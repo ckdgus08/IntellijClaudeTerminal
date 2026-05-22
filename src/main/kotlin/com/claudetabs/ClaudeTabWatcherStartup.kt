@@ -2591,8 +2591,31 @@ $CLAUDE_MD_MARKER
         } catch (e: Exception) { LOG.debug("[ClaudeTabs] Permission install failed: ${e.message}") }
     }
 
+    /**
+     * Deploy a packaged classpath resource to [target]. For executable scripts (`.sh`,
+     * `.bash`), strips any embedded carriage returns before writing. This is defensive: the
+     * source tree pins these files as LF via `.gitattributes`, but if a future Gradle copy
+     * task or a misconfigured checkout reintroduces CR, bash on macOS / Linux fails with
+     * `$'\r': command not found` (issue #1). Stripping CR is harmless on Windows where
+     * Git Bash / MSYS2 / WSL all read LF fine.
+     */
     private fun deployResource(path: String, target: File) {
-        try { javaClass.classLoader.getResourceAsStream(path)?.let { target.parentFile?.mkdirs(); target.writeBytes(it.readBytes()) } } catch (e: Exception) { LOG.debug("[ClaudeTabs] Deploy resource failed: $path — ${e.message}") }
+        try {
+            javaClass.classLoader.getResourceAsStream(path)?.use { stream ->
+                target.parentFile?.mkdirs()
+                val bytes = stream.readBytes()
+                val isExecutableScript = path.endsWith(".sh") || path.endsWith(".bash")
+                if (isExecutableScript) {
+                    // Strip CR. Avoids the `$'\r': command not found` failure mode on
+                    // macOS / Linux when the .sh resource was packaged with CRLF.
+                    target.writeBytes(bytes.filter { it != 0x0D.toByte() }.toByteArray())
+                } else {
+                    target.writeBytes(bytes)
+                }
+            }
+        } catch (e: Exception) {
+            LOG.debug("[ClaudeTabs] Deploy resource failed: $path — ${e.message}")
+        }
     }
 
     // ══════════════════════════════════════════════════════════════

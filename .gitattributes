@@ -1,0 +1,20 @@
+# Pin line endings for files that bash / sh / node must execute. Without this,
+# a Windows clone with `core.autocrlf=true` (Git for Windows default) re-converts
+# these to CRLF on checkout, and the bundled scripts then fail on macOS / Linux
+# with `$'\r': command not found` (see issue #1).
+*.sh    text eol=lf
+*.bash  text eol=lf
+
+# JavaScript helpers we ship in resources/claude-integration/ — also stay LF so
+# Node on macOS / Linux doesn't have to deal with stray CR characters.
+*.js    text eol=lf
+
+# Markdown command definitions — Claude Code reads these; LF is the safe default.
+*.md    text eol=lf
+
+# Source code stays text but lets Git use the platform default — Kotlin / Gradle
+# tooling handles either.
+*.kt    text
+*.java  text
+*.xml   text
+*.json  text
