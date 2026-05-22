@@ -1,6 +1,8 @@
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+
 plugins {
-    id("org.jetbrains.intellij") version "1.17.4"
-    kotlin("jvm") version "1.9.25"
+    id("org.jetbrains.intellij.platform") version "2.10.0"
+    kotlin("jvm") version "2.3.0"
 }
 
 group = "com.claudetabs"
@@ -11,18 +13,24 @@ repositories {
     // Remote Robot (UI test library) is hosted at JetBrains' public Maven repo.
     maven("https://packages.jetbrains.team/maven/p/ij/intellij-dependencies")
     maven("https://cache-redirector.jetbrains.com/intellij-dependencies")
+
+    intellijPlatform {
+        defaultRepositories()
+        releases()
+        snapshots()
+    }
 }
 
-// Target IntelliJ Platform 2024.3 for wide compatibility.
-// Tested on Rider 2026.1. Build number 243 = 2024.3; higher-numbered builds stay compatible
-// since untilBuild is left empty (see patchPluginXml).
-intellij {
-    version.set("2024.3")
-    type.set("IC")
-    plugins.set(listOf("terminal"))
-}
-
+// IntelliJ Platform 2026.1 minimum. The plugin uses createNewSession(...) for terminal
+// creation, which replaces the deprecated createShellWidget(...) — older builds don't
+// have the modernised API. Per JetBrains docs, 2025.3+ unified the Community/Ultimate
+// helper into intellijIdea() (intellijIdeaCommunity is legacy-only).
 dependencies {
+    intellijPlatform {
+        intellijIdea("2026.1")
+        bundledPlugin("org.jetbrains.plugins.terminal")
+    }
+
     // JUnit 4 — IntelliJ platform brings its own version, but declaring it here makes the
     // intent clear and lets plain unit tests run without needing the full platform harness.
     testImplementation("junit:junit:4.13.2")
@@ -32,43 +40,39 @@ dependencies {
     testImplementation("com.intellij.remoterobot:remote-fixtures:0.11.23")
 }
 
-// IntelliJ Platform 2024.3 requires JVM target 17. Pin Java + Kotlin to 17 so the build
+// IntelliJ Platform 2026.1 requires JVM target 17. Pin Java + Kotlin to 17 so the build
 // works regardless of the local JDK (matters when the only available JDK on the build
 // machine is JDK 21+, which would otherwise default `compileJava` to 21 and fail the
-// gradle-intellij-plugin's targetCompatibility verifier).
+// platform verifier).
 java {
     sourceCompatibility = JavaVersion.VERSION_17
     targetCompatibility = JavaVersion.VERSION_17
 }
 
+intellijPlatform {
+    pluginConfiguration {
+        ideaVersion {
+            sinceBuild = "261"
+            // Empty/blank untilBuild = forward-compatible with future IntelliJ versions.
+            untilBuild = provider { "" }
+        }
+    }
+    instrumentCode = false
+}
+
 tasks {
-    patchPluginXml {
-        sinceBuild.set("243")
-        // Empty untilBuild = forward-compatible with future IntelliJ versions.
-        // plugin.xml declares the same via <idea-version since-build="243"/>.
-        untilBuild.set("")
-    }
-
-    buildSearchableOptions {
-        enabled = false
-    }
-
-    // No Java sources in this project (Kotlin only) — instrumentCode has nothing to
-    // process, and on IntelliJ Platform 2024.3+ with gradle-intellij-plugin 1.x it can
-    // fail looking for a non-existent `<JDK>\Packages` directory. Skip it.
-    instrumentCode {
-        enabled = false
-    }
-    instrumentTestCode {
+    // Skip searchable-options indexing — the plugin has no settings UI worth indexing
+    // and the task spins up a full IDE which slows builds significantly.
+    named("buildSearchableOptions") {
         enabled = false
     }
 
     compileKotlin {
-        kotlinOptions.jvmTarget = "17"
+        compilerOptions.jvmTarget.set(JvmTarget.JVM_17)
     }
 
     compileTestKotlin {
-        kotlinOptions.jvmTarget = "17"
+        compilerOptions.jvmTarget.set(JvmTarget.JVM_17)
     }
 
     // Shared test logging — print test names + pass/fail + summary so you don't
@@ -116,10 +120,10 @@ tasks {
         applyTestLogging()
     }
 
-    // Dedicated task for Remote Robot UI tests. Launches the IDE in a sandbox via runIdeForUiTests
-    // (provided by org.jetbrains.intellij plugin) on a well-known port, then runs the `ui/` tests.
+    // Dedicated task for Remote Robot UI tests. Run via `./gradlew uiTest` after spinning
+    // up an IDE sandbox separately (or use the platform 2.x runIdeForUiTests task).
     register<Test>("uiTest") {
-        description = "Run Remote Robot UI tests. Requires runIdeForUiTests to be running."
+        description = "Run Remote Robot UI tests. Requires an IDE sandbox to be running."
         group = "verification"
         useJUnit()
         include("**/ui/**")
@@ -127,12 +131,5 @@ tasks {
         classpath = sourceSets["test"].runtimeClasspath
         shouldRunAfter("test")
         applyTestLogging()
-    }
-
-    runIdeForUiTests {
-        systemProperty("robot-server.port", "8082")
-        systemProperty("ide.mac.message.dialogs.as.sheets", "false")
-        systemProperty("jb.privacy.policy.text", "<!--999.999-->")
-        systemProperty("jb.consents.confirmation.enabled", "false")
     }
 }

@@ -45,6 +45,8 @@
     <change-notes><![CDATA[
     <h3>1.0.14</h3>
     <ul>
+      <li>Bundled shell scripts (<code>rename-tab.sh</code>, <code>session-start-hook.sh</code>) now ship with LF line endings, fixing the <code>$'\r': command not found</code> error on macOS / Linux (issue #1). Three layers of defense: <code>.gitattributes</code> pin, normalised source files, and runtime CR stripping at deploy time.</li>
+      <li>Minimum platform bumped to IntelliJ 2026.1 (build 261). Migrated off the deprecated <code>createShellWidget</code> to <code>createNewSession</code>; built against IntelliJ Platform Gradle Plugin 2.x with Kotlin 2.3.</li>
       <li>Restore file is now a high-water-mark union of existing + new sessions, minus sessions the user explicitly closed. A missed poll can no longer evict a session that's actually still there.</li>
       <li><b>Tab-X / right-click → Close Tab / Close Others / Close All</b> are recognised as user-initiated closes; the session is dropped from auto-restore. <b>Window-X / project shutdown</b> is NOT a close — sessions survive across IDE restarts as intended.</li>
       <li><code>/tab</code> (and right-click → Rename Session) now persists the new name to the restore file and a fresh snapshot immediately, instead of waiting for the next 5-second poll. Crash-safe across the gap.</li>
@@ -136,8 +138,9 @@
     </ul>
     ]]></change-notes>
 
-    <!-- IntelliJ Platform 2024.3 (build 243) and newer. No untilBuild — forward compatible. -->
-    <idea-version since-build="243"/>
+    <!-- IntelliJ Platform 2026.1 (build 261) and newer. No untilBuild — forward compatible.
+         Earlier builds lack the ShellStartupOptions-based createShellWidget API this plugin uses. -->
+    <idea-version since-build="261"/>
 
     <depends>com.intellij.modules.platform</depends>
     <depends>org.jetbrains.plugins.terminal</depends>

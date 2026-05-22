@@ -2194,15 +2194,21 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             // implementation set this to true and that's why only the focused tab "worked"
             // post-restore — the others looked like empty "Local" shells.
             // For a tab whose saved name is generic ("Local", "Local (2)", "pwsh", etc.) we
-            // pass the saved value to createShellWidget so IntelliJ has *something* to show in
-            // the tab strip immediately, but we deliberately DO NOT pin it via userDefinedTitle.
+            // pass the saved value at creation so IntelliJ has *something* to show in the tab
+            // strip immediately, but we deliberately DO NOT pin it via userDefinedTitle below.
             // Reason: buildTitle()'s priority is userDefinedTitle > applicationTitle > default.
             // If we pin "Local", we'd block Claude's resumed-chat title (which Claude sets via
             // OSC escape into applicationTitle) from ever surfacing — so all tabs would stay
             // "Local" forever. By leaving userDefinedTitle null on generic saves, Claude's chat
             // title naturally wins as soon as the resume finishes. For non-generic saved names
             // (user previously ran `/tab <name>`), we DO pin so the user's choice survives.
-            val widget = mgr.createShellWidget(s.cwd, s.tabName, false, false)
+            //
+            // createNewSession is the 2025.x+ replacement for the deprecated createShellWidget
+            // (the deprecated wrapper just delegates here with shellCommand=null anyway).
+            // shellCommand=null → use the platform's default shell. defer=false → start the
+            // shell process immediately so sendCommandToExecute below types into a live TTY
+            // rather than a queued widget waiting for UI activation.
+            val widget = mgr.createNewSession(s.cwd, s.tabName, null, false, false)
             // Record the widget for direct rename access. The platform's tab-enumeration APIs
             // can't reliably find tabs we spawned this way (see [spawnedWidgets] docs), so
             // [handleRename] looks here first before falling back to [getAllTabs].

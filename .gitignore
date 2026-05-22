@@ -2,6 +2,12 @@
 build/
 .gradle/
 
+# IntelliJ Platform Gradle Plugin 2.x caches (downloaded SDK, sandbox, etc).
+.intellijPlatform/
+
+# Kotlin compiler caches
+.kotlin/
+
 # IDE
 .idea/
 *.iml
