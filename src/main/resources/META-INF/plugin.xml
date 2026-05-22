@@ -1,0 +1,156 @@
+<idea-plugin>
+    <id>com.claudetabs.rider-claude-tabs</id>
+    <name>Claude Terminal Tab Persistence</name>
+    <version>1.0.14</version>
+    <vendor email="ragnaraven.dev@gmail.com" url="https://github.com/Ragnaraven/RiderClaudeTabs">Ragnaraven</vendor>
+
+    <description><![CDATA[
+    <h2>Claude Terminal Tab Persistence for Rider / IntelliJ</h2>
+
+    <p>Persists your <a href="https://claude.com/claude-code">Claude Code</a> terminal sessions across IDE
+    restarts — saved tabs come back with their names and auto-resume their conversations, so you can juggle
+    multiple Claude sessions without losing them when you close Rider.</p>
+
+    <h3>Features</h3>
+    <ul>
+      <li><b>Auto-rename terminal tabs</b> based on the Claude conversation topic (or a name you give it)</li>
+      <li><b>Race-condition-free</b> identification of each tab via <code>TERM_SESSION_ID</code> mapping</li>
+      <li><b>Session save/restore</b> across IDE restarts — your named tabs come back</li>
+      <li><b>Session history</b> — browse and resume past Claude sessions with <code>/tabs-history</code></li>
+      <li><b>Respects manual renames</b> — if you rename a tab yourself, the plugin backs off</li>
+    </ul>
+
+    <h3>Slash Commands (installed into ~/.claude/commands/)</h3>
+    <ul>
+      <li><code>/tab &lt;name&gt;</code> — rename current tab and snapshot to history</li>
+      <li><code>/tabs-status</code> — report of all active Claude sessions</li>
+      <li><code>/tabs-backup</code> — manually snapshot current sessions to history</li>
+      <li><code>/tabs-history</code> — browse and resume past sessions</li>
+      <li><code>/tabs-restore</code> — restore saved sessions from last close</li>
+      <li><code>/tabs-clear</code> — clear the rename cache</li>
+    </ul>
+
+    <p><b>Requirements:</b> Rider / IntelliJ 2024.3+ with the bundled Terminal plugin, and
+    <a href="https://docs.claude.com/s/claude-code">Claude Code CLI</a> installed. Currently Windows-focused
+    (the session-detection logic uses <code>tasklist</code>); macOS / Linux compatibility is in progress.</p>
+
+    <p><b>Compatibility:</b> Rider / IntelliJ 2024.3 through 2026.1+. On Rider 2026.1 the plugin coexists
+    with the JetBrains AI Assistant chat tool window (the "AI Agents" panel: Junie / Claude Agent / Codex)
+    and Anthropic's official Claude Code [Beta] plugin. <i>This plugin manages terminal-launched Claude CLI
+    sessions only</i> — chat tabs in the AI Agents panel are managed by JetBrains and are not auto-restored
+    here. Set Registry key <code>rider.claude.tabs.respectAiAgents</code> to <code>false</code> to disable
+    the coexistence notice in the log.</p>
+    ]]></description>
+
+    <change-notes><![CDATA[
+    <h3>1.0.14</h3>
+    <ul>
+      <li>Restore file is now a high-water-mark union of existing + new sessions, minus sessions the user explicitly closed. A missed poll can no longer evict a session that's actually still there.</li>
+      <li><b>Tab-X / right-click → Close Tab / Close Others / Close All</b> are recognised as user-initiated closes; the session is dropped from auto-restore. <b>Window-X / project shutdown</b> is NOT a close — sessions survive across IDE restarts as intended.</li>
+      <li><code>/tab</code> (and right-click → Rename Session) now persists the new name to the restore file and a fresh snapshot immediately, instead of waiting for the next 5-second poll. Crash-safe across the gap.</li>
+      <li>Restore file writes are atomic (tmp + rename). Snapshot filenames use a double-underscore delimiter so sibling projects with overlapping path prefixes (e.g. <code>foo</code> vs <code>foo-mobile</code>) can no longer cross-prune each other.</li>
+      <li>Auto-restored tabs (and Rider's workspace.xml-restored shells) no longer disappear from save tracking. Fixes "only 2 of 5 tabs come back" on Rider 2026.1.</li>
+      <li>Restored terminal tabs actually run <code>claude --resume</code> on spawn — previously shells started cold and only the focused tab ever executed the resume.</li>
+      <li>Restore file is never deleted on an empty poll. A single transient "0 active sessions" cycle can no longer wipe your saved multi-session state.</li>
+      <li>Generic saved names ("Local", "Local (2)") no longer pin <code>userDefinedTitle</code>, so the resumed Claude chat title surfaces naturally.</li>
+      <li>Tab enumeration now sweeps <code>ContentManager</code> as a fallback — fixes <code>/tab</code> reporting "no tab found" for restored sessions whose tab the reworked managers don't list.</li>
+      <li>Direct widget tracking for tabs the plugin spawns — <code>/tab</code> renames go straight to the cached widget reference without re-enumerating, so restored sessions can always be renamed even when the reworked managers don't list them.</li>
+      <li>Save loop now scans <code>~/.claude/sessions/</code> directly (filtered by project cwd) instead of relying solely on the platform's tab APIs to enumerate which Claude processes are alive. Fixes "10 tabs spawned, only 1 saved" on Rider 2026.1 where freshly-spawned widgets don't expose their <code>ttyConnector</code> via reflection.</li>
+    </ul>
+
+    <h3>1.0.13</h3>
+    <ul>
+      <li>Auto-restore opens saved sessions in fresh tabs — fixes wrong-chat-in-wrong-tab when multiple projects are open.</li>
+    </ul>
+
+    <h3>1.0.12</h3>
+    <ul>
+      <li>Auto-restore now covers sessions in unnamed tabs too.</li>
+      <li><code>/tabs-history</code> survives crashes (sessions recorded within a minute of starting).</li>
+    </ul>
+
+    <h3>1.0.11</h3>
+    <ul>
+      <li>Fixes restore and history when multiple projects are open at once.</li>
+    </ul>
+
+    <h3>1.0.10</h3>
+    <ul>
+      <li>Fixes "no tabs auto-restored on load" caused by sessions leaking between sibling projects.</li>
+    </ul>
+
+    <h3>1.0.9</h3>
+    <ul>
+      <li><code>/tab</code> is roughly 2× faster on first use.</li>
+    </ul>
+
+    <h3>1.0.8</h3>
+    <ul>
+      <li>Stops silently wiping <code>history.json</code> on transient read failures (AV, OneDrive, indexer locks).</li>
+      <li>Atomic writes for <code>history.json</code>.</li>
+    </ul>
+
+    <h3>1.0.7</h3>
+    <ul>
+      <li>All <code>/tabs-*</code> commands now scope to the current project by default. Pass <code>--all</code> for the global view.</li>
+      <li><code>/tabs-clear</code> preserves <code>history.json</code>.</li>
+    </ul>
+
+    <h3>1.0.6</h3>
+    <ul>
+      <li>Restore works again after a PC restart that preserves tab titles.</li>
+      <li><code>/tabs-history</code> defaults to the current project.</li>
+      <li>Fixes snapshot mixups between projects with similar paths (e.g. <code>MyApp</code> vs <code>MyApp-mobile</code>).</li>
+    </ul>
+
+    <h3>1.0.5</h3>
+    <ul>
+      <li>Compatibility with Rider 2026.1 — coexists with the JetBrains AI Assistant / Claude Agent panel.</li>
+      <li>Tab names hold against the AI Assistant title overlay.</li>
+      <li>Resuming a session no longer fails with "No conversation found" after Claude rotates the session id.</li>
+    </ul>
+
+    <h3>1.0.3</h3>
+    <ul>
+      <li><code>/tabs-history</code>, <code>/tabs-restore</code>, <code>/tabs-status</code> render as markdown tables.</li>
+      <li>History age column shows seconds for recent entries.</li>
+    </ul>
+
+    <h3>1.0.2</h3>
+    <ul>
+      <li>Cleaner slash-command output — no more Node script dumps in the terminal.</li>
+      <li><code>/tabs-history</code> and <code>/tabs-restore</code> show a built-in choice menu.</li>
+    </ul>
+
+    <h3>1.0.1</h3>
+    <ul>
+      <li><code>/tabs-restore</code> and <code>/tabs-history</code> print the <code>claude --resume</code> command instead of trying to run it (nested resume always failed).</li>
+    </ul>
+
+    <h3>1.0.0 — Initial release</h3>
+    <ul>
+      <li>Auto-rename terminal tabs to match the active Claude conversation.</li>
+      <li>Session save/restore across IDE restarts.</li>
+      <li>Slash commands: <code>/tab</code>, <code>/tabs-status</code>, <code>/tabs-backup</code>, <code>/tabs-history</code>, <code>/tabs-restore</code>, <code>/tabs-clear</code>.</li>
+      <li>Auto-install of scripts, commands, and permissions on startup; clean uninstall on removal.</li>
+    </ul>
+    ]]></change-notes>
+
+    <!-- IntelliJ Platform 2024.3 (build 243) and newer. No untilBuild — forward compatible. -->
+    <idea-version since-build="243"/>
+
+    <depends>com.intellij.modules.platform</depends>
+    <depends>org.jetbrains.plugins.terminal</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <postStartupActivity implementation="com.claudetabs.ClaudeTabWatcherStartup"/>
+        <registryKey key="rider.claude.tabs.respectAiAgents"
+                     defaultValue="true"
+                     description="Defer to JetBrains AI Assistant / Anthropic Claude Code plugin when present (informational log only as of 1.0.5). Set to false for legacy 1.0.3 behavior."
+                     restartRequired="false"/>
+        <registryKey key="rider.claude.tabs.verboseLogs"
+                     defaultValue="false"
+                     description="Bypass rate-limiting on high-frequency log lines (AI overlay re-apply, restore-pending). When true, every event logs. When false, rate-limited to once per minute per key. Equivalent to enabling DEBUG logging for #com.claudetabs."
+                     restartRequired="false"/>
+    </extensions>
+</idea-plugin>
