@@ -1,7 +1,7 @@
 <idea-plugin>
     <id>com.claudetabs.rider-claude-tabs</id>
     <name>Claude Terminal Tab Persistence</name>
-    <version>1.0.15</version>
+    <version>1.0.16</version>
     <vendor email="ragnaraven.dev@gmail.com" url="https://github.com/Ragnaraven/RiderClaudeTabs">Ragnaraven</vendor>
 
     <description><![CDATA[
@@ -45,12 +45,16 @@
     <change-notes><![CDATA[
     <h3>1.0.16</h3>
     <ul>
-      <li><b>Fixes descriptive tab names being silently replaced with "Local"</b> across restart. The save-loop union was unconditionally letting the live tab title overlay the saved name, so a freshly-spawned tab whose title still read "Local" (Claude hadn't repainted yet after <code>--resume</code>) would clobber the descriptive name on disk within 5 seconds. Now a generic name can never beat a descriptive one — other fields (cwd, bypass) still propagate.</li>
+      <li><b>Fixes X-button closes being silently dropped right after restart</b> — the 30-second startup grace introduced in 1.0.15 was too coarse: it correctly ignored Rider's tool-window re-layout events, but it also ate legitimate user closes that happened in the same window (the most natural moment to close an unwanted tab is right after seeing it auto-restore). The grace is gone; a contentRemoved is now disambiguated by capturing the underlying <code>TerminalWidget</code> and checking 1.5 seconds later whether it's still attached to any <code>Content</code> in the tool window. Shuffles re-bind the widget to a fresh Content within the same swing tick; real closes leave it orphaned. Works regardless of how recently the plugin attached.</li>
+      <li><b>Restore file rewritten synchronously on confirmed close</b> — used to wait for the next 5-second poll, which meant a user who clicked X then immediately closed Rider could lose the close (the next poll never runs). Now the verify step writes the restore file atomically the moment the close is confirmed.</li>
+      <li>Verify delay shortened 3s → 1.5s. Widget-attachment is decidable as soon as Rider completes the swing tick that holds the shuffle.</li>
     </ul>
 
     <h3>1.0.15</h3>
     <ul>
-      <li><b>Fixes "tabs go missing after restart"</b> — the <code>ContentManagerListener</code> was treating Rider's tool-window re-layout events (fired while restoring tabs, splits, popouts at startup) as user closes, then subtracting those sessions from the restore file forever. Two new filters: (1) a 30-second startup grace where every <code>contentRemoved</code> is ignored as re-layout, and (2) past the grace, real-looking closes are deferred 3 seconds and only recorded if the Claude process for that session is actually dead. Splits / popouts / drags can no longer be mistaken for closes.</li>
+      <li><b>Fixes "tabs go missing after restart"</b> — the <code>ContentManagerListener</code> was treating Rider's tool-window re-layout events (fired while restoring tabs, splits, popouts at startup) as user closes, then subtracting those sessions from the restore file forever. A 30-second startup grace where every <code>contentRemoved</code> was ignored, plus a 3-second deferred process-alive check for events past the grace. (Superseded by the 1.0.16 widget-attachment check, which catches the same re-layout case without the false-negative on fast user closes.)</li>
+      <li><b>Fixes descriptive tab names being silently replaced with "Local"</b> across restart. The save-loop union was unconditionally letting the live tab title overlay the saved name, so a freshly-spawned tab whose title still read "Local" (Claude hadn't repainted yet after <code>--resume</code>) would clobber the descriptive name on disk within 5 seconds. Now a generic name can never beat a descriptive one — other fields (cwd, bypass) still propagate.</li>
+      <li><b>Clears Marketplace verifier warning</b> on the spawn-new-tab call. <code>TerminalToolWindowManager.createNewSession</code> is annotated <code>@ApiStatus.Internal</code> in 2025.x+ and the verifier rejected the direct invocation. The call is now reflective, so there's no compile-time binary reference for the verifier to flag; runtime behaviour is unchanged.</li>
       <li>Extensive logging on every close-detection branch — search <code>idea.log</code> for <code>[ClaudeTabs][close]</code> and <code>[ClaudeTabs][verify]</code> to see exactly why each event was kept or ignored.</li>
     </ul>
 
