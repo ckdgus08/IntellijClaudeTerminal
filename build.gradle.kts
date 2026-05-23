@@ -6,7 +6,7 @@ plugins {
 }
 
 group = "com.claudetabs"
-version = "1.0.14"
+version = "1.0.15"
 
 repositories {
     mavenCentral()
@@ -53,8 +53,12 @@ intellijPlatform {
     pluginConfiguration {
         ideaVersion {
             sinceBuild = "261"
-            // Empty/blank untilBuild = forward-compatible with future IntelliJ versions.
-            untilBuild = provider { "" }
+            // Forward-compatible with future IntelliJ versions. Setting the property to
+            // a provider that resolves to null tells IPGP 2.x to omit the <until-build>
+            // attribute entirely (rather than emitting an empty value, which fails the
+            // Marketplace plugin descriptor validator with "does not match the multi-part
+            // build number format").
+            untilBuild = provider { null }
         }
     }
     instrumentCode = false

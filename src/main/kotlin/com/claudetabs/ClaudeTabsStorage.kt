@@ -245,10 +245,34 @@ internal class ClaudeTabsStorage(private val claudeHome: File) {
         }
         val existing = (existingRead as RestoreRead.Ok).sessions
 
-        // Union: existing first (so iteration order is stable), then new overlays.
+        // Union: existing first (so iteration order is stable), then new overlays —
+        // but with name precedence rules so a generic *live* title can't clobber a
+        // descriptive *saved* one.
+        //
+        // Bug history: the previous union unconditionally let `new` overlay `existing`.
+        // That meant a tab with a descriptive name saved to disk would be overwritten on
+        // the next 5-second poll if the live tab title still read the JetBrains default
+        // (e.g. "Local") — which is common during the early seconds of a `--resume`,
+        // before Claude has set the tab title. After one cycle the descriptive name was
+        // gone forever.
+        //
+        // Rule: prefer the non-generic name. When both are non-generic, prefer `new`
+        // (more current — captures legitimate user renames). When both are generic, also
+        // prefer `new` (same reason). Only when `new` is generic AND `existing` is not
+        // do we keep `existing`'s name — and even then we copy across new's other fields
+        // (cwd, bypassPermissions) which may have changed.
         val byId = linkedMapOf<String, SavedSession>()
         for (s in existing) byId[s.sessionId] = s
-        for (s in newSessions) byId[s.sessionId] = s
+        for (s in newSessions) {
+            val prior = byId[s.sessionId]
+            byId[s.sessionId] = if (prior != null
+                && ClaudeTabsHelpers.isGenericTabName(s.tabName)
+                && !ClaudeTabsHelpers.isGenericTabName(prior.tabName)) {
+                s.copy(tabName = prior.tabName)
+            } else {
+                s
+            }
+        }
 
         // Subtract user-closed.
         for (sid in userClosedSessionIds) byId.remove(sid)

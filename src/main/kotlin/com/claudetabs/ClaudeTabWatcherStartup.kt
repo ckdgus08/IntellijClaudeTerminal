@@ -54,6 +54,29 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         /** Poll cadence for detecting rename files and session state changes. */
         private const val POLL_INTERVAL_MS = 5_000L
 
+        /**
+         * Grace period after the plugin attaches to a project during which every
+         * `ContentManagerListener.contentRemoved` event is treated as Rider's
+         * tool-window re-layout (restored tabs being attached, split/popout
+         * reflow, drag-to-reorder) — NOT a user close. 30 seconds is long enough
+         * to cover the slowest observed startup (Rider 2026.1 with ~10 tabs
+         * across 3 projects opens in ~12-18s after the welcome screen). The
+         * previous lack of this grace was the root cause of the bug where 3-5
+         * tabs went missing per restart: re-layout events were being recorded
+         * as "user closed this tab" and subtracted from the restore file. */
+        const val STARTUP_GRACE_MS = 30_000L
+
+        /**
+         * After the startup grace, real-looking close events are deferred this
+         * long before being recorded. During the delay we check whether the
+         * Claude process for that sessionId is still alive on disk
+         * (~/.claude/sessions/<pid>.json). If alive → it was a Rider UI shuffle
+         * (split move, popout, drag) and we do nothing. If dead → genuine user
+         * close, add to `userClosedSessions`. 3 seconds is plenty for Claude's
+         * sessions/<pid>.json file to disappear on a real terminate (the file
+         * is unlinked when the process exits). */
+        const val CLOSE_VERIFY_DELAY_MS = 3_000L
+
         /** Root of Claude Code's user data (scripts, sessions, commands live under this). */
         private val CLAUDE_HOME = File(System.getProperty("user.home"), ".claude")
 
@@ -360,11 +383,98 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
          *  ignores `contentRemoved` events — those are project-shutdown tear-down, not
          *  user-initiated tab closes. */
         @Volatile var projectClosing: Boolean = false,
+        /** Wall-clock ms when the plugin attached to this project. Used by
+         *  [TabCloseClassifier] to apply a [STARTUP_GRACE_MS] grace period during which
+         *  `contentRemoved` events are tool-window re-layout (restored tabs, splits,
+         *  popouts being re-attached) rather than user closes. This is the root cause
+         *  of the missing-tabs bug: Rider fired contentRemoved for 3-5 tabs at
+         *  startup, the old listener marked them as user-closed, and the save loop
+         *  subtracted them from the restore file forever. */
+        val startupAt: Long = System.currentTimeMillis(),
     )
 
     private val projectCtx = java.util.concurrent.ConcurrentHashMap<String, ProjectCtx>()
     private fun ctx(project: Project): ProjectCtx =
         projectCtx.computeIfAbsent(project.locationHash) { ProjectCtx() }
+
+    /**
+     * Schedule a deferred process-alive check for [sid] after [CLOSE_VERIFY_DELAY_MS]. The
+     * actual close decision happens in the scheduled task:
+     *  - If the project is disposed or closing when the task fires → skip (project teardown,
+     *    not user intent).
+     *  - If [isClaudeAliveForSession] returns true → the close event was a Rider UI shuffle
+     *    (split move, popout, drag-to-reorder). The process is still running, so DO NOT
+     *    record a user close.
+     *  - Otherwise → genuine user close (X button, right-click → Close Tab, etc.). Add to
+     *    [ProjectCtx.userClosedSessions] so the save loop subtracts it from the restore file.
+     *
+     * Logs every step with `[ClaudeTabs][verify]` so diagnostic timelines are reconstructable
+     * from idea.log without guessing.
+     */
+    private fun scheduleCloseVerification(project: Project, sid: String, tabName: String) {
+        val executor = com.intellij.util.concurrency.AppExecutorUtil.getAppScheduledExecutorService()
+        executor.schedule({
+            try {
+                val verbose = isVerboseLogging()
+                if (project.isDisposed) {
+                    if (verbose) LOG.info("[ClaudeTabs][verify] sid=$sid skip — project disposed during wait (tab='$tabName')")
+                    return@schedule
+                }
+                val c = ctx(project)
+                if (c.projectClosing) {
+                    if (verbose) LOG.info("[ClaudeTabs][verify] sid=$sid skip — project closing during wait (tab='$tabName')")
+                    return@schedule
+                }
+                val alive = isClaudeAliveForSession(sid, verbose)
+                if (alive) {
+                    if (verbose) LOG.info("[ClaudeTabs][verify] sid=$sid alive=true — UI shuffle, NOT recording (tab='$tabName')")
+                    return@schedule
+                }
+                // Genuine close: process is gone, past grace, project isn't shutting down. This
+                // IS a state change (the session won't auto-restore next time) so it logs at
+                // info regardless of verbose mode.
+                synchronized(c.userClosedSessions) { c.userClosedSessions.add(sid) }
+                LOG.info("[ClaudeTabs] Tab closed by user — session $sid removed from restore (tab='$tabName')")
+            } catch (e: Exception) {
+                LOG.warn("[ClaudeTabs][verify] sid=$sid unexpected error: ${e.message}", e)
+            }
+        }, CLOSE_VERIFY_DELAY_MS, java.util.concurrent.TimeUnit.MILLISECONDS)
+    }
+
+    /**
+     * Scan [SESSIONS_DIR] for a `<pid>.json` whose `sessionId` field matches [sid] AND whose
+     * pid is an alive process. Returns true if such a session file is found.
+     *
+     * Claude unlinks its `~/.claude/sessions/<pid>.json` when the process exits cleanly. On
+     * a hard kill (terminal X button) the file may linger briefly until the OS reaps it, but
+     * the pid lookup catches that — we only consider a session alive if BOTH the file exists
+     * and `ProcessHandle.of(pid).isPresent`.
+     */
+    private fun isClaudeAliveForSession(sid: String, verbose: Boolean = false): Boolean {
+        val dir = SESSIONS_DIR
+        if (!dir.isDirectory) {
+            if (verbose) LOG.info("[ClaudeTabs][verify] sid=$sid SESSIONS_DIR missing — assuming dead")
+            return false
+        }
+        val files = dir.listFiles { f -> f.isFile && f.name.endsWith(".json") } ?: return false
+        for (f in files) {
+            try {
+                val pid = f.nameWithoutExtension.toLongOrNull() ?: continue
+                val text = f.readText()
+                // Cheap substring check first; full parse only if the sid string appears.
+                if (!text.contains(sid)) continue
+                if (!text.contains("\"sessionId\":\"$sid\"")) continue
+                val processAlive = ProcessHandle.of(pid).map { it.isAlive }.orElse(false)
+                if (processAlive) {
+                    if (verbose) LOG.info("[ClaudeTabs][verify] sid=$sid found alive pid=$pid")
+                    return true
+                } else {
+                    if (verbose) LOG.info("[ClaudeTabs][verify] sid=$sid file present (pid=$pid) but process not alive")
+                }
+            } catch (_: Exception) { /* unreadable file, skip */ }
+        }
+        return false
+    }
 
     /**
      * IntelliJ entry point. Fires once per project open. Starts two coroutines:
@@ -396,6 +506,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             LOG.info("[ClaudeTabs] No AI Assistant host detected.")
         }
         LOG.info("[ClaudeTabs] Verbose logs: ${if (isVerboseLogging()) "ON (bypassing rate limits)" else "OFF (rate-limited; set Registry rider.claude.tabs.verboseLogs=true to enable)"}")
+        LOG.info("[ClaudeTabs] Close detection: startup grace=${STARTUP_GRACE_MS}ms, verify delay=${CLOSE_VERIFY_DELAY_MS}ms (ProjectCtx.startupAt=${ctx(project).startupAt})")
         LOG.info("[ClaudeTabs] ════════════════════════════════════════════════════════")
         TABS_DIR.mkdirs()
         maybeWriteConfigTemplate()
@@ -424,12 +535,21 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             LOG.debug("[ClaudeTabs] ProjectManagerListener install failed: ${e.message}")
         }
 
-        // ContentManagerListener tracks terminal-tab close events. Any contentRemoved event
-        // fired while [ProjectCtx.projectClosing] is false is treated as a user-initiated
-        // tab close (X-button, right-click → Close Tab / Close Others / Close All — all
-        // funnel through Content removal). Adds the sessionId to [userClosedSessions]
-        // which is subtracted in [saveState], so the user's close intent persists across
-        // restart.
+        // ContentManagerListener tracks terminal-tab close events. The naive interpretation
+        // (every contentRemoved == user closed this tab) was the root cause of the
+        // missing-tabs bug. Rider fires contentRemoved during STARTUP tool-window
+        // re-layout (restored tabs being attached, splits, popouts) — those look
+        // identical to real user closes. The old code marked those as user-closed and
+        // the save loop subtracted them out of the restore file forever.
+        //
+        // The classifier (TabCloseClassifier) now applies two filters:
+        //   1. Startup grace [STARTUP_GRACE_MS]: events in the first 30s after attach
+        //      are tool-window re-layout, not user closes. Ignore unconditionally.
+        //   2. Defer-and-verify [CLOSE_VERIFY_DELAY_MS]: past the grace period, schedule
+        //      a 3-second-deferred check on whether the Claude process for that
+        //      sessionId is still alive (~/.claude/sessions/<pid>.json present). If
+        //      alive → it was a UI shuffle (split move, drag), do nothing. If dead →
+        //      genuine user close, add to userClosedSessions.
         try {
             val tw = TerminalToolWindowManager.getInstance(project).toolWindow
             val cmgr = tw?.contentManager
@@ -438,30 +558,46 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                     override fun contentRemoved(event: com.intellij.ui.content.ContentManagerEvent) {
                         val c = ctx(project)
                         val content = event.content
-                        // The pure decision logic lives in [TabCloseClassifier] so it can be
-                        // unit-tested without an IntelliJ Content / Project. Side effects
-                        // (state mutation + logging) stay here.
+                        val displayName = try { content.displayName ?: "?" } catch (_: Exception) { "?" }
                         val widgetSid = spawnedWidgets.entries.firstOrNull { (_, w) ->
                             try {
                                 TerminalToolWindowManager.findWidgetByContent(content) === w
                             } catch (_: Exception) { false }
                         }?.key
+                        val mapSid = c.contentToSid[content]
+                        val sinceStartup = System.currentTimeMillis() - c.startupAt
+                        // Per-event detail logged at DEBUG so production idea.log isn't spammed
+                        // by every tool-window re-layout, split move, and drag. Enable by setting
+                        // Registry rider.claude.tabs.verboseLogs=true OR enabling DEBUG for this
+                        // class via Help → Diagnostic Tools → Debug Log Settings.
+                        val verbose = isVerboseLogging()
+                        if (verbose) {
+                            LOG.info("[ClaudeTabs][close] contentRemoved fired" +
+                                    " — project='${project.name}' tab='$displayName'" +
+                                    " mapSid=${mapSid ?: "none"} widgetSid=${widgetSid ?: "none"}" +
+                                    " projectClosing=${c.projectClosing}" +
+                                    " msSinceStartup=$sinceStartup graceMs=$STARTUP_GRACE_MS")
+                        }
                         when (val d = TabCloseClassifier.classify(
                             projectClosing = c.projectClosing,
-                            sessionIdFromMap = c.contentToSid[content],
+                            millisSinceStartup = sinceStartup,
+                            startupGraceMillis = STARTUP_GRACE_MS,
+                            sessionIdFromMap = mapSid,
                             sessionIdFromWidgetFallback = widgetSid,
                         )) {
-                            is TabCloseClassifier.Decision.UserClosed -> {
-                                c.userClosedSessions.add(d.sessionId)
+                            is TabCloseClassifier.Decision.DeferAndVerify -> {
+                                if (verbose) LOG.info("[ClaudeTabs][close] decision=DeferAndVerify sid=${d.sessionId} — scheduling alive-check in ${CLOSE_VERIFY_DELAY_MS}ms")
+                                scheduleCloseVerification(project, d.sessionId, displayName)
                                 c.contentToSid.remove(content)
-                                LOG.info("[ClaudeTabs] Tab closed by user — marking session ${d.sessionId} for removal from restore (tab='${content.displayName ?: "?"}')")
                             }
                             TabCloseClassifier.Decision.IgnoreProjectClosing -> {
-                                // Project shutdown teardown — explicitly DO NOT mark any session
-                                // as user-closed; closing Rider should preserve restore state.
+                                if (verbose) LOG.info("[ClaudeTabs][close] decision=IgnoreProjectClosing tab='$displayName'")
+                            }
+                            TabCloseClassifier.Decision.IgnoreStartupGrace -> {
+                                if (verbose) LOG.info("[ClaudeTabs][close] decision=IgnoreStartupGrace (${sinceStartup}ms elapsed) tab='$displayName'")
                             }
                             TabCloseClassifier.Decision.NoMappedSession -> {
-                                LOG.debug("[ClaudeTabs] Tab closed but no sessionId mapped — display='${content.displayName ?: "?"}'")
+                                if (verbose) LOG.info("[ClaudeTabs][close] decision=NoMappedSession tab='$displayName'")
                             }
                         }
                     }
@@ -2270,20 +2406,22 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         }
     }
 
+    /**
+     * Build the `claude --resume <sid>` command for a restored session. Appends
+     * `--dangerously-skip-permissions` ONLY when the saved session was itself running in
+     * bypass mode (i.e. [readPermissionMode] saw `"permissionMode":"bypassPermissions"`
+     * in the transcript).
+     *
+     * Past versions also consulted `settings.json` for `skipDangerousModePermissionPrompt`,
+     * but that setting controls whether Claude *prompts* before honoring bypass — it does
+     * NOT mean "every session should start in bypass mode." Conflating the two caused
+     * every restored tab to come back in bypass mode even when the original session was
+     * `auto`, which is the wrong default and a real security concern: it would silently
+     * elevate a session's permission level across a restart.
+     */
     private fun buildResumeCmd(s: SavedSession): String = buildString {
         append("claude --resume ${s.sessionId}")
-        if (s.bypassPermissions || shouldAlwaysBypass()) append(" --dangerously-skip-permissions")
-    }
-
-    private fun shouldAlwaysBypass(): Boolean {
-        val f = File(CLAUDE_HOME, "settings.json")
-        if (!f.exists()) return false
-        return try {
-            f.readText().let { it.contains("\"skipDangerousModePermissionPrompt\":true") || it.contains("\"skipDangerousModePermissionPrompt\": true") }
-        } catch (e: Exception) {
-            LOG.debug("[ClaudeTabs] settings.json read failed: ${e.message}")
-            false
-        }
+        if (s.bypassPermissions) append(" --dangerously-skip-permissions")
     }
 
     /**

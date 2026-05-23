@@ -332,12 +332,46 @@ class ClaudeTabsStorageTest {
 
     @Test fun saveState_unionsExistingAndNew_newTakesPrecedenceOnCollision() {
         // Existing file has session "x" with the old name; new save passes "x" with a new name.
-        // Result: file contains "x" with the NEW name (new overlays existing).
+        // Result: file contains "x" with the NEW name (new overlays existing) — but only when
+        // both names are non-generic. See generic-name precedence tests below.
         storage.saveState(projectHash, listOf(session("x", "Old Name")), 0)
         storage.saveState(projectHash, listOf(session("x", "New Name")), 0)
         val parsed = storage.parseSessions(storage.restoreFile(projectHash).readText())
         assertEquals(1, parsed.size)
         assertEquals("New Name", parsed[0].tabName)
+    }
+
+    @Test fun saveState_genericLiveName_doesNotClobberDescriptiveSavedName() {
+        // Bug shape: tab with a descriptive name is saved to disk. On the next poll the
+        // live title still reads the JetBrains default ("Local") because Claude hasn't
+        // repainted yet after --resume. The naive union let "Local" overlay the saved
+        // name; after one cycle the descriptive name was gone.
+        storage.saveState(projectHash, listOf(session("sid", "Topic")), 0)
+        storage.saveState(projectHash, listOf(session("sid", "Local")), 0)
+        val parsed = storage.parseSessions(storage.restoreFile(projectHash).readText())
+        assertEquals("Topic", parsed.single().tabName)
+    }
+
+    @Test fun saveState_descriptiveLiveName_replacesGenericSavedName() {
+        // Inverse of the bug: file has generic, live has descriptive ⇒ descriptive wins.
+        // Otherwise legitimate /tab renames would never propagate to disk.
+        storage.saveState(projectHash, listOf(session("sid", "Local")), 0)
+        storage.saveState(projectHash, listOf(session("sid", "Topic")), 0)
+        val parsed = storage.parseSessions(storage.restoreFile(projectHash).readText())
+        assertEquals("Topic", parsed.single().tabName)
+    }
+
+    @Test fun saveState_genericNewStillPropagatesOtherFields() {
+        // Pin: the name-precedence rule must not freeze cwd / bypass at their saved
+        // values. If the live session moved cwd or flipped bypass, those still flow.
+        storage.saveState(projectHash,
+            listOf(ClaudeTabsStorage.SavedSession("sid", "/cwd-a", "Topic", false)), 0)
+        storage.saveState(projectHash,
+            listOf(ClaudeTabsStorage.SavedSession("sid", "/cwd-b", "Local", true)), 0)
+        val s = storage.parseSessions(storage.restoreFile(projectHash).readText()).single()
+        assertEquals("Topic", s.tabName)
+        assertEquals("/cwd-b", s.cwd)
+        assertTrue(s.bypassPermissions)
     }
 
     @Test fun saveState_unionPreservesEntriesPollMissed() {

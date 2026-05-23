@@ -1,7 +1,7 @@
 <idea-plugin>
     <id>com.claudetabs.rider-claude-tabs</id>
     <name>Claude Terminal Tab Persistence</name>
-    <version>1.0.14</version>
+    <version>1.0.15</version>
     <vendor email="ragnaraven.dev@gmail.com" url="https://github.com/Ragnaraven/RiderClaudeTabs">Ragnaraven</vendor>
 
     <description><![CDATA[
@@ -43,6 +43,17 @@
     ]]></description>
 
     <change-notes><![CDATA[
+    <h3>1.0.16</h3>
+    <ul>
+      <li><b>Fixes descriptive tab names being silently replaced with "Local"</b> across restart. The save-loop union was unconditionally letting the live tab title overlay the saved name, so a freshly-spawned tab whose title still read "Local" (Claude hadn't repainted yet after <code>--resume</code>) would clobber the descriptive name on disk within 5 seconds. Now a generic name can never beat a descriptive one — other fields (cwd, bypass) still propagate.</li>
+    </ul>
+
+    <h3>1.0.15</h3>
+    <ul>
+      <li><b>Fixes "tabs go missing after restart"</b> — the <code>ContentManagerListener</code> was treating Rider's tool-window re-layout events (fired while restoring tabs, splits, popouts at startup) as user closes, then subtracting those sessions from the restore file forever. Two new filters: (1) a 30-second startup grace where every <code>contentRemoved</code> is ignored as re-layout, and (2) past the grace, real-looking closes are deferred 3 seconds and only recorded if the Claude process for that session is actually dead. Splits / popouts / drags can no longer be mistaken for closes.</li>
+      <li>Extensive logging on every close-detection branch — search <code>idea.log</code> for <code>[ClaudeTabs][close]</code> and <code>[ClaudeTabs][verify]</code> to see exactly why each event was kept or ignored.</li>
+    </ul>
+
     <h3>1.0.14</h3>
     <ul>
       <li>Bundled shell scripts (<code>rename-tab.sh</code>, <code>session-start-hook.sh</code>) now ship with LF line endings, fixing the <code>$'\r': command not found</code> error on macOS / Linux (issue #1). Three layers of defense: <code>.gitattributes</code> pin, normalised source files, and runtime CR stripping at deploy time.</li>
