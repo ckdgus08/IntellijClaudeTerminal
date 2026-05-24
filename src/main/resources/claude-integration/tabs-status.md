@@ -8,7 +8,9 @@ By default this is scoped to the **current project**. Pass `--all` to see active
 
 1. Decide scope:
    - If `$ARGUMENTS` contains `--all` (case-insensitive, anywhere in the args), load every project's restore file (the original "all projects" behavior).
-   - Otherwise, resolve the current project:
+   - Otherwise, resolve the current project. **Fast path (1.0.17+):** read `~/.claude/rider-plugin/project-index.json` with the **Read** tool. It's a JSON object `{"projects":[{"hash":"...","basePath":"...","name":"..."}, ...]}` maintained by the plugin on every project open/close. Find the entry whose `basePath` is an ancestor of (or equals) your current working directory (`pwd` from shell), pick its `hash` and `name`. This is ~5ms vs ~500-800ms for the Node fallback.
+
+     **Slow fallback** only when the index is missing OR no ancestor matches (e.g. cwd is outside any tracked project):
      ```bash
      node ~/.claude/rider-plugin/current-project.js
      ```

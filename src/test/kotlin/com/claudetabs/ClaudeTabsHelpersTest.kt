@@ -263,6 +263,25 @@ class ClaudeTabsHelpersTest {
         assertFalse(ClaudeTabsHelpers.isAiOverlayName("Some Auto Topic", "MyApp"))
     }
 
+    @Test fun isAiOverlayName_dingbatsHeavyAsterisk_isOverlay() {
+        // U+2733 ✳ is what Claude Code 1.x actually emits in production overlay titles.
+        // Older versions of this regex missed it (range stopped at U+28FF), allowing
+        // "✳ Claude Code" to flow through to the save file as the literal tab name.
+        assertTrue(ClaudeTabsHelpers.isAiOverlayName("✳ Claude Code", "MyApp"))
+        assertTrue(ClaudeTabsHelpers.isAiOverlayName("✳ Refactor auth flow", "MyApp"))
+        assertTrue(ClaudeTabsHelpers.isAiOverlayName("✳ Some Chat Topic", "MyApp"))
+    }
+
+    @Test fun isAiOverlayName_dingbatsSiblings_alsoCaught() {
+        // Defense in depth: the AI host could swap to any sibling glyph in a future release.
+        // Codepoints U+2731-U+273F are all covered by the regex.
+        for (cp in 0x2731..0x273F) {
+            val glyph = String(Character.toChars(cp))
+            val name = "$glyph some chat title"
+            assertTrue("U+${cp.toString(16)} $glyph should match", ClaudeTabsHelpers.isAiOverlayName(name, "MyApp"))
+        }
+    }
+
     // ── extractResumeIdFromArgs ──────────────────────────────────
     // Locks in the parser used by canonicalSessionIdFor's primary path. The argv-based
     // canonical resolver replaced an mtime heuristic that swapped tab names when two

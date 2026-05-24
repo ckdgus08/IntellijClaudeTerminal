@@ -44,9 +44,18 @@ internal object ClaudeTabsHelpers {
     }
 
     /** Status/spinner glyph prefix the AI Assistant terminal overlay puts on tab names while
-     *  a Claude session is active: Braille spinner (`⠁-⠿`), middle-dot, asterisk, bullet,
-     *  play-arrow. Detected as a literal first-character class. */
-    private val AI_OVERLAY_PREFIX = Regex("^[·*•⏵\\u2800-\\u28FF]+\\s+\\S")
+     *  a Claude session is active. Covers:
+     *   - Braille spinner block `⠁-⠿` (U+2800-U+28FF) — the rotating spinner frames.
+     *   - Middle-dot (`·`), plain asterisk (`*`), bullet (`•`), play-arrow (`⏵`).
+     *   - Dingbats heavy-asterisk family `✱-✿` (U+2731-U+273F) — the static "Claude is doing
+     *     something" glyph. `✳` (U+2733) is the one Claude Code currently emits ("✳ Claude
+     *     Code"); the rest cover sibling glyphs the AI host has used historically and could
+     *     swap to in any release.
+     *
+     *  Detected as a literal first-character class. Add new prefixes here when a future
+     *  Claude / AI Assistant release leaks a new glyph (file an issue with the offending
+     *  byte sequence and we extend). */
+    private val AI_OVERLAY_PREFIX = Regex("^[·*•⏵\\u2731-\\u273F\\u2800-\\u28FF]+\\s+\\S")
 
     /**
      * True if [name] looks like the JetBrains AI Assistant terminal overlay's auto-naming.
@@ -102,6 +111,27 @@ internal object ClaudeTabsHelpers {
         val jaccard = if (union == 0.0) 0.0 else intersection / union
         return jaccard >= 0.6
     }
+
+    // ══════════════════════════════════════════════════════════════
+    // NAMES STORE — single source of truth for sessionId → tab name
+    // ══════════════════════════════════════════════════════════════
+
+    /**
+     * Persistent record of a user-given (or hook-assigned) tab name for a Claude session.
+     *
+     * Lives in `~/.claude/rider-plugin/names.json` keyed by sessionId. This file is the
+     * authoritative source of truth for "what should this tab be called" — the save loop
+     * reads from here, never from the live terminal widget title (which gets clobbered by
+     * the AI Assistant overlay and was the recurring cause of restored-with-wrong-name bugs).
+     *
+     *  - `setBy = "user"` — written via `/tab` slash command (explicit user choice).
+     *  - `setBy = "hook"` — written by [com.claudetabs.session-start-hook.sh] at session
+     *     start with a default-ish topic name.
+     *  - `setBy = "alias"` — written by the plugin to mirror a canonical sessionId's name
+     *     onto a rotated sid (after `claude --resume`), so future lookups under either
+     *     id resolve to the same name.
+     */
+    data class NameEntry(val name: String, val setBy: String, val setAt: Long)
 
     // ══════════════════════════════════════════════════════════════
     // CONFIG PARSING

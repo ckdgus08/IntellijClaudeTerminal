@@ -440,6 +440,13 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                 // Genuine close. State change (session won't auto-restore next time) so logs
                 // at info regardless of verbose mode.
                 synchronized(c.userClosedSessions) { c.userClosedSessions.add(sid) }
+                // Persist the user-close BEFORE any save can fire so a crash between this
+                // moment and the next save still respects the close on restart. Was in-memory
+                // only pre-1.0.17 — a hard kill / power loss between close and next save
+                // resurrected the closed tab.
+                try { storage.addUserClosed(projectHash(project), sid) } catch (e: Exception) {
+                    LOG.warn("[ClaudeTabs] user-closed persist failed for sid=$sid: ${e.message}")
+                }
                 LOG.info("[ClaudeTabs] Tab closed by user — session $sid removed from restore (tab='$tabName')")
                 // Immediate persist: subtract from restore file right now. Don't wait for the
                 // next 5-second poll — the user might close Rider in the next second, in
@@ -545,12 +552,33 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                 // subtraction once the high-water-mark union catches it.
                 return
             }
-            val content = storage.serialiseSessions(filtered)
-            val f = storage.restoreFile(projectHash)
-            f.parentFile?.mkdirs()
-            storage.writeAtomic(f, content)
-            storage.writeSnapshot(projectHash, content, snapshotKeepCount)
-            LOG.info("[ClaudeTabs] Restore file updated: $sid removed (${filtered.size} session(s) remain)")
+            // Bug A fix (1.0.17): route through storage.saveState so the empty-write guard
+            // (Storage.kt:289-295) and the 3-backup rotation cover this path. Pre-1.0.17
+            // this wrote directly via writeAtomic, bypassing both guards — and on
+            // false-positive close events during IDE-update tab thrash that wiped every
+            // session in the file to [], the rotation would NOT have been triggered and
+            // the rescue backup would be gone too.
+            //
+            // We pass `existing` as newSessions (everything from disk minus the sid we're
+            // removing — accomplished by listing sid in userClosedSessionIds so saveState's
+            // union-then-subtract semantics produce the same `filtered` result). We DON'T
+            // re-filter by transcript here (sid removal is independent of transcript state).
+            val asStorage = existing.map { ClaudeTabsStorage.SavedSession(it.sessionId, it.cwd, it.tabName, it.bypassPermissions) }
+            val written = storage.saveState(
+                projectHash = projectHash,
+                newSessions = asStorage,
+                keepCount = snapshotKeepCount,
+                userClosedSessionIds = setOf(sid),
+                transcriptCheck = null,
+            )
+            if (written == null) {
+                // saveState refused to write — either the result was empty (preservation
+                // guard fired) or the file became unreadable between our read and the save.
+                // Either way, log and move on; the next poll will retry.
+                LOG.debug("[ClaudeTabs][verify] sid=$sid save preserved by guard (write skipped)")
+            } else {
+                LOG.info("[ClaudeTabs] Restore file updated: $sid removed (${filtered.size} session(s) remain) — backup-1 rotated")
+            }
         } catch (e: Exception) {
             LOG.warn("[ClaudeTabs][verify] sid=$sid immediate save failed: ${e.message}")
         }
@@ -587,6 +615,32 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         }
         LOG.info("[ClaudeTabs] Verbose logs: ${if (isVerboseLogging()) "ON (bypassing rate limits)" else "OFF (rate-limited; set Registry rider.claude.tabs.verboseLogs=true to enable)"}")
         LOG.info("[ClaudeTabs] Close detection: verify delay=${CLOSE_VERIFY_DELAY_MS}ms (widget-attachment, no startup grace) (ProjectCtx.startupAt=${ctx(project).startupAt})")
+        // Self-test (1.0.17): probe the load-bearing APIs we depend on at startup. If any
+        // fail, the save path is still resilient (it uses ~/.claude/sessions/*.json — not
+        // the terminal APIs — for the active-sessions list), but cosmetic features like
+        // name-application and close-detection rely on these. Surfacing the failure mode
+        // here means a user filing an issue can include this line instead of us asking
+        // them to instrument the IDE.
+        try {
+            val tw = TerminalToolWindowManager.getInstance(project).toolWindow
+            val terminalBackend = try {
+                Class.forName("com.intellij.terminal.backend.TerminalTabsManager"); true
+            } catch (_: Throwable) { false }
+            val terminalFrontend = try {
+                Class.forName("com.intellij.terminal.frontend.toolwindow.TerminalToolWindowTabsManager"); true
+            } catch (_: Throwable) { false }
+            val dockManager = try {
+                Class.forName("com.intellij.openapi.fileEditor.impl.DockManager"); true
+            } catch (_: Throwable) { false }
+            val namesFileExists = storage.namesFile.exists()
+            val namesEntryCount = try { storage.loadNames().size } catch (_: Exception) { -1 }
+            LOG.info("[ClaudeTabs] Self-test: toolWindow=${tw != null} backend=$terminalBackend frontend=$terminalFrontend dockManager=$dockManager names.json=${if (namesFileExists) "present(${namesEntryCount})" else "missing"}")
+            if (tw == null) {
+                LOG.warn("[ClaudeTabs] Self-test: Terminal tool window unavailable for this project — name-application is disabled; save data remains intact via SessionsDirScanner. Sessions will still restore on next start, but tab strip name re-apply won't work.")
+            }
+        } catch (e: Exception) {
+            LOG.debug("[ClaudeTabs] Self-test probe failed (non-fatal): ${e.message}")
+        }
         LOG.info("[ClaudeTabs] ════════════════════════════════════════════════════════")
         TABS_DIR.mkdirs()
         maybeWriteConfigTemplate()
@@ -594,6 +648,32 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         deployClaudeIntegration()
         pruneStaleHistoryEntries()
         pruneStaleRestoreEntries(project)
+
+        // Hydrate the in-memory userClosed set from disk so a tab the user X-ed in a previous
+        // Rider session (and then crashed before the next save) doesn't get auto-restored.
+        // Was in-memory only pre-1.0.17 — that lost user-closes across hard kills.
+        try {
+            val persisted = storage.loadUserClosed(projectHash(project))
+            if (persisted.isNotEmpty()) {
+                val c = ctx(project)
+                synchronized(c.userClosedSessions) { c.userClosedSessions.addAll(persisted) }
+                LOG.info("[ClaudeTabs] Loaded ${persisted.size} persisted user-closed sid(s) from disk")
+            }
+        } catch (e: Exception) {
+            LOG.debug("[ClaudeTabs] user-closed load failed: ${e.message}")
+        }
+
+        // Maintain project-index.json (1.0.17): one global file mapping cwd → projectHash so
+        // the /tabs-status skill can resolve the current project in ~5ms via a Read instead
+        // of paying ~500-800ms for a Node cold-start to walk up looking for .idea/.
+        // Upserted on every project open; entries that no longer correspond to an open
+        // project just stay in the index (harmless — at worst a stale basePath that no
+        // ancestor matches, then the skill falls back to Node).
+        try {
+            updateProjectIndex(project)
+        } catch (e: Exception) {
+            LOG.debug("[ClaudeTabs] project-index.json update failed: ${e.message}")
+        }
 
         val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
 
@@ -1543,10 +1623,19 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                     val content = storage.serialiseSessions(outcome.updated)
                     val f = storage.restoreFile(projectHash)
                     f.parentFile?.mkdirs()
+                    // Rotate backups BEFORE overwriting live so backup-1 always holds the
+                    // pre-rename state. Defense in depth alongside writeAtomic.
+                    storage.rotateBackups(projectHash, content)
                     storage.writeAtomic(f, content)
                     storage.writeSnapshot(projectHash, content, snapshotKeepCount)
-                    LOG.info("[ClaudeTabs] /tab persisted: $canonicalSessionId → '$newName' (restore file + snapshot updated)")
+                    LOG.info("[ClaudeTabs] /tab persisted: $canonicalSessionId → '$newName' (restore file + snapshot + backup-1 updated)")
                 }
+            }
+            // Persist the name to names.json regardless of whether the restore file changed.
+            // names.json is the durable source of truth for tab names; the restore file is
+            // the active-sessions list. They update together but for different reasons.
+            try { storage.upsertName(canonicalSessionId, newName, "user") } catch (e: Exception) {
+                LOG.debug("[ClaudeTabs] names.json upsert failed for $canonicalSessionId: ${e.message}")
             }
         } catch (e: Exception) {
             LOG.debug("[ClaudeTabs] persistRenameImmediately failed: ${e.message}")
@@ -1675,6 +1764,38 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
      */
     private fun poll(project: Project) {
         val c = ctx(project)
+
+        // Startup-grace gate (1.0.17): during the first 60s after this project's plugin
+        // start, refuse to save IF the restore-spawn hasn't completed yet AND we'd produce
+        // an empty active set. Why: in that window, the spawned tabs may not yet have
+        // their Claude processes fully alive, the SessionsDirScanner returns nothing, and
+        // a save with newSessions=[] would (in the bypass branch we just removed) have
+        // wiped the file. saveState's empty-guard now protects against that, but adding
+        // an explicit "don't even try yet" reduces noise and surface area. The TERMSESS
+        // and rename fallback above still run — those are name-application, not save.
+        val sinceStartupMs = System.currentTimeMillis() - c.startupAt
+        val inStartupGrace = sinceStartupMs < 60_000 && !c.restoreFired && c.pendingRestores.isNotEmpty()
+        if (inStartupGrace) {
+            if (c.pollCount % 12 == 0) {
+                LOG.info("[ClaudeTabs] Poll save SKIPPED — startup grace (${sinceStartupMs}ms < 60s, restore not yet fired, ${c.pendingRestores.size} pending)")
+            }
+            // Still process the rename-file watcher fallback so /tab inside the grace
+            // window applies. Skip only the active-session save.
+            TABS_DIR.listFiles()?.filter { it.name.startsWith("termsess-") && it.name.endsWith(".json") }?.forEach { f ->
+                try {
+                    val termSessionId = f.name.removePrefix("termsess-").removeSuffix(".json")
+                    if ("termsess-$termSessionId" !in renamedSessions) {
+                        val name = extractJsonString(f.readText(), "name") ?: return@forEach
+                        handleTermSessionRename(project, termSessionId, name)
+                        f.delete()
+                    }
+                } catch (e: Exception) {
+                    LOG.debug("[ClaudeTabs] termsess file processing failed (grace): ${e.message}")
+                }
+            }
+            return
+        }
+
         // Poll fallback: process any unhandled termsess-*.json files
         TABS_DIR.listFiles()?.filter { it.name.startsWith("termsess-") && it.name.endsWith(".json") }?.forEach { f ->
             try {
@@ -1713,6 +1834,12 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             // id from sessions/<pid>.json) against a resumed session.
             if (sessionId != rawSessionId) {
                 sessionAliases[rawSessionId] = sessionId
+                // Mirror the name onto the rotated id in names.json too, so future bash
+                // scripts that see the rotated id and look up the name find the canonical
+                // entry without needing to re-do the canonicalize walk.
+                try { storage.aliasName(sessionId, rawSessionId) } catch (e: Exception) {
+                    LOG.debug("[ClaudeTabs] aliasName failed for $rawSessionId: ${e.message}")
+                }
             }
             // Record Content → sessionId so the ContentManagerListener can identify which
             // session is in a tab that the user just closed via the X / right-click menu.
@@ -1762,28 +1889,37 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                 LOG.info("[ClaudeTabs] POLL RENAME: '${tab.tabName}' → '$name' (file=${renameFile.name})")
                 lastAppliedName[sessionId] = name
                 lastAppliedName[rawSessionId] = name
+                // names.json is keyed by canonical sid — that's what the save loop reads.
+                try { storage.upsertName(sessionId, name, "user") } catch (e: Exception) {
+                    LOG.debug("[ClaudeTabs] names.json upsert failed for $sessionId: ${e.message}")
+                }
                 renameTab(project, tab, name, sessionId = sessionId)
                 renamedSessions.add(sessionId)
                 renamedSessions.add(rawSessionId)
                 try { renameFile.delete() } catch (_: Exception) { }
             }
 
-            // Resolve the title we'll save. buildTitle() can return an AI-Assistant-overlay-
-            // tainted string (e.g. "⠐ dfn3-adaptive-bleed-bridge") because the overlay writes
-            // into userDefinedTitle, which wins in buildTitle's priority chain. Saving that
-            // would persist the glyph into restore-<hash>.json and a future restored tab would
-            // show the glyph forever. Detect overlay-shape names and fall back to the cleanest
-            // signal we have: the last user-applied /tab name, then any previously-tracked
-            // session name, then the raw tab name, then a default.
-            val rawTitle = tab.widget?.terminalTitle?.buildTitle() ?: tab.tabName
-            val title = if (rawTitle != null && ClaudeTabsHelpers.isAiOverlayName(rawTitle, project.name)) {
-                lastAppliedName[sessionId]
-                    ?: lastAppliedName[rawSessionId]
-                    ?: c.previousActive[sessionId]?.tabName
-                    ?: tab.tabName
-                    ?: "Claude"
-            } else {
-                rawTitle ?: "Claude"
+            // Name resolution priority (1.0.17):
+            //   1. names.json — the durable user-given name (written by /tab via persistRename-
+            //      Immediately and the poll-loop rename branch). This bypasses the AI Assistant
+            //      overlay entirely: even if the live widget title is corrupted with "✳ Foo",
+            //      we save the clean name from disk.
+            //   2. Legacy fallback chain — for sessions that pre-date names.json: try the
+            //      widget title, detect/reject overlay shapes, fall back through in-memory
+            //      caches. Same logic as pre-1.0.17 — kept for backward compatibility with
+            //      sessions whose only name record is in restore-<hash>.json from older saves.
+            val nameFromStore = storage.nameFor(sessionId) ?: storage.nameFor(rawSessionId)
+            val title = nameFromStore ?: run {
+                val rawTitle = tab.widget?.terminalTitle?.buildTitle() ?: tab.tabName
+                if (rawTitle != null && ClaudeTabsHelpers.isAiOverlayName(rawTitle, project.name)) {
+                    lastAppliedName[sessionId]
+                        ?: lastAppliedName[rawSessionId]
+                        ?: c.previousActive[sessionId]?.tabName
+                        ?: tab.tabName
+                        ?: "Claude"
+                } else {
+                    rawTitle ?: "Claude"
+                }
             }
 
             // Save EVERY Claude session that has a transcript on disk — generic tab names
@@ -1827,16 +1963,22 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             canonicalSessionId = ::canonicalSessionIdFor,
             hasTranscript = ::hasTranscript,
             resolveName = { sid ->
-                // Name priority for sessions found via direct scan:
-                //   1. The widget we spawned for this session (current live title)
-                //   2. The name we last applied via /tab
-                //   3. The name we tracked in previousActive
-                //   4. "Claude" default
+                // Name priority for sessions found via direct scan (1.0.17 order):
+                //   1. names.json — durable on-disk store, set by /tab. Beats every other
+                //      source because it's the user's explicit choice and can't be
+                //      corrupted by the AI Assistant overlay (we don't read titles into it).
+                //   2. The widget we spawned for this session (live title — only used when
+                //      names.json has nothing AND the widget title isn't an overlay shape).
+                //   3. The name we last applied via /tab (in-memory cache).
+                //   4. The name we tracked in previousActive.
+                //   5. "Claude" default.
+                storage.nameFor(sid)?.let { return@scan it }
                 val fromWidget = run {
                     val w = spawnedWidgets[sid]
                     try { w?.terminalTitle?.buildTitle() } catch (_: Exception) { null }
                 }
-                fromWidget ?: lastAppliedName[sid] ?: c.previousActive[sid]?.tabName ?: "Claude"
+                val widgetClean = if (fromWidget != null && ClaudeTabsHelpers.isAiOverlayName(fromWidget, project.name)) null else fromWidget
+                widgetClean ?: lastAppliedName[sid] ?: c.previousActive[sid]?.tabName ?: "Claude"
             },
             readBypass = ::readPermissionMode,
         )
@@ -2094,6 +2236,59 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         ClaudeTabsHelpers.projectHashForPath(project.basePath)
 
     private fun getStateFile(project: Project): File = File(STATE_DIR, "restore-${projectHash(project)}.json")
+
+    /**
+     * Upsert this project into `~/.claude/rider-plugin/project-index.json` (1.0.17).
+     *
+     * The file is a single JSON object `{"projects":[{...}]}` — one entry per project hash.
+     * The `/tabs-status` skill reads it instead of cold-starting Node (~500ms saved on
+     * Windows). Idempotent; safe to call on every `runActivity`.
+     *
+     * Read-modify-write under a synchronized block guards against two projects opening at
+     * the same instant racing each other and one's entry being lost.
+     */
+    @Synchronized
+    private fun updateProjectIndex(project: Project) {
+        val basePath = project.basePath ?: return
+        val hash = projectHash(project)
+        val name = project.name
+        val indexFile = File(STATE_DIR, "project-index.json")
+
+        val existing = if (indexFile.exists()) {
+            try { indexFile.readText() } catch (_: Exception) { "" }
+        } else {
+            ""
+        }
+
+        // Parse the existing array of {"hash":"...","basePath":"...","name":"..."} objects.
+        val entries = linkedMapOf<String, Triple<String, String, String>>() // hash → (hash, basePath, name)
+        if (existing.isNotBlank()) {
+            val re = Regex("""\{[^}]*"hash"\s*:\s*"([^"]+)"[^}]*"basePath"\s*:\s*"((?:[^"\\]|\\.)*)"[^}]*"name"\s*:\s*"((?:[^"\\]|\\.)*)"[^}]*\}""")
+            for (m in re.findAll(existing)) {
+                val h = m.groupValues[1]
+                val b = m.groupValues[2].replace("\\\\", "\\").replace("\\\"", "\"")
+                val n = m.groupValues[3].replace("\\\\", "\\").replace("\\\"", "\"")
+                entries[h] = Triple(h, b, n)
+            }
+        }
+        val before = entries[hash]
+        val after = Triple(hash, basePath, name)
+        if (before == after) return  // no-op write — skip the disk hit
+        entries[hash] = after
+
+        val body = entries.values.joinToString(",\n") { (h, b, n) ->
+            "    {\"hash\":\"${ClaudeTabsHelpers.esc(h)}\",\"basePath\":\"${ClaudeTabsHelpers.esc(b)}\",\"name\":\"${ClaudeTabsHelpers.esc(n)}\"}"
+        }
+        val content = "{\n  \"projects\": [\n$body\n  ]\n}\n"
+        indexFile.parentFile?.mkdirs()
+        // Reuse storage's atomic write helper.
+        try {
+            storage.writeAtomic(indexFile, content)
+            LOG.debug("[ClaudeTabs] project-index.json updated for $hash → $basePath")
+        } catch (e: Exception) {
+            LOG.debug("[ClaudeTabs] project-index.json write failed: ${e.message}")
+        }
+    }
 
     /**
      * List this project's snapshot files in the snapshots dir, newest first (by filename —

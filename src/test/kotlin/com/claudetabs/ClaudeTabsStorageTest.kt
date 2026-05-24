@@ -3,6 +3,7 @@ package com.claudetabs
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -490,5 +491,220 @@ class ClaudeTabsStorageTest {
         assertTrue("old-1 must survive: $text", text.contains("old-1"))
         assertTrue("old-2 must survive: $text", text.contains("old-2"))
         assertTrue("new-1 must be added: $text", text.contains("new-1"))
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // names.json — single source of truth for tab names
+    // ══════════════════════════════════════════════════════════════
+
+    @Test fun names_missingFile_loadReturnsEmptyMap() {
+        assertTrue(storage.loadNames().isEmpty())
+    }
+
+    @Test fun names_emptyObjectFile_loadReturnsEmptyMap() {
+        storage.namesFile.parentFile.mkdirs()
+        storage.namesFile.writeText("{}")
+        assertTrue(storage.loadNames().isEmpty())
+    }
+
+    @Test fun names_upsertCreatesFileAndPersists() {
+        storage.upsertName("sid-1", "Login Bug", "user", now = 1000L)
+        assertTrue(storage.namesFile.exists())
+        val loaded = storage.loadNames()
+        assertEquals(1, loaded.size)
+        assertEquals("Login Bug", loaded["sid-1"]?.name)
+        assertEquals("user", loaded["sid-1"]?.setBy)
+        assertEquals(1000L, loaded["sid-1"]?.setAt)
+    }
+
+    @Test fun names_upsertReplacesExistingEntry() {
+        storage.upsertName("sid-1", "Old Name", "user", now = 1000L)
+        storage.upsertName("sid-1", "New Name", "user", now = 2000L)
+        val loaded = storage.loadNames()
+        assertEquals(1, loaded.size)
+        assertEquals("New Name", loaded["sid-1"]?.name)
+        assertEquals(2000L, loaded["sid-1"]?.setAt)
+    }
+
+    @Test fun names_upsertSkipsWriteWhenContentIdentical() {
+        storage.upsertName("sid-1", "Same Name", "user", now = 1000L)
+        val mtime1 = storage.namesFile.lastModified()
+        Thread.sleep(10) // ensure mtime would change if a write happened
+        storage.upsertName("sid-1", "Same Name", "user", now = 9999L)
+        val mtime2 = storage.namesFile.lastModified()
+        assertEquals("no-op write should not change mtime", mtime1, mtime2)
+    }
+
+    @Test fun names_nameForCanonicalLookup() {
+        storage.upsertName("sid-1", "Tab A", "user")
+        storage.upsertName("sid-2", "Tab B", "hook")
+        assertEquals("Tab A", storage.nameFor("sid-1"))
+        assertEquals("Tab B", storage.nameFor("sid-2"))
+        assertNull(storage.nameFor("nonexistent"))
+    }
+
+    @Test fun names_aliasCopiesNameToNewSid() {
+        storage.upsertName("canonical-1", "Original Name", "user", now = 1000L)
+        storage.aliasName("canonical-1", "rotated-1", now = 2000L)
+        val loaded = storage.loadNames()
+        assertEquals(2, loaded.size)
+        assertEquals("Original Name", loaded["canonical-1"]?.name)
+        assertEquals("Original Name", loaded["rotated-1"]?.name)
+        assertEquals("user", loaded["canonical-1"]?.setBy)
+        assertEquals("alias", loaded["rotated-1"]?.setBy)
+    }
+
+    @Test fun names_aliasIsNoOpWhenTargetAlreadyExists() {
+        storage.upsertName("src", "Source", "user")
+        storage.upsertName("dst", "Pre-existing", "user")
+        storage.aliasName("src", "dst")
+        assertEquals("Pre-existing", storage.nameFor("dst"))
+    }
+
+    @Test fun names_pruneDropsEntriesWithoutPredicate() {
+        storage.upsertName("keep", "K", "user")
+        storage.upsertName("drop1", "D1", "user")
+        storage.upsertName("drop2", "D2", "user")
+        val removed = storage.pruneNames { it == "keep" }
+        assertEquals(2, removed)
+        assertEquals(1, storage.loadNames().size)
+        assertNotNull(storage.nameFor("keep"))
+    }
+
+    @Test fun names_handlesUnicodeAndEscapesRoundTrip() {
+        val name = "✳ Tab \"with\" \\ backslash"
+        storage.upsertName("sid-x", name, "user")
+        assertEquals(name, storage.nameFor("sid-x"))
+    }
+
+    @Test fun names_loadCachesUntilMtimeChanges() {
+        storage.upsertName("sid-1", "Original", "user")
+        assertEquals("Original", storage.nameFor("sid-1"))
+        // Sneak a manual edit that bypasses the cache invalidation. Without mtime change
+        // this would normally be hidden by the cache — but the test ensures we DO re-read
+        // on mtime change by touching the file's mtime forward.
+        val newContent = """{"sid-1":{"name":"Manual","setBy":"user","setAt":1}}"""
+        Thread.sleep(20) // ensure new mtime
+        storage.namesFile.writeText(newContent)
+        assertTrue("manual mtime bump", storage.namesFile.setLastModified(System.currentTimeMillis() + 1000))
+        assertEquals("Manual", storage.nameFor("sid-1"))
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // user-closed store
+    // ══════════════════════════════════════════════════════════════
+
+    @Test fun userClosed_missingFileReturnsEmptySet() {
+        assertTrue(storage.loadUserClosed(projectHash).isEmpty())
+    }
+
+    @Test fun userClosed_addAndLoadRoundTrip() {
+        assertTrue(storage.addUserClosed(projectHash, "sid-1"))
+        assertTrue(storage.addUserClosed(projectHash, "sid-2"))
+        val loaded = storage.loadUserClosed(projectHash)
+        assertEquals(setOf("sid-1", "sid-2"), loaded)
+    }
+
+    @Test fun userClosed_addIdempotent() {
+        assertTrue(storage.addUserClosed(projectHash, "sid-1"))
+        assertFalse("second add should report no change", storage.addUserClosed(projectHash, "sid-1"))
+    }
+
+    @Test fun userClosed_perProjectIsolation() {
+        storage.addUserClosed("proj-A", "sid-A1")
+        storage.addUserClosed("proj-B", "sid-B1")
+        assertEquals(setOf("sid-A1"), storage.loadUserClosed("proj-A"))
+        assertEquals(setOf("sid-B1"), storage.loadUserClosed("proj-B"))
+    }
+
+    @Test fun userClosed_pruneDropsEntriesWithoutPredicate() {
+        storage.addUserClosed(projectHash, "keep")
+        storage.addUserClosed(projectHash, "drop")
+        val removed = storage.pruneUserClosed(projectHash) { it == "keep" }
+        assertEquals(1, removed)
+        assertEquals(setOf("keep"), storage.loadUserClosed(projectHash))
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // backups — 3-tier recovery
+    // ══════════════════════════════════════════════════════════════
+
+    @Test fun backups_rotateCreatesBackup1OnFirstWrite() {
+        val content = storage.serialiseSessions(listOf(session("a", "A")))
+        storage.rotateBackups(projectHash, content)
+        assertTrue(storage.backupFile(projectHash, 1).exists())
+        assertFalse(storage.backupFile(projectHash, 2).exists())
+        assertFalse(storage.backupFile(projectHash, 3).exists())
+    }
+
+    @Test fun backups_rotateShiftsExistingBackups() {
+        val v1 = storage.serialiseSessions(listOf(session("a", "v1")))
+        val v2 = storage.serialiseSessions(listOf(session("a", "v2")))
+        val v3 = storage.serialiseSessions(listOf(session("a", "v3")))
+        val v4 = storage.serialiseSessions(listOf(session("a", "v4")))
+        storage.rotateBackups(projectHash, v1)
+        storage.rotateBackups(projectHash, v2)
+        storage.rotateBackups(projectHash, v3)
+        storage.rotateBackups(projectHash, v4)  // pushes v1 out
+
+        assertEquals(v4, storage.backupFile(projectHash, 1).readText())
+        assertEquals(v3, storage.backupFile(projectHash, 2).readText())
+        assertEquals(v2, storage.backupFile(projectHash, 3).readText())
+    }
+
+    @Test fun backups_rotateSkipsWhenIdenticalToBackup1() {
+        val content = storage.serialiseSessions(listOf(session("a", "Stable")))
+        storage.rotateBackups(projectHash, content)
+        val originalMtime = storage.backupFile(projectHash, 1).lastModified()
+        Thread.sleep(20)
+        // Second call with same content: backup-1 should not be rewritten
+        storage.rotateBackups(projectHash, content)
+        assertEquals(originalMtime, storage.backupFile(projectHash, 1).lastModified())
+        assertFalse("no rotation should happen", storage.backupFile(projectHash, 2).exists())
+    }
+
+    @Test fun backups_rotateSkipsEmptyContent() {
+        storage.rotateBackups(projectHash, "[]")
+        storage.rotateBackups(projectHash, "")
+        storage.rotateBackups(projectHash, "   ")
+        assertFalse(storage.backupFile(projectHash, 1).exists())
+    }
+
+    @Test fun load_fallsBackToBackupWhenLiveCorrupt() {
+        // Write a non-empty backup-1, then corrupt the live file.
+        val good = listOf(session("recovered", "From Backup"))
+        storage.rotateBackups(projectHash, storage.serialiseSessions(good))
+        storage.restoreFile(projectHash).also {
+            it.parentFile.mkdirs()
+            it.writeText("garbage")
+        }
+        val result = storage.loadRestoreWithFallback(projectHash)
+        assertEquals(1, result.sessions.size)
+        assertEquals("recovered", result.sessions[0].sessionId)
+        assertEquals("backup-1", result.tier)
+    }
+
+    @Test fun load_fallsThroughBackup1ToBackup2WhenBoth1AndLiveCorrupt() {
+        val v1 = listOf(session("v1", "V1"))
+        val v2 = listOf(session("v2", "V2"))
+        storage.rotateBackups(projectHash, storage.serialiseSessions(v1))
+        storage.rotateBackups(projectHash, storage.serialiseSessions(v2))
+        // Corrupt live and backup-1
+        storage.restoreFile(projectHash).also { it.parentFile.mkdirs(); it.writeText("garbage") }
+        storage.backupFile(projectHash, 1).writeText("also garbage")
+        // backup-2 still has v1 content
+        val result = storage.loadRestoreWithFallback(projectHash)
+        assertEquals("v1", result.sessions[0].sessionId)
+        assertEquals("backup-2", result.tier)
+    }
+
+    @Test fun saveState_writesBackupToBackup1() {
+        // saveState rotates backups before each non-empty write.
+        storage.saveState(projectHash, listOf(session("a", "First")), 5, now = 100L)
+        assertTrue("backup-1 should exist after first save",
+            storage.backupFile(projectHash, 1).exists())
+        storage.saveState(projectHash, listOf(session("a", "Second")), 5, now = 200L)
+        val b1Content = storage.backupFile(projectHash, 1).readText()
+        assertTrue("backup-1 should reflect most recent save", b1Content.contains("Second"))
     }
 }

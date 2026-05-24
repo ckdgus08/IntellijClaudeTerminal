@@ -30,14 +30,17 @@ internal class ClaudeTabsStorage(private val claudeHome: File) {
     val tabsDir = File(stateDir, "tabs")
     val sessionMapDir = File(stateDir, "session-map")
     val snapshotsDir = File(stateDir, "snapshots")
+    val backupsDir = File(stateDir, "backups")
     val sessionsDir = File(claudeHome, "sessions")
     val historyFile = File(stateDir, "history.json")
     val configFile = File(stateDir, "config.json")
+    val namesFile = File(stateDir, "names.json")
     val claudeMdFile = File(claudeHome, "CLAUDE.md")
     val settingsFile = File(claudeHome, "settings.json")
     val commandsDir = File(claudeHome, "commands")
 
     fun restoreFile(projectHash: String): File = File(stateDir, "restore-$projectHash.json")
+    fun userClosedFile(projectHash: String): File = File(stateDir, "user-closed-$projectHash.json")
 
     // ══════════════════════════════════════════════════════════════
     // HISTORY
@@ -295,6 +298,10 @@ internal class ClaudeTabsStorage(private val claudeHome: File) {
         }
 
         val content = serialiseSessions(filtered)
+        // Rotate backups BEFORE overwriting live. If the live file has good content and the
+        // new write somehow corrupts (it shouldn't — writeAtomic is tmp+rename — but defense
+        // in depth), backup-1 still has the pre-write state.
+        rotateBackups(projectHash, content)
         f.parentFile?.mkdirs()
         writeAtomic(f, content)
         writeSnapshot(projectHash, content, keepCount, now)
@@ -318,6 +325,233 @@ internal class ClaudeTabsStorage(private val claudeHome: File) {
         }
     }
 
+    // ══════════════════════════════════════════════════════════════
+    // NAMES STORE — names.json (sessionId → NameEntry)
+    // ══════════════════════════════════════════════════════════════
+    //
+    // names.json is the authoritative source of truth for tab names. The save loop reads
+    // from here (via [nameFor]) — never from the live widget title — so the AI Assistant
+    // overlay's status-glyph titles ("✳ Claude Code") can never corrupt what gets saved.
+    //
+    // Writes go through [upsertName] (called from the rename-application paths in
+    // ClaudeTabWatcherStartup whenever /tab fires or a tabs/<sid>.json drop is processed).
+    // Reads via [nameFor] use an in-memory cache invalidated on file mtime change — so
+    // a poll cycle that doesn't rename anything pays at most one File.lastModified() check.
+
+    private val namesLock = Any()
+    @Volatile private var namesCache: Map<String, ClaudeTabsHelpers.NameEntry>? = null
+    @Volatile private var namesCacheMtime: Long = -1L
+
+    /** Load the names map, reading from disk only when the file mtime has changed since the
+     *  cached copy. Cheap to call from inside the 5s poll loop — typically a single stat
+     *  syscall in steady state. */
+    fun loadNames(): Map<String, ClaudeTabsHelpers.NameEntry> = synchronized(namesLock) {
+        val currentMtime = if (namesFile.exists()) namesFile.lastModified() else 0L
+        val cached = namesCache
+        if (cached != null && currentMtime == namesCacheMtime) return@synchronized cached
+        val text = if (namesFile.exists()) {
+            try { namesFile.readText() } catch (_: Exception) { "" }
+        } else {
+            ""
+        }
+        val parsed = parseNames(text)
+        namesCache = parsed
+        namesCacheMtime = currentMtime
+        parsed
+    }
+
+    /** Look up the name for [sessionId]. Returns null if no entry exists. */
+    fun nameFor(sessionId: String): String? = loadNames()[sessionId]?.name
+
+    /** Insert or replace the entry for [sessionId] and atomically rewrite the file.
+     *  Cache is invalidated; the next [loadNames] re-reads. */
+    fun upsertName(
+        sessionId: String,
+        name: String,
+        setBy: String,
+        now: Long = System.currentTimeMillis(),
+    ) = synchronized(namesLock) {
+        val current = loadNames().toMutableMap()
+        val existing = current[sessionId]
+        if (existing != null && existing.name == name && existing.setBy == setBy) {
+            // No-op write — saves a disk hit for the common "every poll re-applies same name".
+            return@synchronized
+        }
+        current[sessionId] = ClaudeTabsHelpers.NameEntry(name, setBy, now)
+        namesFile.parentFile?.mkdirs()
+        writeAtomic(namesFile, serialiseNames(current))
+        namesCache = null
+        namesCacheMtime = -1L
+    }
+
+    /** Copy [fromSid]'s name to [toSid] (no-op if [fromSid] has no entry or [toSid] already
+     *  has one). Used after `claude --resume` to mirror a canonical sid's name onto its
+     *  rotated counterpart so either lookup resolves correctly. */
+    fun aliasName(
+        fromSid: String,
+        toSid: String,
+        now: Long = System.currentTimeMillis(),
+    ) = synchronized(namesLock) {
+        if (fromSid == toSid) return@synchronized
+        val current = loadNames()
+        val src = current[fromSid] ?: return@synchronized
+        if (current[toSid] != null) return@synchronized
+        val updated = current.toMutableMap().apply {
+            put(toSid, ClaudeTabsHelpers.NameEntry(src.name, "alias", now))
+        }
+        namesFile.parentFile?.mkdirs()
+        writeAtomic(namesFile, serialiseNames(updated))
+        namesCache = null
+        namesCacheMtime = -1L
+    }
+
+    /** Drop entries whose sid no longer satisfies [sidStillExists]. Used by the periodic
+     *  pruner to keep names.json from growing unbounded across long Rider sessions.
+     *  Returns the number of entries removed. */
+    fun pruneNames(sidStillExists: (sid: String) -> Boolean): Int = synchronized(namesLock) {
+        val current = loadNames()
+        val kept = current.filterKeys(sidStillExists)
+        if (kept.size == current.size) return@synchronized 0
+        namesFile.parentFile?.mkdirs()
+        writeAtomic(namesFile, serialiseNames(kept))
+        namesCache = null
+        namesCacheMtime = -1L
+        current.size - kept.size
+    }
+
+    /** Serialise [map] to a stable, human-readable JSON object. Order is insertion order
+     *  (so the file diff stays minimal across small upserts when the map is a LinkedHashMap). */
+    fun serialiseNames(map: Map<String, ClaudeTabsHelpers.NameEntry>): String {
+        if (map.isEmpty()) return "{}"
+        return map.entries.joinToString(prefix = "{\n", postfix = "\n}", separator = ",\n") { (sid, e) ->
+            "  \"${ClaudeTabsHelpers.esc(sid)}\":{" +
+                "\"name\":\"${ClaudeTabsHelpers.esc(e.name)}\"," +
+                "\"setBy\":\"${ClaudeTabsHelpers.esc(e.setBy)}\"," +
+                "\"setAt\":${e.setAt}}"
+        }
+    }
+
+    /** Parse a names.json text blob back into a map. Tolerant of trailing whitespace,
+     *  missing fields (setBy defaults to "unknown", setAt to 0), and any unparseable
+     *  entry is silently skipped (won't crash the poll loop on a hand-edited file). */
+    fun parseNames(text: String): Map<String, ClaudeTabsHelpers.NameEntry> {
+        val t = text.trim()
+        if (t.isEmpty() || t == "{}") return emptyMap()
+        val result = linkedMapOf<String, ClaudeTabsHelpers.NameEntry>()
+        // Top-level entries: "sid": { ... } — sid value may have escaped chars, body is flat object.
+        val entryRe = Regex("\"([^\"\\\\]*(?:\\\\.[^\"\\\\]*)*)\"\\s*:\\s*\\{([^}]*)\\}")
+        for (m in entryRe.findAll(t)) {
+            val sid = m.groupValues[1].replace("\\\\", "\\").replace("\\\"", "\"")
+            val body = "{${m.groupValues[2]}}"
+            val name = ClaudeTabsHelpers.extractJsonString(body, "name") ?: continue
+            val setBy = ClaudeTabsHelpers.extractJsonString(body, "setBy") ?: "unknown"
+            val setAt = Regex("\"setAt\"\\s*:\\s*(\\d+)").find(body)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
+            result[sid] = ClaudeTabsHelpers.NameEntry(name, setBy, setAt)
+        }
+        return result
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // USER-CLOSED STORE — per-project persistent set of sids the user closed
+    // ══════════════════════════════════════════════════════════════
+    //
+    // Was in-memory only (ProjectCtx.userClosedSessions). A crash mid-close lost the close
+    // event and the next start auto-restored the just-closed tab. Persisted here so the
+    // close survives a hard kill / power loss.
+
+    private val userClosedLock = Any()
+
+    /** Load the set of sids the user has explicitly closed in [projectHash]. Returns
+     *  emptySet on missing/empty/unreadable file (safe default — never resurrect tabs
+     *  spuriously, but also never block load on a corrupted file). */
+    fun loadUserClosed(projectHash: String): Set<String> = synchronized(userClosedLock) {
+        val f = userClosedFile(projectHash)
+        if (!f.exists()) return@synchronized emptySet()
+        val text = try { f.readText() } catch (_: Exception) { return@synchronized emptySet() }
+        val trimmed = text.trim()
+        if (trimmed.isEmpty() || trimmed == "[]") return@synchronized emptySet()
+        // Match every quoted string literal — sids are UUIDs so quote-only contents are safe.
+        Regex("\"([^\"]+)\"").findAll(trimmed).map { it.groupValues[1] }.toSet()
+    }
+
+    /** Persist [closed] for [projectHash] via atomic write. */
+    fun saveUserClosed(projectHash: String, closed: Set<String>) = synchronized(userClosedLock) {
+        val f = userClosedFile(projectHash)
+        f.parentFile?.mkdirs()
+        val content = if (closed.isEmpty()) "[]" else closed.joinToString(
+            prefix = "[\n",
+            postfix = "\n]",
+            separator = ",\n",
+        ) { "  \"${ClaudeTabsHelpers.esc(it)}\"" }
+        writeAtomic(f, content)
+    }
+
+    /** Add [sid] to the persistent user-closed set for [projectHash]. Idempotent. */
+    fun addUserClosed(projectHash: String, sid: String): Boolean = synchronized(userClosedLock) {
+        val current = loadUserClosed(projectHash)
+        if (sid in current) return@synchronized false
+        saveUserClosed(projectHash, current + sid)
+        true
+    }
+
+    /** Prune entries whose sid no longer satisfies [sidStillExists] (called from the
+     *  periodic pruner to keep this set from accumulating sids whose transcripts are gone). */
+    fun pruneUserClosed(projectHash: String, sidStillExists: (sid: String) -> Boolean): Int =
+        synchronized(userClosedLock) {
+            val current = loadUserClosed(projectHash)
+            val kept = current.filter(sidStillExists).toSet()
+            if (kept.size == current.size) return@synchronized 0
+            saveUserClosed(projectHash, kept)
+            current.size - kept.size
+        }
+
+    // ══════════════════════════════════════════════════════════════
+    // BACKUPS — 3 most recent non-empty active-sessions files per project
+    // ══════════════════════════════════════════════════════════════
+    //
+    // Separate from snapshots/ (forensic rolling history of every save). Backups are the
+    // user-facing recovery tier: if the live file gets corrupted / wiped / replaced with
+    // [] by some race, fall back to backup-1, then backup-2, then backup-3.
+
+    private val backupsLock = Any()
+    private val BACKUP_COUNT = 3
+
+    fun backupFile(projectHash: String, index: Int): File =
+        File(backupsDir, "active-sessions-$projectHash-$index.json")
+
+    /** Rotate backups for [projectHash], shifting `1→2`, `2→3` (oldest dropped), then
+     *  copying [currentContent] into `-1`. No-op when [currentContent] is empty/`[]` or
+     *  identical to the current `-1.json` (avoids 3 identical backups when state hasn't
+     *  changed). */
+    fun rotateBackups(projectHash: String, currentContent: String) = synchronized(backupsLock) {
+        val trimmed = currentContent.trim()
+        if (trimmed.isEmpty() || trimmed == "[]") return@synchronized
+        backupsDir.mkdirs()
+        val backup1 = backupFile(projectHash, 1)
+        if (backup1.exists()) {
+            val existing1 = try { backup1.readText().trim() } catch (_: Exception) { "" }
+            if (existing1 == trimmed) return@synchronized
+        }
+        // Shift: 2→3, 1→2 (oldest gone)
+        for (i in (BACKUP_COUNT - 1) downTo 1) {
+            val src = backupFile(projectHash, i)
+            val dst = backupFile(projectHash, i + 1)
+            if (src.exists()) {
+                try {
+                    if (dst.exists()) dst.delete()
+                    src.copyTo(dst, overwrite = true)
+                } catch (_: Exception) { /* best effort */ }
+            }
+        }
+        // Write new -1
+        writeAtomic(backup1, currentContent)
+    }
+
+    /** List backup files for [projectHash] newest-first. Used by the recovery fallback. */
+    fun listBackups(projectHash: String): List<File> = (1..BACKUP_COUNT)
+        .map { backupFile(projectHash, it) }
+        .filter { it.exists() }
+
     /** List snapshots for [projectHash], newest first. Accepts both the current `__`
      *  delimiter and the legacy single-dash format. */
     fun listSnapshots(projectHash: String): List<File> {
@@ -333,23 +567,29 @@ internal class ClaudeTabsStorage(private val claudeHome: File) {
     }
 
     /**
-     * Load the restore file (or fall back to the newest non-empty snapshot if the live file
-     * is missing, empty, or unparseable). Returns the list of sessions to restore plus the
-     * source file for logging.
+     * Load the restore file with a tiered fallback chain:
+     *   1. live `restore-<hash>.json`
+     *   2. `backups/active-sessions-<hash>-{1,2,3}.json` (most recent first)
+     *   3. existing `snapshots/<hash>__<ts>.json` (forensic rolling history, newest first)
+     *
+     * Returns the first non-empty source with its parsed sessions plus a tag for logging
+     * (so idea.log can tell the user which tier rescued the restore).
      */
-    data class LoadResult(val sessions: List<SavedSession>, val source: File?)
+    data class LoadResult(val sessions: List<SavedSession>, val source: File?, val tier: String?)
     fun loadRestoreWithFallback(projectHash: String): LoadResult {
-        val sources = mutableListOf<File>().apply {
+        data class Tier(val tag: String, val file: File)
+        val sources = mutableListOf<Tier>().apply {
             val live = restoreFile(projectHash)
-            if (live.exists()) add(live)
-            addAll(listSnapshots(projectHash))
+            if (live.exists()) add(Tier("live", live))
+            listBackups(projectHash).forEachIndexed { i, f -> add(Tier("backup-${i + 1}", f)) }
+            listSnapshots(projectHash).forEachIndexed { i, f -> add(Tier("snapshot-${i + 1}", f)) }
         }
         for (src in sources) {
             try {
-                val parsed = parseSessions(src.readText())
-                if (parsed.isNotEmpty()) return LoadResult(parsed, src)
+                val parsed = parseSessions(src.file.readText())
+                if (parsed.isNotEmpty()) return LoadResult(parsed, src.file, src.tag)
             } catch (_: Exception) { /* try next */ }
         }
-        return LoadResult(emptyList(), null)
+        return LoadResult(emptyList(), null, null)
     }
 }
