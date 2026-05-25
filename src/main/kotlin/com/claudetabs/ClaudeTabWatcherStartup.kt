@@ -54,23 +54,11 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         /** Poll cadence for detecting rename files and session state changes. */
         private const val POLL_INTERVAL_MS = 5_000L
 
-        /**
-         * After a real-looking close event fires, defer this long before recording
-         * it. During the delay we check whether the captured [TerminalWidget] is
-         * still attached to any [com.intellij.ui.content.Content] in the terminal
-         * tool window. UI shuffles (split move, popout, drag-to-reorder, tool-
-         * window re-layout during restore) fire contentRemoved on the old Content
-         * but immediately re-attach the same widget to a new Content; genuine user
-         * closes leave the widget orphaned. 1.5 seconds is plenty for Rider to
-         * complete a shuffle (those happen synchronously in the swing event tick).
-         *
-         * Earlier builds also enforced a 30-second startup grace that
-         * unconditionally ignored every contentRemoved in the first half-minute.
-         * That grace ate user X-clicks on just-restored tabs (the most natural
-         * moment to close a tab is right after seeing it auto-restore). The
-         * widget-attachment verify is reliable regardless of timing, so the
-         * blanket grace is gone. */
-        const val CLOSE_VERIFY_DELAY_MS = 1_500L
+        /** Pending-close entries are dropped after this long without an observed
+         *  process-death. Generous (Rider kills child shells within milliseconds of
+         *  an X-click and Claude takes ~1s to clean up), so 30s is "if we haven't
+         *  seen the process die by now, it wasn't a real close." */
+        const val PENDING_CLOSE_EXPIRY_MS = 30_000L
 
         /** Root of Claude Code's user data (scripts, sessions, commands live under this). */
         private val CLAUDE_HOME = File(System.getProperty("user.home"), ".claude")
@@ -368,21 +356,32 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
          *  user-closed sessions don't come back on the next start. NOT populated when the
          *  PROJECT (or Rider itself) is closing — see [projectClosing]. */
         val userClosedSessions: MutableSet<String> = mutableSetOf(),
+        /** Sids whose `contentRemoveQuery` fired with no temporary-removed marker AND not
+         *  during projectClosing. Value is the wall-clock ms when added. The poll loop
+         *  promotes entries to [userClosedSessions] only after also confirming the Claude
+         *  process for that sid is DEAD. Entries that linger past 30s without process death
+         *  are dropped — those were ambiguous events (pane reorder we didn't catch, etc.),
+         *  NOT real user closes.
+         *
+         *  Why two signals: contentRemoveQuery alone false-positives on whole-window-close
+         *  (projectClosing flag races). Process-death alone false-positives on Claude
+         *  process crashes (`claude --resume` failures, OOM kills, etc. shouldn't be
+         *  recorded as user-closed). Requiring BOTH is the conservative choice that the
+         *  user explicitly asked for. */
+        val pendingClose: MutableMap<String, Long> = mutableMapOf(),
         /** Map from a terminal tab's `Content` to the canonical sessionId we know it holds.
          *  Populated by [getAllTabs] each poll; consulted by the `ContentManagerListener`
          *  when a Content is removed so we can identify which session was just closed.
          *  IdentityHashMap because `Content` doesn't implement value-equality. */
         val contentToSid: MutableMap<com.intellij.ui.content.Content, String> = java.util.IdentityHashMap(),
         /** True once the project is in its shutdown sequence (`ProjectManagerListener.
-         *  projectClosing` fired OR our disposer ran). While true, `ContentManagerListener`
-         *  ignores `contentRemoved` events — those are project-shutdown tear-down, not
+         *  projectClosing` fired OR our disposer ran). While true, the contentRemoveQuery
+         *  listener bails immediately — those events are project-shutdown tear-down, not
          *  user-initiated tab closes. */
         @Volatile var projectClosing: Boolean = false,
-        /** Wall-clock ms when the plugin attached to this project. Logged on every
-         *  contentRemoved event so a diagnostic timeline can be reconstructed from
-         *  idea.log when verifying close-detection behaviour after a restart. The
-         *  classifier no longer uses this for time-based filtering (see
-         *  [TabCloseClassifier] doc for the widget-attachment scheme). */
+        /** Wall-clock ms when the plugin attached to this project. Used by the startup-
+         *  grace gate in [poll] to skip empty-save during the first 60s while spawned
+         *  tabs are still warming up. */
         val startupAt: Long = System.currentTimeMillis(),
     )
 
@@ -390,199 +389,17 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
     private fun ctx(project: Project): ProjectCtx =
         projectCtx.computeIfAbsent(project.locationHash) { ProjectCtx() }
 
-    /**
-     * Schedule a deferred widget-attachment check for [sid] after [CLOSE_VERIFY_DELAY_MS].
-     * UI shuffles (split move, popout, drag, restore re-layout) fire contentRemoved on
-     * one Content and then re-attach the same [TerminalWidget] to a new Content within
-     * the same swing event tick; genuine X-button / right-click → Close closes leave the
-     * widget orphaned. After the delay we walk the project's ContentManager and check
-     * whether [capturedWidget] is still bound to any Content:
-     *  - Project disposed / closing → skip (teardown, not user intent).
-     *  - Widget found in current contents → UI shuffle, do nothing.
-     *  - Widget orphaned → genuine close. Add to [ProjectCtx.userClosedSessions] AND
-     *    immediately rewrite the restore file (subtract the closed sid). The immediate
-     *    save survives the race where the user clicks X and then closes Rider before
-     *    the next 5-second poll would have rewritten the file.
-     *
-     * When [capturedWidget] is null (no [TerminalWidget] could be resolved at
-     * contentRemoved time — rare; happens for non-spawned manual sessions whose Content
-     * is fully torn down before the listener runs) we fall back to scanning the current
-     * contents for any whose Claude child matches [sid]. If found → shuffle. If not →
-     * real close.
-     *
-     * Logs every step with `[ClaudeTabs][verify]` so diagnostic timelines are
-     * reconstructable from idea.log.
-     */
-    private fun scheduleCloseVerification(
-        project: Project,
-        sid: String,
-        tabName: String,
-        capturedWidget: TerminalWidget?,
-    ) {
-        val executor = com.intellij.util.concurrency.AppExecutorUtil.getAppScheduledExecutorService()
-        executor.schedule({
-            try {
-                val verbose = isVerboseLogging()
-                if (project.isDisposed) {
-                    if (verbose) LOG.info("[ClaudeTabs][verify] sid=$sid skip — project disposed during wait (tab='$tabName')")
-                    return@schedule
-                }
-                val c = ctx(project)
-                if (c.projectClosing) {
-                    if (verbose) LOG.info("[ClaudeTabs][verify] sid=$sid skip — project closing during wait (tab='$tabName')")
-                    return@schedule
-                }
-                val stillAttached = isTabStillPresent(project, sid, capturedWidget, verbose)
-                if (stillAttached) {
-                    if (verbose) LOG.info("[ClaudeTabs][verify] sid=$sid widget still attached — UI shuffle, NOT recording (tab='$tabName')")
-                    return@schedule
-                }
-                // Genuine close. State change (session won't auto-restore next time) so logs
-                // at info regardless of verbose mode.
-                synchronized(c.userClosedSessions) { c.userClosedSessions.add(sid) }
-                // Persist the user-close BEFORE any save can fire so a crash between this
-                // moment and the next save still respects the close on restart. Was in-memory
-                // only pre-1.0.17 — a hard kill / power loss between close and next save
-                // resurrected the closed tab.
-                try { storage.addUserClosed(projectHash(project), sid) } catch (e: Exception) {
-                    LOG.warn("[ClaudeTabs] user-closed persist failed for sid=$sid: ${e.message}")
-                }
-                LOG.info("[ClaudeTabs] Tab closed by user — session $sid removed from restore (tab='$tabName')")
-                // Immediate persist: subtract from restore file right now. Don't wait for the
-                // next 5-second poll — the user might close Rider in the next second, in
-                // which case the next poll never runs and the close would be lost. Reading +
-                // rewriting the restore file synchronously here is cheap (atomic tmpfile +
-                // rename) and bounds the failure window to "Rider crashes between mark and
-                // write", which is much narrower than "Rider closes in the next 5 seconds".
-                removeFromRestoreImmediately(project, sid)
-            } catch (e: Exception) {
-                LOG.warn("[ClaudeTabs][verify] sid=$sid unexpected error: ${e.message}", e)
-            }
-        }, CLOSE_VERIFY_DELAY_MS, java.util.concurrent.TimeUnit.MILLISECONDS)
-    }
-
-    /**
-     * Walk the project's terminal tool-window [com.intellij.ui.content.ContentManager] and
-     * report whether the tab for [sid] is still present:
-     *
-     *   1. Fast path — if [capturedWidget] is non-null, identity-compare against the widget
-     *      backing each current Content. Same widget reference == same tab (shuffles re-bind
-     *      the widget to a new Content but keep the underlying object).
-     *   2. Fallback — walk each content's widget → shell PID → Claude child → session file,
-     *      and look for a sessionId match (raw or canonical). Useful for manual `claude`
-     *      sessions we never spawned ourselves.
-     *
-     * Returns true the moment a match is found; false only after exhausting the list.
-     */
-    private fun isTabStillPresent(
-        project: Project,
-        sid: String,
-        capturedWidget: TerminalWidget?,
-        verbose: Boolean,
-    ): Boolean {
-        val cmgr = try {
-            TerminalToolWindowManager.getInstance(project).toolWindow?.contentManager
-        } catch (e: Exception) {
-            if (verbose) LOG.info("[ClaudeTabs][verify] sid=$sid contentManager unavailable: ${e.message} — assuming closed")
-            return false
-        } ?: run {
-            if (verbose) LOG.info("[ClaudeTabs][verify] sid=$sid tool window has no contentManager — assuming closed")
-            return false
-        }
-        val contents = try { cmgr.contents.toList() } catch (_: Exception) { return false }
-
-        if (capturedWidget != null) {
-            for (content in contents) {
-                val w = try { TerminalToolWindowManager.findWidgetByContent(content) } catch (_: Exception) { null }
-                if (w === capturedWidget) {
-                    if (verbose) LOG.info("[ClaudeTabs][verify] sid=$sid widget identity match on content='${content.displayName}'")
-                    return true
-                }
-            }
-            return false
-        }
-
-        // No widget reference — fall back to walking each tab's process tree for a sid match.
-        for (content in contents) {
-            try {
-                val w = try { TerminalToolWindowManager.findWidgetByContent(content) } catch (_: Exception) { null } ?: continue
-                val pid = extractPidFromWidget(w) ?: continue
-                val claude = findClaudeChild(pid) ?: continue
-                val sf = File(SESSIONS_DIR, "${claude.pid()}.json")
-                if (!sf.exists()) continue
-                val text = try { sf.readText() } catch (_: Exception) { continue }
-                val raw = ClaudeTabsHelpers.extractJsonString(text, "sessionId") ?: continue
-                if (raw == sid) {
-                    if (verbose) LOG.info("[ClaudeTabs][verify] sid=$sid raw match on content='${content.displayName}' pid=${claude.pid()}")
-                    return true
-                }
-                val cwd = ClaudeTabsHelpers.extractJsonString(text, "cwd") ?: continue
-                val startedAt = Regex(""""startedAt":(\d+)""").find(text)?.groupValues?.get(1)?.toLongOrNull()
-                    ?: System.currentTimeMillis()
-                val canonical = canonicalSessionIdFor(claude.pid(), cwd, raw, startedAt)
-                if (canonical == sid) {
-                    if (verbose) LOG.info("[ClaudeTabs][verify] sid=$sid canonical match on content='${content.displayName}' (raw=$raw)")
-                    return true
-                }
-            } catch (_: Exception) { /* unreadable / dead process — skip */ }
-        }
-        return false
-    }
-
-    /**
-     * Rewrite the project's restore file with [sid] subtracted, right now (no waiting for
-     * the next poll). Bounds the Rider-shutdown race to "user clicks X then Rider crashes
-     * within ~50ms of the verify completing" instead of "...within the next 5 seconds".
-     *
-     * Refuses to write when the existing file is unreadable (don't clobber a corrupted
-     * file) and when removing [sid] would leave the list unchanged (no-op).
-     */
-    private fun removeFromRestoreImmediately(project: Project, sid: String) {
-        try {
-            val projectHash = projectHash(project)
-            val read = storage.loadRestoreSafe(projectHash)
-            if (read is ClaudeTabsStorage.RestoreRead.ReadFailed) {
-                LOG.debug("[ClaudeTabs][verify] sid=$sid skip immediate save — restore file unreadable (${read.reason})")
-                return
-            }
-            val existing = (read as ClaudeTabsStorage.RestoreRead.Ok).sessions
-            val filtered = existing.filter { it.sessionId != sid }
-            if (filtered.size == existing.size) {
-                // sid wasn't in the file yet — the next poll's save will handle the
-                // subtraction once the high-water-mark union catches it.
-                return
-            }
-            // Bug A fix (1.0.17): route through storage.saveState so the empty-write guard
-            // (Storage.kt:289-295) and the 3-backup rotation cover this path. Pre-1.0.17
-            // this wrote directly via writeAtomic, bypassing both guards — and on
-            // false-positive close events during IDE-update tab thrash that wiped every
-            // session in the file to [], the rotation would NOT have been triggered and
-            // the rescue backup would be gone too.
-            //
-            // We pass `existing` as newSessions (everything from disk minus the sid we're
-            // removing — accomplished by listing sid in userClosedSessionIds so saveState's
-            // union-then-subtract semantics produce the same `filtered` result). We DON'T
-            // re-filter by transcript here (sid removal is independent of transcript state).
-            val asStorage = existing.map { ClaudeTabsStorage.SavedSession(it.sessionId, it.cwd, it.tabName, it.bypassPermissions) }
-            val written = storage.saveState(
-                projectHash = projectHash,
-                newSessions = asStorage,
-                keepCount = snapshotKeepCount,
-                userClosedSessionIds = setOf(sid),
-                transcriptCheck = null,
-            )
-            if (written == null) {
-                // saveState refused to write — either the result was empty (preservation
-                // guard fired) or the file became unreadable between our read and the save.
-                // Either way, log and move on; the next poll will retry.
-                LOG.debug("[ClaudeTabs][verify] sid=$sid save preserved by guard (write skipped)")
-            } else {
-                LOG.info("[ClaudeTabs] Restore file updated: $sid removed (${filtered.size} session(s) remain) — backup-1 rotated")
-            }
-        } catch (e: Exception) {
-            LOG.warn("[ClaudeTabs][verify] sid=$sid immediate save failed: ${e.message}")
-        }
-    }
+    // ── Pre-1.0.17 close-detection helpers removed in 1.0.17 ──────────────────
+    // `scheduleCloseVerification`, `isTabStillPresent`, and `removeFromRestoreImmediately`
+    // implemented the old defer-and-verify scheme: capture widget at contentRemoved time,
+    // wait 1.5s, walk the primary ContentManager, mark user-closed if orphan. That scheme
+    // false-positived during window-close (every widget genuinely gone) and split-pane
+    // closes (widget moved to a sibling ContentManager). 1.0.17 replaces it with the
+    // two-signal design — see the contentRemoveQuery listener in runActivity() and the
+    // pendingClose confirmation block in poll(). The new design requires BOTH a
+    // contentRemoveQuery signal (filtered by TEMPORARY_REMOVED_KEY + projectClosing) AND
+    // a process-death observation before recording user-closed, so false-positives on
+    // any single signal cannot mark a tab as closed.
 
     /**
      * IntelliJ entry point. Fires once per project open. Starts two coroutines:
@@ -614,7 +431,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             LOG.info("[ClaudeTabs] No AI Assistant host detected.")
         }
         LOG.info("[ClaudeTabs] Verbose logs: ${if (isVerboseLogging()) "ON (bypassing rate limits)" else "OFF (rate-limited; set Registry rider.claude.tabs.verboseLogs=true to enable)"}")
-        LOG.info("[ClaudeTabs] Close detection: verify delay=${CLOSE_VERIFY_DELAY_MS}ms (widget-attachment, no startup grace) (ProjectCtx.startupAt=${ctx(project).startupAt})")
+        LOG.info("[ClaudeTabs] Close detection: two-signal (contentRemoveQuery + process-dead) — pending expiry=${PENDING_CLOSE_EXPIRY_MS}ms (ProjectCtx.startupAt=${ctx(project).startupAt})")
         // Self-test (1.0.17): probe the load-bearing APIs we depend on at startup. If any
         // fail, the save path is still resilient (it uses ~/.claude/sessions/*.json — not
         // the terminal APIs — for the active-sessions list), but cosmetic features like
@@ -695,71 +512,74 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             LOG.debug("[ClaudeTabs] ProjectManagerListener install failed: ${e.message}")
         }
 
-        // ContentManagerListener tracks terminal-tab close events. The naive interpretation
-        // (every contentRemoved == user closed this tab) was the root cause of the
-        // missing-tabs bug — Rider fires contentRemoved during tool-window re-layout
-        // (restored tabs being attached, splits, popouts, drag-to-reorder), and those
-        // events look identical at the API level to a real X-button click.
+        // ContentManagerListener tracks terminal-tab close events. Pre-1.0.17 this used
+        // `contentRemoved` + a 1.5s widget-attachment verify, which still false-positived
+        // on whole-window-close (every tab's widget genuinely gone) and split-pane closes
+        // (widget moves to a sibling ContentManager we didn't walk).
         //
-        // The fix layers two filters:
-        //   1. `projectClosing` — if the ProjectManagerListener has signalled shutdown,
-        //      every contentRemoved is teardown. Ignore unconditionally.
-        //   2. Defer-and-verify [CLOSE_VERIFY_DELAY_MS]: capture the TerminalWidget at
-        //      contentRemoved time, wait ~1.5s, then check whether that same widget is
-        //      still attached to any Content in the manager. Shuffles re-bind the widget
-        //      to a fresh Content within the same swing tick; real closes leave it
-        //      orphaned. The discriminator is reliable regardless of how recently the
-        //      plugin attached — earlier builds also enforced a 30-second blanket
-        //      grace, but it ate user closes on just-restored tabs.
+        // 1.0.17 switches to the **two-signal** design (per user request, after the window-
+        // close false-positives accumulated 8 entries in user-closed during one session):
+        //
+        //   Signal 1: contentRemoveQuery fires AND content is NOT marked TEMPORARY_REMOVED
+        //             (the platform's own discriminator for shuffle/drag/pane-move —
+        //             ContentManagerImpl.doRemoveContent checks this same key to skip
+        //             non-removal cases) AND projectClosing is false.
+        //   Signal 2: the Claude process for that sid is dead at next poll-loop check.
+        //
+        // A sid only becomes user-closed when BOTH signals fire. Signal 1 alone is too
+        // noisy (the platform fires it for many things). Signal 2 alone is too aggressive
+        // (a Claude crash inside a still-open tab shouldn't drop the saved session).
+        // Together they're conservative: every recorded close has the user's UI action AND
+        // an observable process-death consequence.
+        //
+        // Window-close path: ProjectManager.projectClosing fires → c.projectClosing = true
+        // → listener bails before adding to pendingClose. Even if the order races,
+        // Disposer cancels the poll scope so signal 2 never confirms.
         try {
             val tw = TerminalToolWindowManager.getInstance(project).toolWindow
             val cmgr = tw?.contentManager
             if (cmgr != null) {
                 val cmListener = object : com.intellij.ui.content.ContentManagerListener {
-                    override fun contentRemoved(event: com.intellij.ui.content.ContentManagerEvent) {
+                    override fun contentRemoveQuery(event: com.intellij.ui.content.ContentManagerEvent) {
                         val c = ctx(project)
                         val content = event.content
                         val displayName = try { content.displayName ?: "?" } catch (_: Exception) { "?" }
-                        // Capture the widget reference NOW — the Content has just been removed
-                        // from the manager but the widget binding should still be resolvable
-                        // via the public API. This is the anchor the verify step uses to
-                        // distinguish shuffles (widget re-attached elsewhere) from real
-                        // closes (widget orphaned).
+                        // TEMPORARY_REMOVED_KEY is the platform's own discriminator for
+                        // drag/reorder/pane-split/tear-off (ContentManagerImpl.doRemoveContent
+                        // checks this same key to skip the disposal path).
+                        val isTemporary = try {
+                            content.getUserData(com.intellij.ui.content.Content.TEMPORARY_REMOVED_KEY) == true
+                        } catch (_: Throwable) { false }
+                        // Resolve sid via contentToSid map first, fall back to widget identity
+                        // against the spawnedWidgets cache.
                         val capturedWidget = try {
                             TerminalToolWindowManager.findWidgetByContent(content)
                         } catch (_: Exception) { null }
                         val widgetSid = if (capturedWidget != null) {
                             spawnedWidgets.entries.firstOrNull { (_, w) -> w === capturedWidget }?.key
                         } else null
-                        val mapSid = c.contentToSid[content]
-                        val sinceStartup = System.currentTimeMillis() - c.startupAt
-                        // Per-event detail at INFO only when verbose logging is on, so
-                        // production idea.log isn't spammed by every re-layout / split /
-                        // drag event. Toggle via Registry rider.claude.tabs.verboseLogs=true.
+                        val sid = c.contentToSid[content] ?: widgetSid
                         val verbose = isVerboseLogging()
-                        if (verbose) {
-                            LOG.info("[ClaudeTabs][close] contentRemoved fired" +
-                                    " — project='${project.name}' tab='$displayName'" +
-                                    " mapSid=${mapSid ?: "none"} widgetSid=${widgetSid ?: "none"}" +
-                                    " widget=${if (capturedWidget != null) "captured" else "null"}" +
-                                    " projectClosing=${c.projectClosing}" +
-                                    " msSinceStartup=$sinceStartup")
-                        }
-                        when (val d = TabCloseClassifier.classify(
+                        when (val d = TwoSignalCloseDetector.decideOnRemoveQuery(
                             projectClosing = c.projectClosing,
-                            sessionIdFromMap = mapSid,
-                            sessionIdFromWidgetFallback = widgetSid,
+                            isTemporary = isTemporary,
+                            sid = sid,
                         )) {
-                            is TabCloseClassifier.Decision.DeferAndVerify -> {
-                                if (verbose) LOG.info("[ClaudeTabs][close] decision=DeferAndVerify sid=${d.sessionId} — scheduling widget-attachment check in ${CLOSE_VERIFY_DELAY_MS}ms")
-                                scheduleCloseVerification(project, d.sessionId, displayName, capturedWidget)
+                            TwoSignalCloseDetector.Signal1.SkipProjectClosing -> {
+                                if (verbose) LOG.info("[ClaudeTabs][close] removeQuery skipped — projectClosing tab='$displayName'")
+                            }
+                            TwoSignalCloseDetector.Signal1.SkipTemporary -> {
+                                if (verbose) LOG.info("[ClaudeTabs][close] removeQuery skipped — TEMPORARY_REMOVED_KEY set (shuffle/drag/split) tab='$displayName'")
+                            }
+                            TwoSignalCloseDetector.Signal1.SkipNoSid -> {
+                                if (verbose) LOG.info("[ClaudeTabs][close] removeQuery sid-unknown tab='$displayName' — cannot pend")
+                            }
+                            is TwoSignalCloseDetector.Signal1.AddToPending -> {
+                                // Signal 1 confirmed. Queue for signal-2 (process-dead)
+                                // verification at next poll. Don't write user-closed yet.
+                                c.pendingClose[d.sid] = System.currentTimeMillis()
                                 c.contentToSid.remove(content)
-                            }
-                            TabCloseClassifier.Decision.IgnoreProjectClosing -> {
-                                if (verbose) LOG.info("[ClaudeTabs][close] decision=IgnoreProjectClosing tab='$displayName'")
-                            }
-                            TabCloseClassifier.Decision.NoMappedSession -> {
-                                if (verbose) LOG.info("[ClaudeTabs][close] decision=NoMappedSession tab='$displayName'")
+                                LOG.info("[ClaudeTabs][close] Signal 1 (removeQuery) for sid=${d.sid} tab='$displayName' — added to pendingClose, awaiting signal 2 (process-dead)")
                             }
                         }
                     }
@@ -1794,6 +1614,64 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                 }
             }
             return
+        }
+
+        // ─── pendingClose confirmation (signal 2: process dead) ───────────────
+        // Two-signal close detection (1.0.17): the contentRemoveQuery listener has already
+        // filtered out projectClosing + TEMPORARY_REMOVED_KEY (shuffle/drag/split). What
+        // remains in pendingClose is "user did SOMETHING that removed the tab". We only
+        // promote to userClosed when the Claude process for that sid is ALSO dead — that
+        // confirms the removal was destructive (X-click kills the shell which kills Claude)
+        // rather than something we should ignore.
+        //
+        // Entries that stay in pendingClose past 30s without process-death are dropped as
+        // ambiguous (not real closes). 30s is generous — Rider kills child shells within
+        // milliseconds of an X-click, and Claude takes ~1s to clean up.
+        if (c.pendingClose.isNotEmpty()) {
+            val nowMs = System.currentTimeMillis()
+            val pendingSnapshot = HashMap(c.pendingClose)
+            // Build a set of sids whose Claude process is currently alive (cwd-scoped to
+            // this project so a sid from another project window doesn't accidentally count).
+            val alive = mutableSetOf<String>()
+            try {
+                val pendingSids = pendingSnapshot.keys
+                val sessionFiles = SESSIONS_DIR.listFiles { f -> f.name.endsWith(".json") } ?: emptyArray()
+                for (sf in sessionFiles) {
+                    val pid = sf.nameWithoutExtension.toLongOrNull() ?: continue
+                    val text = try { sf.readText() } catch (_: Exception) { continue }
+                    val rawSid = extractJsonString(text, "sessionId") ?: continue
+                    val cwd = extractJsonString(text, "cwd") ?: continue
+                    if (!ClaudeTabsHelpers.isCwdUnderProject(cwd, project.basePath)) continue
+                    // Resolve canonical so we match either form the listener might have stored.
+                    val startedAt = Regex(""""startedAt":(\d+)""").find(text)?.groupValues?.get(1)
+                        ?.toLongOrNull() ?: nowMs
+                    val canonical = canonicalSessionIdFor(pid, cwd, rawSid, startedAt)
+                    val isAlive = ProcessHandle.of(pid).map { it.isAlive }.orElse(false)
+                    if (!isAlive) continue
+                    if (rawSid in pendingSids) alive.add(rawSid)
+                    if (canonical in pendingSids) alive.add(canonical)
+                }
+            } catch (e: Exception) {
+                LOG.debug("[ClaudeTabs][close] pendingClose alive-check failed: ${e.message}")
+            }
+            val result = TwoSignalCloseDetector.confirmPending(
+                pendingClose = pendingSnapshot,
+                aliveSids = alive,
+                now = nowMs,
+                expiryMs = PENDING_CLOSE_EXPIRY_MS,
+            )
+            for (sid in result.confirmed) {
+                c.pendingClose.remove(sid)
+                synchronized(c.userClosedSessions) { c.userClosedSessions.add(sid) }
+                try { storage.addUserClosed(projectHash(project), sid) } catch (e: Exception) {
+                    LOG.warn("[ClaudeTabs] user-closed persist failed for sid=$sid: ${e.message}")
+                }
+                LOG.info("[ClaudeTabs][close] CONFIRMED user-close (signal 1 + signal 2) sid=$sid — process dead, persisted to user-closed-${projectHash(project)}.json")
+            }
+            for (sid in result.expired) {
+                c.pendingClose.remove(sid)
+                LOG.info("[ClaudeTabs][close] Pending-close EXPIRED (process still alive after ${PENDING_CLOSE_EXPIRY_MS}ms) sid=$sid — not recording. Likely a non-close event we false-positived on.")
+            }
         }
 
         // Poll fallback: process any unhandled termsess-*.json files
