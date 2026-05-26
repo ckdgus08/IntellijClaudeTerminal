@@ -9,6 +9,7 @@ import com.intellij.openapi.startup.StartupActivity
 import com.intellij.openapi.util.Disposer
 import com.intellij.terminal.ui.TerminalWidget
 import com.intellij.ui.content.Content
+import com.intellij.ui.content.ContentManager
 import com.jediterm.terminal.ProcessTtyConnector
 import kotlinx.coroutines.*
 import org.jetbrains.plugins.terminal.TerminalToolWindowManager
@@ -217,6 +218,23 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
     private val spawnedWidgets = java.util.concurrent.ConcurrentHashMap<String, com.intellij.terminal.ui.TerminalWidget>()
 
     /**
+     * 1.0.18 cross-project arbitration: maps `sessionId → projectHash`. Populated by each
+     * project's tab-walk when it discovers a session attached to its window. A session in this
+     * map is "claimed" by that project — other projects' [SessionsDirScanner] passes skip it
+     * (even if the cwd matches their basePath). Ensures each session lives in exactly one
+     * restore file.
+     *
+     * Necessary because [SessionsDirScanner] matches by cwd-under-basePath, which would
+     * otherwise classify a worktree session as belonging to whichever project's basePath
+     * coincidentally shares a prefix. Tab-walk knows which window the session is ACTUALLY in,
+     * so its claim trumps cwd-based guessing.
+     *
+     * Entries get refreshed every poll (no expiry needed); the map is cleared on project close
+     * via [ProjectCtx] teardown.
+     */
+    private val claimedByTabWalk = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    /**
      * Rotated → canonical session id aliases. Populated when [poll]'s canonical resolution
      * detects that a session's current in-memory id differs from its canonical (transcript-
      * backed) id — this happens after `claude --resume`, which rotates the in-memory id but
@@ -356,6 +374,14 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
          *  user-closed sessions don't come back on the next start. NOT populated when the
          *  PROJECT (or Rider itself) is closing — see [projectClosing]. */
         val userClosedSessions: MutableSet<String> = mutableSetOf(),
+        /** Two-poll-grace tracking: sids present in the restore file at the last save call
+         *  but absent from that save's `newSessions`. On the NEXT save, if a sid is still
+         *  missing AND in this set, it gets evicted; if it's missing for the FIRST time
+         *  (not in this set), it's kept (grace). Prevents single-poll races (Claude restart,
+         *  brief PID/transcript gap, scanner missed a session for one cycle) from wiping
+         *  legitimate entries. Evictions still happen — they just need two consecutive
+         *  misses, ~10s at the 5s poll cadence. */
+        var missedLastPoll: Set<String> = emptySet(),
         /** Sids whose `contentRemoveQuery` fired with no temporary-removed marker AND not
          *  during projectClosing. Value is the wall-clock ms when added. The poll loop
          *  promotes entries to [userClosedSessions] only after also confirming the Claude
@@ -888,6 +914,78 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             LOG.debug("[ClaudeTabs] spawnedWidgets union failed: ${e.message}")
         }
         if (pollCount % 12 == 0) LOG.info("[ClaudeTabs] STEP 6: spawnedWidgets union — cached=${spawnedWidgets.size} added=$spawnAdded skipKnown=$spawnSkipKnown skipNoPid=$spawnSkipNoPid")
+
+        // STEP 6c (1.0.18): DockManager containers — covers popped-out terminal tabs.
+        //
+        // When the user drags a terminal tab out into its own floating window, the tab leaves
+        // `TerminalToolWindowManager.getInstance(project).toolWindow.contentManager` (which only
+        // sees the docked tool-window strip). It's hosted by a separate `DockContainer` that
+        // DockManager tracks. Without walking these, popped-out tabs go silent: poll doesn't see
+        // them, they fall out of the restore file, and on next restart they don't come back.
+        //
+        // Reflective access (no compile-time dep on DockManager internals) — degrades to
+        // "no popout coverage" on older IDEs or if the API shifts, rather than crashing.
+        var dockAdded = 0
+        var dockContainersWalked = 0
+        var dockSkipNoMgr = 0
+        var dockSkipNoCmgr = 0
+        var dockSkipKnown = 0
+        var dockSkipNoWidget = 0
+        var dockSkipNoPid = 0
+        try {
+            val dockMgrCls = Class.forName("com.intellij.openapi.fileEditor.impl.DockManager")
+            val dockMgr = dockMgrCls.getMethod("getInstance", Project::class.java).invoke(null, project)
+            if (dockMgr == null) {
+                dockSkipNoMgr++
+            } else {
+                val containers = dockMgrCls.methods.firstOrNull { it.name == "getContainers" }
+                    ?.invoke(dockMgr) as? Collection<*>
+                val knownContents = result.mapNotNull { it.content }.toSet()
+                val knownWidgets = result.mapNotNull { it.widget }.toSet()
+                containers?.forEach { container ->
+                    container ?: return@forEach
+                    dockContainersWalked++
+                    try {
+                        // DockContainer doesn't have a single canonical ContentManager accessor;
+                        // try the common shapes (getContentManager / containerComponent → manager).
+                        val cmgr = container.javaClass.methods.firstOrNull { it.name == "getContentManager" }
+                            ?.invoke(container) as? ContentManager
+                        if (cmgr == null) { dockSkipNoCmgr++; return@forEach }
+                        for (content in cmgr.contents) {
+                            if (content in knownContents) { dockSkipKnown++; continue }
+                            val widget = try {
+                                TerminalToolWindowManager.findWidgetByContent(content)
+                            } catch (_: Exception) { null }
+                            if (widget == null) { dockSkipNoWidget++; continue }
+                            if (widget in knownWidgets) { dockSkipKnown++; continue }
+                            val pid = extractPidFromWidget(widget)
+                            if (pid == null) { dockSkipNoPid++; continue }
+                            result.add(TabInfo(
+                                content = content,
+                                widget = widget,
+                                pid = pid,
+                                reworkedSession = null,
+                                reworkedTabId = null,
+                                tabName = content.displayName ?: "Local",
+                            ))
+                            dockAdded++
+                        }
+                    } catch (e: Exception) {
+                        LOG.debug("[ClaudeTabs] DockManager container walk failed: ${e.message}")
+                    }
+                }
+            }
+        } catch (_: ClassNotFoundException) {
+            // Older IDE without DockManager. Acceptable degrade — popouts won't be covered.
+            dockSkipNoMgr++
+        } catch (e: Exception) {
+            LOG.debug("[ClaudeTabs] DockManager unavailable: ${e.message}")
+        }
+        if (pollCount % 12 == 0) {
+            LOG.info(
+                "[ClaudeTabs] STEP 6c: DockManager popouts — containers=$dockContainersWalked added=$dockAdded skipKnown=$dockSkipKnown skipNoWidget=$dockSkipNoWidget skipNoPid=$dockSkipNoPid skipNoCmgr=$dockSkipNoCmgr skipNoMgr=$dockSkipNoMgr"
+            )
+        }
 
         if (pollCount % 12 == 0) LOG.info("[ClaudeTabs] STEP 4: Total: ${result.size} → ${result.map { "'${it.tabName}'→PID${it.pid}" }}")
         return result
@@ -1692,6 +1790,12 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         val tabs = getAllTabs(project)
         val activeSessions = mutableListOf<SavedSession>()
         val claudeSessions = mutableListOf<String>()
+        // 1.0.18: Sids discovered via this project's tab-walk. These bypass the cross-project
+        // cwd filter in saveState because they're authoritatively in THIS window (regardless of
+        // where the Claude process's cwd points — worktrees, sibling dirs, manual cd, etc.).
+        // Also added to the global claimedByTabWalk set so other projects' scanner passes skip
+        // them — only one project can own a sid at a time, and tab-walk wins over cwd matching.
+        val tabWalkOwnedSids = mutableSetOf<String>()
 
         for (tab in tabs) {
             val claudeProcess = findClaudeChild(tab.pid) ?: continue
@@ -1777,57 +1881,156 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                 try { renameFile.delete() } catch (_: Exception) { }
             }
 
-            // Name resolution priority (1.0.17):
-            //   1. names.json — the durable user-given name (written by /tab via persistRename-
-            //      Immediately and the poll-loop rename branch). This bypasses the AI Assistant
-            //      overlay entirely: even if the live widget title is corrupted with "✳ Foo",
-            //      we save the clean name from disk.
-            //   2. Legacy fallback chain — for sessions that pre-date names.json: try the
-            //      widget title, detect/reject overlay shapes, fall back through in-memory
-            //      caches. Same logic as pre-1.0.17 — kept for backward compatibility with
-            //      sessions whose only name record is in restore-<hash>.json from older saves.
-            val nameFromStore = storage.nameFor(sessionId) ?: storage.nameFor(rawSessionId)
-            val title = nameFromStore ?: run {
-                val rawTitle = tab.widget?.terminalTitle?.buildTitle() ?: tab.tabName
-                if (rawTitle != null && ClaudeTabsHelpers.isAiOverlayName(rawTitle, project.name)) {
-                    lastAppliedName[sessionId]
-                        ?: lastAppliedName[rawSessionId]
-                        ?: c.previousActive[sessionId]?.tabName
-                        ?: tab.tabName
-                        ?: "Claude"
-                } else {
-                    rawTitle ?: "Claude"
+            // names.json → live-tab re-apply (1.0.17 follow-up). If names.json has a name
+            // for this sid and the live tab title is generic (Local / Claude / etc.) or an
+            // AI overlay, apply the names.json value. This catches sessions that:
+            //   - were named via /tab BEFORE the user opened/restarted the project window
+            //     (so the spawn used the old restore-file tabName instead of names.json)
+            //   - got a name backfilled via the migration or direct names.json edit
+            //   - had their name set by /tab on a different rotated sid that aliases here
+            // We skip when the live title is descriptive AND differs — that's a manual
+            // in-tab rename by the user (they typed it in the tab strip), which we respect.
+            val nameInStore = storage.nameFor(sessionId) ?: storage.nameFor(rawSessionId)
+            if (nameInStore != null) {
+                val currentTitle = tab.tabName ?: ""
+                val shouldApply = currentTitle != nameInStore && (
+                    ClaudeTabsHelpers.isGenericTabName(currentTitle) ||
+                    ClaudeTabsHelpers.isAiOverlayName(currentTitle, project.name) ||
+                    currentTitle.isBlank()
+                )
+                if (shouldApply) {
+                    LOG.info("[ClaudeTabs] Applying names.json: '${currentTitle}' → '${nameInStore}' (sid=${sessionId.take(8)})")
+                    renameTab(project, tab, nameInStore, sessionId = sessionId)
+                    lastAppliedName[sessionId] = nameInStore
+                    renamedSessions.add(sessionId)
                 }
             }
 
-            // Save EVERY Claude session that has a transcript on disk — generic tab names
-            // (Local, Local (2), pwsh, …) included. The user's wish is "every claude session
-            // I had open should auto-restore", so name-gating here would silently exclude any
-            // session the user didn't bother renaming. We still skip sessions whose transcript
-            // hasn't been flushed yet — those get picked up on the next poll once the file
-            // exists, and `claude --resume <id>` would fail without it anyway.
-            if (!hasTranscript(cwd, sessionId)) continue
+            // 1.0.18: Re-enabled tab-walk's contribution to activeSessions.
+            //
+            // The cell that this session is hosted in IS this project's Rider window — that's
+            // what tab-walk discovered. Save it as belonging here, regardless of where the
+            // Claude process's cwd is on disk. This is the fix for worktrees (cwd is the
+            // worktree dir, NOT the project basePath, but the tab is in the main project's
+            // window) and for any case where the user does `cd <other-dir> && claude --resume`
+            // in this project's terminal.
+            //
+            // Bug history that previously gated this:
+            //   - tab-walk's PID→sid mapping used a poisoned cache, returning STALE sids that
+            //     collided with real ones (two distinct alive sids both mapping to the same
+            //     canonical via Strategy 3 mtime fallback). The scanner then skipped real sids
+            //     as `skipAlreadyHave`. That's now fixed in `canonicalSessionIdFor` (always
+            //     re-check Strategy 1 transcript-on-disk BEFORE consulting cache).
+            //
+            // Name resolution: prefer names.json (durable), then last-applied (in-memory cache),
+            // then this tab's current title, then "Claude". Skip AI overlay titles like the
+            // scanner does — those are AI Assistant's status churn, not real names.
+            val nameFromStore = storage.nameFor(sessionId) ?: storage.nameFor(rawSessionId)
+            val tabTitle = tab.tabName
+            val title = nameFromStore
+                ?: lastAppliedName[sessionId]
+                ?: lastAppliedName[rawSessionId]
+                ?: tabTitle?.takeUnless { ClaudeTabsHelpers.isAiOverlayName(it, project.name) }
+                ?: c.previousActive[sessionId]?.tabName
+                ?: "Claude"
 
+            // Skip sessions whose transcript hasn't been flushed yet — they get picked up next poll.
+            if (!hasTranscript(cwd, sessionId)) continue
             val bypass = readPermissionMode(cwd, sessionId)
             activeSessions.add(SavedSession(sessionId, cwd, title, bypass))
+            tabWalkOwnedSids.add(sessionId)
+            claimedByTabWalk[sessionId] = projectHash(project)
         }
 
         // ──────────────────────────────────────────────────────────────
-        // STEP 6b: SESSIONS_DIR direct scan — tab-enumeration-independent.
+        // STEP 6d (1.0.18): PROCESS-ANCESTRY WALK — definitive "is this in our window?"
         // ──────────────────────────────────────────────────────────────
-        // The tab-driven loop above misses any tab the platform's tab APIs can't see — in
-        // Rider 2026.1 that's most tabs we spawn via createShellWidget (sessionId=null on
-        // the backend row, no ttyConnector on the frontend widget). Result: 10 spawned
-        // tabs, 1 saved, restart → 1 restored.
+        // Why this exists: in Rider 2026.1's reworked terminal, `extractPidFromWidget`
+        // returns null for tabs that ContentManager sees (logs: `contents=4 skipNoPid=4`).
+        // The platform exposes the Content but withholds the underlying shell PID, so
+        // STEP 1–6c can't connect tabs → Claude processes. Result: tab-walk reports 0
+        // Claude sessions even when the user has 4 tabs in the window.
         //
-        // The decision logic for this scan lives in [SessionsDirScanner.scan] so it can
-        // be exercised by unit tests with injected lambdas. The bindings below adapt the
-        // production-world dependencies (real ProcessHandle, the canonical-id resolver,
-        // spawnedWidgets cache, etc.) to the lambda surface the scanner expects.
+        // Fix: walk in reverse. Iterate every alive Claude in `~/.claude/sessions/<pid>.json`,
+        // walk each one's process-parent chain, and if any ancestor matches THIS JVM's PID,
+        // the Claude is hosted by a shell spawned by this Rider window — by definition it
+        // belongs to this project, regardless of cwd. No platform API needed.
+        //
+        // This is the real fix for the worktree case: a session whose cwd is
+        // `D:\Dev\ProjectAlpha-couch-mode` but whose shell was spawned by ProjectAlpha's Rider window
+        // gets discovered here. Goes into `tabWalkOwnedSids` so `saveState` bypasses the
+        // cross-project cwd filter (see `ClaudeTabsHelpers.ownedByProjectSave`).
+        val ownJvmPid = ProcessHandle.current().pid()
+        var ancestryAdded = 0
+        var ancestryScanned = 0
+        var ancestrySkipDead = 0
+        var ancestrySkipNotOurs = 0
+        var ancestrySkipAlreadyHave = 0
+        var ancestrySkipNoTranscript = 0
+        try {
+            val sessionFiles = SESSIONS_DIR.listFiles { f -> f.name.endsWith(".json") } ?: emptyArray()
+            for (sf in sessionFiles) {
+                ancestryScanned++
+                val claudePid = sf.nameWithoutExtension.toLongOrNull() ?: continue
+                val claudeProc = ProcessHandle.of(claudePid).orElse(null)
+                if (claudeProc == null || !claudeProc.isAlive) { ancestrySkipDead++; continue }
+
+                // Walk up to our JVM. Logic lives in ClaudeTabsHelpers.isProcessHostedByJvm
+                // (testable). Injected lambda: production uses ProcessHandle parent chain.
+                val hitOurJvm = ClaudeTabsHelpers.isProcessHostedByJvm(
+                    startPid = claudePid,
+                    jvmPid = ownJvmPid,
+                    parentOf = { pid -> ProcessHandle.of(pid).orElse(null)?.parent()?.orElse(null)?.pid() },
+                )
+                if (!hitOurJvm) { ancestrySkipNotOurs++; continue }
+
+                val text = try { sf.readText() } catch (_: Exception) { continue }
+                val rawSid = extractJsonString(text, "sessionId") ?: continue
+                val cwd = extractJsonString(text, "cwd") ?: continue
+                val startedAt = Regex(""""startedAt":(\d+)""").find(text)?.groupValues?.get(1)
+                    ?.toLongOrNull() ?: System.currentTimeMillis()
+                val sid = canonicalSessionIdFor(claudePid, cwd, rawSid, startedAt)
+                if (sid in tabWalkOwnedSids) { ancestrySkipAlreadyHave++; continue }
+                if (!hasTranscript(cwd, sid)) { ancestrySkipNoTranscript++; continue }
+
+                val name = storage.nameFor(sid)
+                    ?: storage.nameFor(rawSid)
+                    ?: lastAppliedName[sid]
+                    ?: lastAppliedName[rawSid]
+                    ?: c.previousActive[sid]?.tabName
+                    ?: "Claude"
+                val bypass = readPermissionMode(cwd, sid)
+                activeSessions.add(SavedSession(sid, cwd, name, bypass))
+                tabWalkOwnedSids.add(sid)
+                claimedByTabWalk[sid] = projectHash(project)
+                ancestryAdded++
+            }
+        } catch (e: Exception) {
+            LOG.debug("[ClaudeTabs] STEP 6d: ancestry walk failed: ${e.message}")
+        }
+        if (c.pollCount % 12 == 0) {
+            LOG.info(
+                "[ClaudeTabs] STEP 6d: ancestry walk — jvm=$ownJvmPid scanned=$ancestryScanned added=$ancestryAdded skipDead=$ancestrySkipDead skipNotOurs=$ancestrySkipNotOurs skipAlreadyHave=$ancestrySkipAlreadyHave skipNoTranscript=$ancestrySkipNoTranscript"
+            )
+        }
+
+        // ──────────────────────────────────────────────────────────────
+        // STEP 6b: SESSIONS_DIR direct scan — tab-enumeration-independent fallback.
+        // ──────────────────────────────────────────────────────────────
+        // Catches any session that ancestry walk missed (e.g. Claude PID dead but
+        // resumed via a wrapper script that obscures the parent chain). Matches by
+        // cwd-under-basePath. Skips sids already claimed by THIS project's tab-walk
+        // or ancestry walk (no double-counting), and sids claimed by ANY OTHER
+        // project's tab-walk this run (cross-project arbitration — tab-walk's
+        // "this is in my window" beats scanner's "cwd matches my basePath").
+        val thisProjectHash = projectHash(project)
+        val skipForScanner = tabWalkOwnedSids + claimedByTabWalk.entries
+            .filter { it.value != thisProjectHash }
+            .map { it.key }
         val scan = SessionsDirScanner.scan(
             sessionsDir = SESSIONS_DIR,
             projectBasePath = project.basePath,
-            alreadyActiveIds = activeSessions.mapTo(mutableSetOf()) { it.sessionId },
+            alreadyActiveIds = skipForScanner,
             processLookup = { pid ->
                 val ph = ProcessHandle.of(pid).orElse(null)
                 if (ph == null || !ph.isAlive) SessionsDirScanner.ProcessLookup.DeadOrMissing
@@ -1914,7 +2117,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             toPersist.add(pending)
             haveIds.add(pending.sessionId)
         }
-        saveState(project, toPersist)
+        saveState(project, toPersist, tabWalkOwnedSids = tabWalkOwnedSids)
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -2217,52 +2420,73 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
     }
 
     /**
-     * Write [sessions] to the project's restore file as a **high-water-mark union** with the
-     * existing on-disk content, minus sessions the user has explicitly closed.
+     * Write [sessions] to the project's restore file as the **authoritative current state**
+     * with **two-poll-grace eviction** for entries that have momentarily disappeared.
      *
-     * Crash-safety / drift-safety contract (delegated to [ClaudeTabsStorage.saveState]):
-     *   - The file content is `(existing ∪ new) − userClosed`, filtered by transcript existence.
-     *     Union semantics mean a session can't be evicted just because one poll happened to miss
-     *     it (Claude restart, PID race, AI overlay collision); it survives until the user
-     *     explicitly closes it OR its transcript disappears.
-     *   - The only path that *removes* a session from auto-restore is:
-     *       1. ContentManagerListener observes the user closing the tab (X / right-click → Close)
-     *       2. The transcript file is gone (resume would fail anyway)
-     *     Project shutdown is NOT a close — `projectClosing` short-circuits the listener.
-     *   - Writes are atomic (tmp + rename) so a crash mid-write can't corrupt the file.
-     *   - A snapshot is written for every successful save (rolling history of last N).
+     * Crash-safety / drift-safety contract:
+     *   - `newSessions` is authoritative. Existing entries whose sid is NOT in `newSessions`
+     *     are evicted — BUT only after they've been missing for TWO consecutive polls. A
+     *     single missed poll (Claude restart, PID race, scanner momentary skip) is forgiven
+     *     via the `missedLastPoll` set tracked per-project.
+     *   - userClosed subtraction still applies — explicit close is one-shot, no grace.
+     *   - Transcript filter still applies — `claude --resume <sid>` can't succeed without it.
+     *   - Writes are atomic (tmp + rename). A snapshot is written per save.
+     *   - Project shutdown is NOT a close — `projectClosing` short-circuits the listener.
      */
-    private fun saveState(project: Project, sessions: List<SavedSession>) {
+    private fun saveState(
+        project: Project,
+        sessions: List<SavedSession>,
+        tabWalkOwnedSids: Set<String> = emptySet(),
+    ) {
         try {
-            // Drop sessions whose cwd is outside this project's tree. They belong to a
-            // sibling/different project and would silently fail `claude --resume <sid>` from
-            // this project's terminal (the resume is cwd-scoped). Without this filter, a
-            // session run via `cd /some/other/project && claude` from inside another window
-            // leaks into the wrong restore file.
             val basePath = project.basePath
+            // 1.0.18: ownership = window-hosting (tab-walk) takes precedence over cwd
+            // matching. See [ClaudeTabsHelpers.ownedByProjectSave] for the contract + worktree
+            // case. Tested in ClaudeTabsHelpersTest.
             val (kept, leaked) = sessions.partition {
-                ClaudeTabsHelpers.isCwdUnderProject(it.cwd, basePath)
+                ClaudeTabsHelpers.ownedByProjectSave(it.sessionId, it.cwd, basePath, tabWalkOwnedSids)
             }
             if (leaked.isNotEmpty()) {
-                LOG.info("[ClaudeTabs] Skipping ${leaked.size} cross-project session(s) at save (cwd outside ${basePath ?: "<unknown>"}): ${leaked.map { "${it.tabName}@${it.cwd}" }}")
+                LOG.info("[ClaudeTabs] Skipping ${leaked.size} cross-project session(s) at save (cwd outside ${basePath ?: "<unknown>"}, not tab-walk-owned): ${leaked.map { "${it.tabName}@${it.cwd}" }}")
             }
 
             val c = ctx(project)
-            // Snapshot userClosed at call time so a concurrent close doesn't mutate mid-write.
             val userClosed = synchronized(c.userClosedSessions) { c.userClosedSessions.toSet() }
 
-            // Convert this class's nested SavedSession → Storage's identically-shaped record.
             val newForStorage = kept.map {
                 ClaudeTabsStorage.SavedSession(it.sessionId, it.cwd, it.tabName, it.bypassPermissions)
             }
 
+            // Two-poll-grace: compute which sids are missing from `new` this poll. Entries
+            // missing for the FIRST time are graced (passed as keepExistingSids); entries
+            // already missing last poll get evicted by simply not being in graceSids.
+            val hash = projectHash(project)
+            val existingNow = (storage.loadRestoreSafe(hash) as? ClaudeTabsStorage.RestoreRead.Ok)
+                ?.sessions ?: emptyList()
+            val existingIds = existingNow.mapTo(mutableSetOf()) { it.sessionId }
+            val newIds = newForStorage.mapTo(mutableSetOf()) { it.sessionId }
+            val missingThisPoll = existingIds - newIds - userClosed
+            val graceSids = missingThisPoll - c.missedLastPoll  // first-miss grace
+            val evictSids = missingThisPoll intersect c.missedLastPoll  // second-miss eviction
+            if (evictSids.isNotEmpty()) {
+                LOG.info("[ClaudeTabs] Evicting ${evictSids.size} sid(s) after 2 consecutive misses: ${evictSids.map { it.take(8) }}")
+            }
+            if (graceSids.isNotEmpty() && c.pollCount % 12 == 0) {
+                LOG.info("[ClaudeTabs] First-miss grace, keeping ${graceSids.size} sid(s) this poll: ${graceSids.map { it.take(8) }}")
+            }
+
             storage.saveState(
-                projectHash = projectHash(project),
+                projectHash = hash,
                 newSessions = newForStorage,
                 keepCount = snapshotKeepCount,
                 userClosedSessionIds = userClosed,
                 transcriptCheck = { cwd, sid -> hasTranscript(cwd, sid) },
+                keepExistingSids = graceSids,
             )
+
+            // Next poll: only graceSids remain "previously missed." Evicted ones are gone
+            // from the file; new entries (in newIds) reset the miss counter to 0.
+            c.missedLastPoll = graceSids
         } catch (e: Exception) {
             LOG.debug("[ClaudeTabs] Save state failed: ${e.message}")
         }
@@ -2626,19 +2850,13 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
     }
 
     /**
-     * True if a transcript file exists at the path Claude --resume looks for:
-     * `~/.claude/projects/<cwd-encoded>/<sessionId>.jsonl`.
-     *
-     * Used to filter out "rotated" sessionIds — when Claude --resume runs, the new claude
-     * process sometimes writes a fresh sessionId to `sessions/<pid>.json` while the actual
-     * persisted transcript is still under the ORIGINAL id. Saving the rotated id to history
-     * makes resume commands fail with "No conversation found".
+     * True if a transcript file exists for this sessionId. Delegates to
+     * [ClaudeTabsHelpers.hasTranscriptAnywhere] — kept as an instance method so call sites
+     * can pass it as a method reference (`::hasTranscript`) into scanners that don't know
+     * about `CLAUDE_HOME`.
      */
-    private fun hasTranscript(cwd: String, sessionId: String): Boolean {
-        if (cwd.isBlank() || sessionId.isBlank()) return false
-        val h = cwd.replace("\\", "/").replace(":/", "--").replace("/", "-")
-        return File(File(CLAUDE_HOME, "projects/$h"), "$sessionId.jsonl").exists()
-    }
+    private fun hasTranscript(cwd: String, sessionId: String): Boolean =
+        ClaudeTabsHelpers.hasTranscriptAnywhere(File(CLAUDE_HOME, "projects"), sessionId, cwd)
 
     /**
      * Given a sessionId we read from `sessions/<pid>.json`, return the **canonical**
@@ -2663,11 +2881,25 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
     private val pidToCanonicalSession = mutableMapOf<Long, String>()
 
     private fun canonicalSessionIdFor(pid: Long, cwd: String, currentSessionId: String, claudeStartedAt: Long): String {
-        pidToCanonicalSession[pid]?.let { return it }
+        // Strategy 1 (highest priority, always re-checked — NOT gated by cache).
+        // If currentSessionId has a transcript on disk, it IS canonical. Use it and refresh
+        // the cache. This corrects any prior misresolve via Strategy 3 mtime fallback (which
+        // can map an unrelated PID to a stale sid when transcripts weren't on disk yet at
+        // resolve time). Without this re-check, a poisoned cache entry would stick for the
+        // lifetime of the process — causing two distinct alive sids to collapse to one
+        // canonical, which then makes SessionsDirScanner skip the second one as
+        // `skipAlreadyHave` and the save loop drops it from the restore file.
         if (hasTranscript(cwd, currentSessionId)) {
+            val cached = pidToCanonicalSession[pid]
+            if (cached != null && cached != currentSessionId) {
+                LOG.info("[ClaudeTabs] Cache correction for PID $pid: '$cached' → '$currentSessionId' (currentSessionId now has a transcript; prior value was a Strategy 3 mtime-fallback guess)")
+            }
             pidToCanonicalSession[pid] = currentSessionId
             return currentSessionId
         }
+        // Cache fallback: only honored when Strategy 1 fails (e.g., session is mid --resume
+        // and transcript hasn't been flushed yet). Strategy 2/3 results live here.
+        pidToCanonicalSession[pid]?.let { return it }
 
         // Strategy 2: read the claude process's argv directly. This is the canonical signal —
         // `claude --resume <uuid>` literally tells us the canonical id, no heuristic needed.

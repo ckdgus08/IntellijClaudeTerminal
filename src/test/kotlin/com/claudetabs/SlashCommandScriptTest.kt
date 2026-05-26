@@ -98,6 +98,39 @@ class SlashCommandScriptTest {
     private fun sess(id: String, name: String, bypass: Boolean = false, cwd: String = "D:\\Dev\\Project"): ClaudeTabsStorage.SavedSession =
         ClaudeTabsStorage.SavedSession(id, cwd, name, bypass)
 
+    /**
+     * Seed an entry in `~/.claude/sessions/<pid>.json` — the source of truth for the
+     * /tabs-backup script (which walks alive Claude sessions from there, not the
+     * plugin-maintained restore files). PID can be fake; the script doesn't liveness-check.
+     */
+    private fun seedAliveSession(pid: Long, sid: String, cwd: String, name: String? = null) {
+        val sessionsDir = File(claudeHome, "sessions").apply { mkdirs() }
+        val nameField = if (name != null) ",\"name\":\"$name\"" else ""
+        val cwdEscaped = cwd.replace("\\", "\\\\")
+        File(sessionsDir, "$pid.json").writeText(
+            "{\"pid\":$pid,\"sessionId\":\"$sid\",\"cwd\":\"$cwdEscaped\",\"startedAt\":1000$nameField}"
+        )
+    }
+
+    /** Seed `project-index.json` so the backup script can map cwd → projectHash. */
+    private fun seedProjectIndex(vararg projects: Triple<String, String, String>) {
+        // each Triple = (hash, basePath, name)
+        val f = File(storage.stateDir, "project-index.json")
+        f.parentFile.mkdirs()
+        val arr = projects.joinToString(",") { (h, bp, n) ->
+            val bpEscaped = bp.replace("\\", "\\\\")
+            "{\"hash\":\"$h\",\"basePath\":\"$bpEscaped\",\"name\":\"$n\"}"
+        }
+        f.writeText("{\"projects\":[$arr]}")
+    }
+
+    /** Seed a transcript file so hasTranscript() returns true for (cwd, sid). */
+    private fun seedTranscript(cwd: String, sid: String) {
+        val dirName = cwd.replace(Regex("[\\\\/:]"), "-").trimStart('-').trimEnd('-')
+        val txDir = File(claudeHome, "projects/$dirName").apply { mkdirs() }
+        File(txDir, "$sid.jsonl").writeText("{}\n")
+    }
+
     // ══════════════════════════════════════════════════════════════
     // /tabs-backup
     // ══════════════════════════════════════════════════════════════
@@ -467,8 +500,11 @@ class SlashCommandScriptTest {
         val parsed = parseCurrentProjectJson(r.stdout)
         val hash = parsed["hash"]!!
 
-        // Seed a restore file under the JS-reported hash; verify backup-active.js can read it.
-        seedRestoreFile(hash, listOf(sess("rt-1", "Roundtrip Tab")))
+        // Seed everything backup-active.js needs to find a session for this project:
+        seedProjectIndex(Triple(hash, proj.absolutePath, "roundtrip-proj"))
+        seedAliveSession(pid = 10001, sid = "rt-1", cwd = proj.absolutePath)
+        seedTranscript(proj.absolutePath, "rt-1")
+
         val backup = runNodeFile(deployedJs("backup-active.js"), args = listOf("--hash=$hash"))
         assertEquals(0, backup.exitCode)
         assertTrue("expected backup to find the seeded session: ${backup.stdout}",
@@ -481,12 +517,20 @@ class SlashCommandScriptTest {
 
     @Test fun backupActive_withHashFilter_onlyBacksUpThatProject() {
         if (!hasNode()) { println("Node missing — skipping"); return }
-        seedRestoreFile("proj-a", listOf(sess("sess-a1", "A1"), sess("sess-a2", "A2")))
-        seedRestoreFile("proj-b", listOf(sess("sess-b1", "B1")))
+        seedProjectIndex(
+            Triple("proj-a", "${tmp.root}/proj-a", "proj-a"),
+            Triple("proj-b", "${tmp.root}/proj-b", "proj-b"),
+        )
+        seedAliveSession(pid = 20001, sid = "sess-a1", cwd = "${tmp.root}/proj-a")
+        seedAliveSession(pid = 20002, sid = "sess-a2", cwd = "${tmp.root}/proj-a")
+        seedAliveSession(pid = 20003, sid = "sess-b1", cwd = "${tmp.root}/proj-b")
+        seedTranscript("${tmp.root}/proj-a", "sess-a1")
+        seedTranscript("${tmp.root}/proj-a", "sess-a2")
+        seedTranscript("${tmp.root}/proj-b", "sess-b1")
 
         val r = runNodeFile(deployedJs("backup-active.js"), args = listOf("--hash=proj-a"))
         assertEquals(0, r.exitCode)
-        assertTrue("expected 2 new sessions backed up: ${r.stdout}", r.stdout.contains("2 new"))
+        assertTrue("expected 2 new history entries: ${r.stdout}", r.stdout.contains("2 new"))
 
         val history = storage.historyFile.readText()
         assertTrue("history must include proj-a sessions", history.contains("sess-a1"))
@@ -496,8 +540,14 @@ class SlashCommandScriptTest {
 
     @Test fun backupActive_withoutHashFilter_backsUpEveryProject() {
         if (!hasNode()) { println("Node missing — skipping"); return }
-        seedRestoreFile("proj-a", listOf(sess("sess-a1", "A1")))
-        seedRestoreFile("proj-b", listOf(sess("sess-b1", "B1")))
+        seedProjectIndex(
+            Triple("proj-a", "${tmp.root}/proj-a", "proj-a"),
+            Triple("proj-b", "${tmp.root}/proj-b", "proj-b"),
+        )
+        seedAliveSession(pid = 30001, sid = "sess-a1", cwd = "${tmp.root}/proj-a")
+        seedAliveSession(pid = 30002, sid = "sess-b1", cwd = "${tmp.root}/proj-b")
+        seedTranscript("${tmp.root}/proj-a", "sess-a1")
+        seedTranscript("${tmp.root}/proj-b", "sess-b1")
 
         val r = runNodeFile(deployedJs("backup-active.js"))
         assertEquals(0, r.exitCode)
@@ -509,13 +559,15 @@ class SlashCommandScriptTest {
 
     @Test fun backupActive_withHashFilter_emptyForUnknownProject() {
         if (!hasNode()) { println("Node missing — skipping"); return }
-        // Seed proj-a so home/ exists, but ask for proj-c which has no restore file.
-        seedRestoreFile("proj-a", listOf(sess("sess-a1", "A1")))
+        // Seed proj-a but request proj-c which is not in the project-index — nothing to back up.
+        seedProjectIndex(Triple("proj-a", "${tmp.root}/proj-a", "proj-a"))
+        seedAliveSession(pid = 40001, sid = "sess-a1", cwd = "${tmp.root}/proj-a")
+        seedTranscript("${tmp.root}/proj-a", "sess-a1")
 
         val r = runNodeFile(deployedJs("backup-active.js"), args = listOf("--hash=proj-c"))
         assertEquals(0, r.exitCode)
         assertTrue("should report per-project empty message: ${r.stdout}",
-            r.stdout.contains("No active sessions for this project"))
+            r.stdout.contains("No alive sessions for project hash"))
         assertFalse("history must not be created when nothing was backed up",
             storage.historyFile.exists())
     }

@@ -207,25 +207,30 @@ internal class ClaudeTabsStorage(private val claudeHome: File) {
     }
 
     /**
-     * Write [newSessions] to the project's restore file as a **high-water-mark union** with
-     * any existing entries, then write a rotating snapshot.
+     * Write [newSessions] to the project's restore file as the **authoritative current state**,
+     * preserving descriptive names from any prior entries, then write a rotating snapshot.
      *
-     * Semantics:
+     * Semantics (1.0.17 follow-up — authoritative replace, not union):
      *  - Read the existing restore file. If [RestoreRead.ReadFailed], abort the write
      *    (don't clobber a corrupted file — keep whatever is on disk).
-     *  - Union: `existing ∪ newSessions`, **new takes precedence** on sessionId collisions
-     *    (new's name is more current than the file's stale name).
-     *  - Subtract [userClosedSessionIds] — these are sessions the user explicitly closed via
-     *    the terminal tab's X (NOT project close). Sessions in this set are dropped from
-     *    the saved state and won't be auto-restored.
-     *  - Filter via [transcriptCheck] if provided — drops entries whose Claude transcript
-     *    is no longer on disk (resume would fail anyway, so don't save them).
-     *  - Empty result + empty new input + no existing content → return null (transient
-     *    empty poll, preserve previous file content).
-     *  - Otherwise write atomically (tmp + rename) so a mid-write crash can't corrupt.
+     *  - **[newSessions] is authoritative**: the file is rebuilt from it. Existing entries
+     *    whose sid is NOT in [newSessions] are DROPPED (this is the eviction path for dead
+     *    zombies, cross-project leaks, and sessions the scanner correctly determined are
+     *    no longer alive-and-ours).
+     *  - **Name preservation**: for each entry in [newSessions], if its tabName is generic
+     *    ("Claude", "Local", etc.) AND the prior file had a descriptive tabName for the same
+     *    sid, the descriptive name is copied over. This preserves restore-file-only names
+     *    (sessions that never got a names.json entry) without keeping zombies.
+     *  - Subtract [userClosedSessionIds].
+     *  - Filter via [transcriptCheck] if provided.
+     *  - Transient-empty preservation: if [newSessions] is empty (poll race / startup
+     *    grace / Claude binary error), do NOT write — keep whatever's already on disk.
+     *  - Otherwise write atomically (tmp + rename).
      *
-     * This is **crash-safe** (atomic write) and **drift-safe** (union with existing means
-     * a session can't get evicted from restore just because the poll missed it once).
+     * Bug history: prior versions used `existing ∪ newSessions` (high-water-mark union).
+     * That preserved stale entries forever — once a dead/migrated sid landed in the file,
+     * nothing evicted it. Combined with the now-fixed tab-walk pollution (which fed wrong
+     * sids into newSessions), corrupted restore files were one-way trapdoors.
      *
      * Returns the file content written, or null if nothing was written.
      */
@@ -235,6 +240,7 @@ internal class ClaudeTabsStorage(private val claudeHome: File) {
         keepCount: Int,
         userClosedSessionIds: Set<String> = emptySet(),
         transcriptCheck: ((cwd: String, sessionId: String) -> Boolean)? = null,
+        keepExistingSids: Set<String> = emptySet(),
         now: Long = System.currentTimeMillis(),
     ): String? {
         val f = restoreFile(projectHash)
@@ -248,32 +254,45 @@ internal class ClaudeTabsStorage(private val claudeHome: File) {
         }
         val existing = (existingRead as RestoreRead.Ok).sessions
 
-        // Union: existing first (so iteration order is stable), then new overlays —
-        // but with name precedence rules so a generic *live* title can't clobber a
-        // descriptive *saved* one.
+        // Transient-empty preservation: if newSessions is empty AND no grace entries, do NOT
+        // touch the file. An empty poll is either a startup race (Claude hasn't written
+        // sessions/<pid>.json yet) or the project genuinely has no sessions. Either way, the
+        // existing file is a more reliable source than "nothing right now."
+        if (newSessions.isEmpty() && keepExistingSids.isEmpty()) return null
+
+        // Authoritative replace + two-poll grace:
+        //   - newSessions is authoritative. Existing entries whose sid is NOT in newSessions
+        //     AND NOT in keepExistingSids are DROPPED (the eviction path for dead zombies
+        //     and cross-project leaks).
+        //   - keepExistingSids is the caller's grace list: sids missing from new for the
+        //     FIRST time this poll. They're copied verbatim from existing (no scanner data
+        //     to overlay). On the next poll, if they're still missing, the caller passes
+        //     them in newSessions (which they won't be in) and NOT in keepExistingSids →
+        //     finally evicted.
         //
-        // Bug history: the previous union unconditionally let `new` overlay `existing`.
-        // That meant a tab with a descriptive name saved to disk would be overwritten on
-        // the next 5-second poll if the live tab title still read the JetBrains default
-        // (e.g. "Local") — which is common during the early seconds of a `--resume`,
-        // before Claude has set the tab title. After one cycle the descriptive name was
-        // gone forever.
-        //
-        // Rule: prefer the non-generic name. When both are non-generic, prefer `new`
-        // (more current — captures legitimate user renames). When both are generic, also
-        // prefer `new` (same reason). Only when `new` is generic AND `existing` is not
-        // do we keep `existing`'s name — and even then we copy across new's other fields
-        // (cwd, bypassPermissions) which may have changed.
+        // Name preservation: if newSessions[sid] has a generic tabName ("Claude"/"Local"/...)
+        // but the prior file had a descriptive name for the same sid, copy the descriptive
+        // name across. This preserves restore-file-only names without keeping zombies.
+        // Sessions that have a name in names.json (the durable name store) get their name
+        // via the scanner's resolveName before we ever see them here, so this branch is the
+        // safety net for pre-1.0.17 sessions whose only name record is the old restore file.
+        val priorById = existing.associateBy { it.sessionId }
         val byId = linkedMapOf<String, SavedSession>()
-        for (s in existing) byId[s.sessionId] = s
         for (s in newSessions) {
-            val prior = byId[s.sessionId]
+            val prior = priorById[s.sessionId]
             byId[s.sessionId] = if (prior != null
                 && ClaudeTabsHelpers.isGenericTabName(s.tabName)
                 && !ClaudeTabsHelpers.isGenericTabName(prior.tabName)) {
                 s.copy(tabName = prior.tabName)
             } else {
                 s
+            }
+        }
+        // Grace entries: preserve existing entries that the caller flagged as "first miss."
+        // Iterate `existing` to preserve original ordering of file entries.
+        for (s in existing) {
+            if (s.sessionId in keepExistingSids && s.sessionId !in byId) {
+                byId[s.sessionId] = s
             }
         }
 

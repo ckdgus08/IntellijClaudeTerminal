@@ -230,6 +230,89 @@ internal object ClaudeTabsHelpers {
         return n1.startsWith("$n2/")
     }
 
+    /**
+     * 1.0.18: returns true if a session should be saved into [projectBasePath]'s restore
+     * file. The window-state model: a session belongs to whichever Rider window's tab-walk
+     * discovered it (authoritative), regardless of cwd. Path-prefix matching remains the
+     * fallback for sessions the tab-walk missed (Scanner-discovered).
+     *
+     * Worktree case (the original bug): a session whose Claude process runs in
+     * `D:\Dev\MyApp-feature-branch` (a git worktree) is hosted in a tab inside the main
+     * `D:\Dev\MyApp` Rider window. Path-prefix says "different project, drop." Window-
+     * hosting says "it's right here, keep." This function lets the latter override.
+     */
+    fun ownedByProjectSave(
+        sessionId: String,
+        cwd: String?,
+        projectBasePath: String?,
+        tabWalkOwnedSids: Set<String>,
+    ): Boolean {
+        if (sessionId in tabWalkOwnedSids) return true
+        return isCwdUnderProject(cwd, projectBasePath)
+    }
+
+    /**
+     * 1.0.18 ancestry walk: returns true if walking the process-parent chain from
+     * [startPid] reaches [jvmPid] within [maxDepth] hops.
+     *
+     * Why it exists: Rider 2026.1's reworked terminal manager hides shell PIDs from the
+     * reflection APIs (`extractPidFromWidget` returns null even when ContentManager sees
+     * the tab). So top-down "which tabs are in our window" fails. Bottom-up "which Claude
+     * processes have OUR Rider JVM as an ancestor" is reliable and doesn't depend on any
+     * platform API. Typical chain on Windows: `claude.exe → pwsh.exe → rider64.exe` = 3
+     * hops; on macOS/Linux: `claude → bash/zsh → idea / rider` = 3. Default depth 8 covers
+     * unusual wrappers (e.g. `claude` → `node` → `pwsh` → `cmd` → `rider64`).
+     *
+     * [parentOf] returns the parent PID for a given PID, or null if no parent. Tests can
+     * inject a deterministic fake; production uses `ProcessHandle.of(pid).parent().pid()`.
+     */
+    fun isProcessHostedByJvm(
+        startPid: Long,
+        jvmPid: Long,
+        parentOf: (Long) -> Long?,
+        maxDepth: Int = 8,
+    ): Boolean {
+        var current: Long? = startPid
+        for (i in 0 until maxDepth) {
+            current = current?.let(parentOf) ?: return false
+            if (current == jvmPid) return true
+        }
+        return false
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // TRANSCRIPT LOOKUP
+    // ══════════════════════════════════════════════════════════════
+
+    /**
+     * True if a transcript file `<sessionId>.jsonl` exists anywhere under [projectsDir]
+     * (which is `~/.claude/projects/` in production).
+     *
+     * Fast path: check the cwd-derived subdir (`<projectsDir>/<encoded-cwd>/<sessionId>.jsonl`)
+     * since that's where Claude writes for fresh sessions.
+     *
+     * Fallback: scan all immediate subdirs. Needed when a session originally started in
+     * cwd A is later resumed by sid from cwd B — Claude keeps appending to the original
+     * transcript path (under A's encoded dir), not the one derived from B. Without the
+     * fallback, every cross-cwd resume (most commonly: resuming a session inside a git
+     * worktree shell) was rejected by `skipNoTranscript`.
+     *
+     * The cwd → subdir encoding matches Claude's: backslash → forward-slash, then `:/` →
+     * `--`, then `/` → `-`.
+     */
+    fun hasTranscriptAnywhere(projectsDir: java.io.File, sessionId: String, cwd: String?): Boolean {
+        if (sessionId.isBlank()) return false
+        if (!cwd.isNullOrBlank()) {
+            val h = cwd.replace("\\", "/").replace(":/", "--").replace("/", "-")
+            if (java.io.File(java.io.File(projectsDir, h), "$sessionId.jsonl").exists()) return true
+        }
+        val dirs = projectsDir.listFiles { f -> f.isDirectory } ?: return false
+        for (d in dirs) {
+            if (java.io.File(d, "$sessionId.jsonl").exists()) return true
+        }
+        return false
+    }
+
     // ══════════════════════════════════════════════════════════════
     // ARGV PARSING — canonical session id from --resume flag
     // ══════════════════════════════════════════════════════════════

@@ -328,13 +328,24 @@ class ClaudeTabsStorageTest {
     }
 
     // ══════════════════════════════════════════════════════════════
-    // saveState — union / userClosed / transcriptCheck / ReadFailed
+    // saveState — authoritative replace / userClosed / transcriptCheck / ReadFailed
     // ══════════════════════════════════════════════════════════════
+    //
+    // 1.0.17 follow-up contract change: saveState is AUTHORITATIVE on `newSessions`.
+    // Existing entries whose sid is NOT in newSessions are EVICTED. Bug history: the
+    // prior "high-water-mark union" preserved stale entries forever — once a dead or
+    // migrated sid landed in the file, nothing dropped it. Combined with the now-fixed
+    // tab-walk pollution that fed wrong sids into newSessions, corrupted files were
+    // one-way trapdoors. Transient-empty preservation (newSessions=[] → don't write)
+    // protects against poll races.
+    //
+    // Name preservation: when newSessions[sid] has a generic tabName ("Claude" / "Local")
+    // but the prior file had a descriptive tabName for the same sid, the descriptive name
+    // is copied over. This preserves restore-file-only names without keeping zombies.
 
-    @Test fun saveState_unionsExistingAndNew_newTakesPrecedenceOnCollision() {
+    @Test fun saveState_authoritativeReplace_newNameWinsForExistingSid() {
         // Existing file has session "x" with the old name; new save passes "x" with a new name.
-        // Result: file contains "x" with the NEW name (new overlays existing) — but only when
-        // both names are non-generic. See generic-name precedence tests below.
+        // Both are non-generic, so new (more current) wins.
         storage.saveState(projectHash, listOf(session("x", "Old Name")), 0)
         storage.saveState(projectHash, listOf(session("x", "New Name")), 0)
         val parsed = storage.parseSessions(storage.restoreFile(projectHash).readText())
@@ -343,10 +354,9 @@ class ClaudeTabsStorageTest {
     }
 
     @Test fun saveState_genericLiveName_doesNotClobberDescriptiveSavedName() {
-        // Bug shape: tab with a descriptive name is saved to disk. On the next poll the
-        // live title still reads the JetBrains default ("Local") because Claude hasn't
-        // repainted yet after --resume. The naive union let "Local" overlay the saved
-        // name; after one cycle the descriptive name was gone.
+        // Tab with a descriptive name is saved. On the next poll the scanner returns a
+        // generic name (no names.json entry yet, no widget title visible). The descriptive
+        // name in the existing file is preserved via the name-preservation rule.
         storage.saveState(projectHash, listOf(session("sid", "Topic")), 0)
         storage.saveState(projectHash, listOf(session("sid", "Local")), 0)
         val parsed = storage.parseSessions(storage.restoreFile(projectHash).readText())
@@ -354,8 +364,8 @@ class ClaudeTabsStorageTest {
     }
 
     @Test fun saveState_descriptiveLiveName_replacesGenericSavedName() {
-        // Inverse of the bug: file has generic, live has descriptive ⇒ descriptive wins.
-        // Otherwise legitimate /tab renames would never propagate to disk.
+        // Inverse: file has generic, new has descriptive ⇒ descriptive wins.
+        // Otherwise legitimate /tab renames would never propagate.
         storage.saveState(projectHash, listOf(session("sid", "Local")), 0)
         storage.saveState(projectHash, listOf(session("sid", "Topic")), 0)
         val parsed = storage.parseSessions(storage.restoreFile(projectHash).readText())
@@ -363,7 +373,7 @@ class ClaudeTabsStorageTest {
     }
 
     @Test fun saveState_genericNewStillPropagatesOtherFields() {
-        // Pin: the name-precedence rule must not freeze cwd / bypass at their saved
+        // The name-preservation rule must not freeze cwd / bypass at their saved
         // values. If the live session moved cwd or flipped bypass, those still flow.
         storage.saveState(projectHash,
             listOf(ClaudeTabsStorage.SavedSession("sid", "/cwd-a", "Topic", false)), 0)
@@ -375,16 +385,107 @@ class ClaudeTabsStorageTest {
         assertTrue(s.bypassPermissions)
     }
 
-    @Test fun saveState_unionPreservesEntriesPollMissed() {
-        // Poll 1: sees both x and y → file has both.
-        // Poll 2: sees only x (y was transiently invisible) → file MUST still have both.
-        // This is the drift-safety contract: a missed poll cannot evict a session.
+    @Test fun saveState_authoritativeReplace_evictsEntriesNotInNew() {
+        // The eviction contract: any sid in the existing file that is NOT in newSessions
+        // is dropped. This is what fixes the cross-project / dead-zombie leak — once the
+        // scanner correctly excludes a sid (because the process died, or the cwd moved
+        // to a different project), the file rebuilds without it.
+        //
+        // Poll 1: scanner sees x and y → file = [x, y].
+        // Poll 2: scanner sees only x (y migrated to a different project, or died) →
+        // file MUST = [x] only. y is evicted.
         storage.saveState(projectHash,
             listOf(session("x", "X"), session("y", "Y")), 0)
         storage.saveState(projectHash, listOf(session("x", "X")), 0)
         val parsed = storage.parseSessions(storage.restoreFile(projectHash).readText())
-        assertEquals(2, parsed.size)
-        assertTrue(parsed.any { it.sessionId == "y" })
+        assertEquals(1, parsed.size)
+        assertEquals("x", parsed[0].sessionId)
+    }
+
+    @Test fun saveState_transientEmptyNew_preservesExistingFile() {
+        // Critical safety property: if newSessions is empty (poll race, scanner returned
+        // nothing transiently, startup grace, Claude binary error), do NOT touch the file.
+        // The existing content must be preserved verbatim. Otherwise a single bad poll
+        // would wipe every saved session in the project.
+        storage.saveState(projectHash,
+            listOf(session("a", "A"), session("b", "B")), 0)
+        val before = storage.restoreFile(projectHash).readText()
+        val result = storage.saveState(projectHash, emptyList(), 0)
+        val after = storage.restoreFile(projectHash).readText()
+        assertEquals("transient empty must not write", null, result)
+        assertEquals("file content must be byte-identical", before, after)
+    }
+
+    @Test fun saveState_twoPollGrace_keepsExistingOnFirstMiss() {
+        // Pin the two-poll-grace contract: a sid in existing but NOT in newSessions is
+        // KEPT this save if the caller passes it via keepExistingSids (first miss = grace),
+        // and is EVICTED if the caller doesn't pass it (second miss = conviction).
+        //
+        // Poll 1: scanner sees [a, b]. Both saved → file = [a, b]. nothing missed.
+        storage.saveState(projectHash, listOf(session("a", "A"), session("b", "B")), 0)
+        // Poll 2: scanner sees only [a]. Caller computes (existing - new) = {b}. b is not
+        // in caller's previousMissed (it was present last poll), so caller passes
+        // keepExistingSids = {b} → first-miss grace, file stays [a, b].
+        storage.saveState(projectHash, listOf(session("a", "A")), 0,
+            keepExistingSids = setOf("b"))
+        val afterGrace = storage.parseSessions(storage.restoreFile(projectHash).readText())
+        assertEquals(setOf("a", "b"), afterGrace.map { it.sessionId }.toSet())
+
+        // Poll 3: scanner still sees only [a]. b is now in caller's previousMissed (it was
+        // graced last poll), so caller passes keepExistingSids = {} → b evicted, file = [a].
+        storage.saveState(projectHash, listOf(session("a", "A")), 0,
+            keepExistingSids = emptySet())
+        val afterEvict = storage.parseSessions(storage.restoreFile(projectHash).readText())
+        assertEquals(setOf("a"), afterEvict.map { it.sessionId }.toSet())
+    }
+
+    @Test fun saveState_twoPollGrace_recoversIfSidReappears() {
+        // Scanner momentarily missed sid b (transient PID race / Claude restart) at poll 2,
+        // but it's back at poll 3 → grace forgives the miss, no eviction.
+        //
+        // Poll 1: [a, b] → file = [a, b].
+        storage.saveState(projectHash, listOf(session("a", "A"), session("b", "B")), 0)
+        // Poll 2: [a] only. Grace keeps b.
+        storage.saveState(projectHash, listOf(session("a", "A")), 0,
+            keepExistingSids = setOf("b"))
+        // Poll 3: scanner sees b again. Caller's previousMissed had {b} but b is now in
+        // newSessions so it doesn't need grace → keepExistingSids = {}. File = [a, b].
+        storage.saveState(projectHash, listOf(session("a", "A"), session("b", "B")), 0,
+            keepExistingSids = emptySet())
+        val parsed = storage.parseSessions(storage.restoreFile(projectHash).readText())
+        assertEquals(setOf("a", "b"), parsed.map { it.sessionId }.toSet())
+    }
+
+    @Test fun scenario_tabWalkPollutionDropped() {
+        // Regression pin matching the exact bug shape that drove this fix. Before: a
+        // project's restore file had a real entry plus a cross-project leak (sid alive
+        // in a different project) plus a dead zombie (process gone, transcript still
+        // on disk). The bugged union kept all three forever; new alive sessions never
+        // appeared because the tab-walk pollution tricked the scanner into skipping
+        // them as already-active.
+        //
+        // After the fix: the scanner produces the authoritative list of alive-and-ours
+        // sessions, and saveState rebuilds the file from that. Stale entries evicted,
+        // real new entries appear.
+        //
+        // Setup: pre-bug state of the file (after the tab-walk pollution had run).
+        storage.saveState(projectHash, listOf(
+            session("real-alive", "Important Topic"),     // legitimate alive session
+            session("cross-project", "Local"),            // alive but actually belongs to another project
+            session("dead-zombie", "Local"),              // dead process, transcript still on disk
+        ), 0)
+        // The next poll: scanner correctly identifies what's alive-and-in-this-project.
+        // (cross-project and dead-zombie correctly absent; two new alive sessions present.)
+        storage.saveState(projectHash, listOf(
+            session("real-alive", "Important Topic"),
+            session("new-alive-1", "Claude"),
+            session("new-alive-2", "Claude"),
+        ), 0)
+        val parsed = storage.parseSessions(storage.restoreFile(projectHash).readText())
+        val ids = parsed.map { it.sessionId }.toSet()
+        assertEquals(setOf("real-alive", "new-alive-1", "new-alive-2"), ids)
+        assertTrue("cross-project leak must be evicted", "cross-project" !in ids)
+        assertTrue("dead-zombie must be evicted", "dead-zombie" !in ids)
     }
 
     @Test fun saveState_subtractsUserClosedSessions() {
@@ -400,7 +501,7 @@ class ClaudeTabsStorageTest {
     }
 
     @Test fun saveState_transcriptCheckDropsEntriesWithMissingTranscript() {
-        // "ghost" passes the union but its transcript check returns false → dropped.
+        // "ghost" is in newSessions but its transcript check returns false → dropped.
         storage.saveState(projectHash,
             listOf(session("real", "Real"), session("ghost", "Ghost")), 0,
             transcriptCheck = { _, sid -> sid != "ghost" })

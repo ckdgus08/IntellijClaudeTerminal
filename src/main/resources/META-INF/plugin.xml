@@ -1,7 +1,7 @@
 <idea-plugin>
     <id>com.claudetabs.rider-claude-tabs</id>
     <name>Claude Terminal Tab Persistence</name>
-    <version>1.0.16</version>
+    <version>1.0.18</version>
     <vendor email="ragnaraven.dev@gmail.com" url="https://github.com/Ragnaraven/RiderClaudeTabs">Ragnaraven</vendor>
 
     <description><![CDATA[
@@ -43,6 +43,21 @@
     ]]></description>
 
     <change-notes><![CDATA[
+    <h3>1.0.18</h3>
+    <ul>
+      <li><b>Window-state serialization: tabs are tracked by which Rider window they live in, not by their working directory.</b> A Claude session opened from a sibling folder (e.g. a git worktree at <code>D:\Dev\MyApp-feature-branch</code>) whose terminal tab is hosted in the main project's Rider window is now correctly tracked in that project's restore file. Pre-1.0.18 the cwd-prefix filter dropped these sessions as "cross-project leaks" and they never auto-restored.</li>
+      <li><b>Worktree-resume transcript lookup:</b> when a session originally started in one folder is later resumed by sid from a different folder (typical worktree workflow: <code>cd ../MyApp-feature && claude --resume &lt;sid&gt;</code>), Claude keeps appending to the original transcript path. The transcript-existence check now falls back to scanning all project dirs after the cwd-derived path misses, so the session is no longer rejected with <code>skipNoTranscript</code> and lands in the restore file like any other.</li>
+      <li><b>Tab discovery is now authoritative.</b> The <code>poll()</code> tab-walk re-contributes to the saved session list (it was disabled in the early 1.0.17 work after a canonical-id collision caused stale sids to shadow real ones; the underlying collision is now fixed, so tab-walk is trustworthy again). <code>SessionsDirScanner</code> stays as a fallback for tabs the platform APIs lose.</li>
+      <li><b>DockManager-based 5th tab source:</b> popped-out terminal tabs in floating windows are now enumerated via <code>com.intellij.openapi.fileEditor.impl.DockManager.containers</code>. Reflective access with try/catch fallback &mdash; missing API on older IDEs degrades to "no popout coverage" rather than a crash. Combined with the existing 4 enumeration sources, this catches tabs across split panes, island groups, hidden-under-overflow, minimized tool windows, and popped-out floating windows.</li>
+      <li><b>Cross-project arbitration:</b> when two open project windows would both claim the same session, the project whose tab-walk found it wins. The other project's scanner defers. Prevents the same sid from being saved into two restore files.</li>
+      <li><b>Canonical-id cache correction:</b> <code>canonicalSessionIdFor</code> now always re-checks Strategy 1 (transcript-on-disk) before honoring cached results. A stale Strategy 3 mtime-fallback guess gets corrected the instant the real transcript appears. Fixes two distinct alive sids collapsing into one canonical (which previously caused the scanner to skip the second as <code>skipAlreadyHave</code> and the save loop to drop it from the restore file).</li>
+      <li><b><code>names.json</code> auto-applied to live tabs.</b> The poll loop now re-applies a stored name when the live tab title is generic ("Local"/"Claude") or an AI overlay glyph. Manual user-typed titles are still respected. Effect: setting a name via <code>/tab</code>, migration backfill, or direct <code>names.json</code> edit shows up on the tab strip within ~5 seconds.</li>
+      <li><b>Two-poll-grace eviction.</b> A sid missing from one poll's scanner output is no longer instantly evicted from the restore file &mdash; it's preserved one cycle (the grace), then evicted if still missing on the second poll. Forgives single-poll races (Claude restart, brief PID gap, scanner momentary skip) without keeping zombies forever. Worst-case eviction lag: ~10s at the 5s poll cadence.</li>
+      <li><b>Authoritative <code>saveState</code> with name preservation.</b> When the scanner returns a non-empty list, existing restore entries whose sid isn't in the new list are dropped (the eviction path for dead zombies and cross-project leaks). Descriptive names from the prior file are preserved when the scanner returns a generic name for the same sid &mdash; restore-file-only names from sessions that pre-date <code>names.json</code> survive.</li>
+      <li><b><code>/tabs-backup</code> rewritten.</b> Source switched from "whatever's in the restore file" to <code>~/.claude/sessions/*.json</code> (Claude's own alive list). Now actually backs up every currently-alive session, catching anything the poll lagged on or dropped. Updates both the restore file AND <code>history.json</code> in one go.</li>
+      <li>248+ unit tests &mdash; new scenarios cover canonical-id cache correction, two-poll-grace eviction + recovery, authoritative replace with descriptive-name preservation, the tab-walk-pollution regression shape, JSON cwd extraction with Windows-style double-backslash escapes, and the rewritten <code>/tabs-backup</code> behavior.</li>
+    </ul>
+
     <h3>1.0.17</h3>
     <ul>
       <li><b>Saves no longer trust the live widget title for tab names.</b> A new <code>names.json</code> store keyed by sessionId is the durable source of truth. The save loop reads from there ahead of the legacy fallback chain, so the JetBrains AI Assistant overlay corrupting the live title with a status glyph (e.g. <code>&#x2733; Claude Code</code>) can no longer reach the saved name. Fixes restored tabs coming back as <code>&#x2733; Claude Code</code> instead of their real names.</li>
