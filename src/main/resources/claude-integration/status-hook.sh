@@ -41,6 +41,12 @@ SID=$(echo "$INPUT" | sed -n 's/.*"session_id":"\([^"]*\)".*/\1/p')
 # getting that wrong makes a finished chat come back as idle after an IDE restart.
 SOURCE=$(echo "$INPUT" | sed -n 's/.*"source":"\([^"]*\)".*/\1/p')
 
+# Notification carries what kind it is, in the same slot SessionStart uses for
+# `source`. Claude's own hook-payload builder:
+#   case "Notification": a = n.notification_type
+#   case "SessionStart": a = n.source
+NOTIF_TYPE=$(echo "$INPUT" | sed -n 's/.*"notification_type":"\([^"]*\)".*/\1/p')
+
 STATUS_DIR="$HOME/.claude/rider-plugin/status"
 mkdir -p "$STATUS_DIR" 2>/dev/null || exit 0
 
@@ -53,9 +59,25 @@ case "$NOW_NS" in
   *)           TS=$(( NOW_NS / 1000000 )) ;;
 esac
 
-PAYLOAD="{\"event\":\"$EVENT\",\"source\":\"$SOURCE\",\"sessionId\":\"$SID\",\"ts\":$TS,\"pid\":$PPID}"
+PAYLOAD="{\"event\":\"$EVENT\",\"source\":\"$SOURCE\",\"notificationType\":\"$NOTIF_TYPE\",\"sessionId\":\"$SID\",\"ts\":$TS,\"pid\":$PPID}"
 
-if [ -n "$SID" ]; then
+# `idle_prompt` is Claude nudging you 60s after it went idle — "Claude is waiting
+# for your input". It is not a permission prompt and nothing about the turn has
+# changed, so it must not overwrite the edge already on record.
+#
+# This is filtered here rather than in the plugin because the file holds one edge
+# per session: writing this event would destroy the `Stop` under it, and there
+# would be nothing left to fall back to. Recording it and ignoring it later is
+# not the same thing.
+#
+# Observed: a finished session showed ✓, then flipped to ⚠ exactly 60s later and
+# stayed there. Claude's own status said `idle` the whole time.
+SKIP_STATUS_WRITE=""
+if [ "$EVENT" = "Notification" ] && [ "$NOTIF_TYPE" = "idle_prompt" ]; then
+  SKIP_STATUS_WRITE=1
+fi
+
+if [ -n "$SID" ] && [ -z "$SKIP_STATUS_WRITE" ]; then
   echo "$PAYLOAD" > "$STATUS_DIR/$SID.json"
 fi
 

@@ -39,6 +39,12 @@ internal object RemoteControlLauncher {
          * file will say so.
          */
         val mode: String,
+        /**
+         * Absolute path to the `claude` executable, when the search in [candidatePaths]
+         * doesn't find it. Setting this is what keeps background mode off the interactive
+         * shell — see [buildArgv].
+         */
+        val claudePath: String? = null,
     ) {
         val isBackground get() = mode == "background"
 
@@ -72,35 +78,118 @@ internal object RemoteControlLauncher {
         val mode = ClaudeTabsHelpers.extractJsonString(block, "mode")
             ?.takeIf { it == "tab" || it == "background" }
             ?: Config.DEFAULT.mode
-        return Config(enabled, spawnMode, extraArgs, mode)
+        val claudePath = ClaudeTabsHelpers.extractJsonString(block, "claudePath")?.takeIf { it.isNotBlank() }
+        return Config(enabled, spawnMode, extraArgs, mode, claudePath)
     }
 
     /**
-     * The background-mode argv: the command run through a **login, interactive** shell —
-     * the same `-l -i` the IDE's own terminal tab uses.
+     * Where the `claude` executable is looked for, in order, before falling back to a shell.
      *
-     * Not `["claude", "remote-control", …]` directly. An IDE launched from the Dock or
-     * Finder inherits a minimal PATH without `~/.local/bin`, where the CLI installs itself,
-     * so the first attempt at this mode died with
-     * `Cannot run program "claude" … error=2 (No such file or directory)`.
+     * An IDE launched from the Dock or Finder inherits a minimal PATH without
+     * `~/.local/bin`, where the CLI installs itself — running `claude` directly under that
+     * environment dies with `Cannot run program "claude" … error=2`. The first fix for that
+     * was to run the command through `$SHELL -l -i -c`, because the PATH entry lives in
+     * `.zshrc` and only an *interactive* shell sources it (`-l` alone genuinely is not
+     * enough; that was measured).
      *
-     * `-l` alone is not enough either, which is the part worth remembering: measured against
-     * a stripped environment, `zsh -l -c 'command -v claude'` still fails. A login shell
-     * reads `.zprofile`, but the PATH entry lives in `.zshrc`, which only an *interactive*
-     * shell sources. Tab mode works precisely because its shell is `zsh --login -i`, so
-     * background mode uses the same flags rather than a guessed list of install locations.
+     * That worked, and cost more than it looked like. An interactive shell also sources the
+     * user's whole prompt framework, and a framework like powerlevel10k starts a `gitstatus`
+     * daemon that double-forks to `ppid=1`. Those forks inherit the shell's argv, so each
+     * IDE start left two stray `zsh -l -i -c claude remote-control …` processes that the
+     * shutdown path — which kills the process *tree* — structurally could not see, because
+     * they had already been reparented away from it.
+     *
+     * Finding the executable ourselves removes the shell from the picture entirely: the
+     * process tree becomes `pty → claude` and the existing teardown covers all of it.
+     */
+    fun candidatePaths(
+        override: String?,
+        home: String?,
+        pathEnv: String?,
+        exeName: String = "claude",
+    ): List<String> {
+        val out = LinkedHashSet<String>()
+        override?.takeIf { it.isNotBlank() }?.let { out.add(it) }
+        // The IDE's own PATH first: if the user launched from a terminal it already has the
+        // right entry, and it beats guessing.
+        pathEnv?.split(java.io.File.pathSeparatorChar)
+            ?.filter { it.isNotBlank() }
+            ?.forEach { out.add(it.trimEnd('/', '\\') + java.io.File.separator + exeName) }
+        home?.takeIf { it.isNotBlank() }?.let { h ->
+            val base = h.trimEnd('/', '\\')
+            out.add("$base/.local/bin/$exeName")
+            out.add("$base/.claude/local/$exeName")
+            out.add("$base/.bun/bin/$exeName")
+        }
+        out.add("/opt/homebrew/bin/$exeName")
+        out.add("/usr/local/bin/$exeName")
+        out.add("/usr/bin/$exeName")
+        return out.toList()
+    }
+
+    /** First candidate that exists and can be run, or null to fall back to the shell. */
+    fun resolveExecutable(candidates: List<String>, isExecutable: (String) -> Boolean): String? =
+        candidates.firstOrNull(isExecutable)
+
+    /**
+     * The background-mode argv.
+     *
+     * With [executable] resolved, this is the program and its arguments directly — no shell,
+     * so no quoting, no rc files, and no orphaned prompt-framework forks. See
+     * [candidatePaths] for why that matters.
+     *
+     * Without it, fall back to the **login, interactive** shell that made this mode work in
+     * the first place. It is worse for the reasons above, but a working server with two
+     * stray shells beats no server at all.
      */
     fun buildArgv(
         config: Config,
         sessionName: String,
         shell: String? = System.getenv("SHELL"),
-    ): List<String> = listOf(
-        shell?.takeIf { it.isNotBlank() } ?: "/bin/sh",
-        "-l",
-        "-i",
-        "-c",
-        buildCommand(config, sessionName),
-    )
+        executable: String? = null,
+    ): List<String> {
+        if (executable != null && executable.isNotBlank()) {
+            val argv = mutableListOf(executable, "remote-control", "--name", sessionName)
+            config.spawnMode?.let { argv.add("--spawn"); argv.add(it) }
+            config.extraArgs?.let { argv.addAll(splitArgs(it)) }
+            return argv
+        }
+        return listOf(
+            shell?.takeIf { it.isNotBlank() } ?: "/bin/sh",
+            "-l",
+            "-i",
+            "-c",
+            buildCommand(config, sessionName),
+        )
+    }
+
+    /**
+     * Split `extraArgs` the way a shell would, honouring quotes.
+     *
+     * The setting is documented as "appended verbatim to the command line", and in the shell
+     * path it is exactly that. Without a shell there is nothing to do the splitting, and
+     * passing the whole string as one argv element would hand `claude` a single nonsense
+     * argument.
+     */
+    fun splitArgs(s: String): List<String> {
+        val out = mutableListOf<String>()
+        val current = StringBuilder()
+        var quote: Char? = null
+        var started = false
+        for (ch in s) {
+            when {
+                quote != null && ch == quote -> quote = null
+                quote != null -> current.append(ch)
+                ch == '\'' || ch == '"' -> { quote = ch; started = true }
+                ch.isWhitespace() -> {
+                    if (started) { out.add(current.toString()); current.clear(); started = false }
+                }
+                else -> { current.append(ch); started = true }
+            }
+        }
+        if (started) out.add(current.toString())
+        return out
+    }
 
     /**
      * Should this project window start a server?

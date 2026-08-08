@@ -169,6 +169,85 @@ class RemoteControlModeTest {
         assertEquals("tab", RemoteControlLauncher.parseConfig("""{"remoteControl":{"mode":"hidden"}}""").mode)
     }
 
+    @Test fun backgroundRunsTheExecutableDirectlyWhenItCanBeFound() {
+        // No shell at all: the process tree becomes `pty → claude`, which is what makes the
+        // teardown's descendant walk sufficient. See fallsBackToAShellOnlyWhenItHasTo.
+        val cfg = RemoteControlLauncher.Config(true, "worktree", "--capacity 4", "background")
+        val argv = RemoteControlLauncher.buildArgv(cfg, "my project", executable = "/Users/x/.local/bin/claude")
+        assertEquals(
+            listOf("/Users/x/.local/bin/claude", "remote-control", "--name", "my project",
+                   "--spawn", "worktree", "--capacity", "4"),
+            argv,
+        )
+    }
+
+    /**
+     * Without a shell there is no quoting problem to have — the name is one argv element,
+     * so the shell metacharacters that [shellQuote] exists to neutralise never reach a
+     * parser at all.
+     */
+    @Test fun theDirectFormNeedsNoQuoting() {
+        val argv = RemoteControlLauncher.buildArgv(
+            RemoteControlLauncher.Config.DEFAULT, "'; rm -rf ~; echo '", executable = "/bin/claude",
+        )
+        assertEquals("'; rm -rf ~; echo '", argv[3])
+        assertFalse(argv.any { it.contains("rm -rf ~;") && it != "'; rm -rf ~; echo '" })
+    }
+
+    @Test fun extraArgsAreSplitTheWayAShellWould() {
+        assertEquals(listOf("--capacity", "4"), RemoteControlLauncher.splitArgs("--capacity 4"))
+        assertEquals(listOf("--label", "my box"), RemoteControlLauncher.splitArgs("""--label "my box""""))
+        assertEquals(listOf("--label", "my box"), RemoteControlLauncher.splitArgs("--label 'my box'"))
+        assertEquals(emptyList<String>(), RemoteControlLauncher.splitArgs("   "))
+        assertEquals(listOf("a", "b"), RemoteControlLauncher.splitArgs("  a   b  "))
+    }
+
+    // ── Finding the executable ────────────────────────────────────
+
+    @Test fun looksWhereTheCliActuallyInstalls() {
+        val paths = RemoteControlLauncher.candidatePaths(null, "/Users/x", "/usr/bin:/bin")
+        assertTrue(paths.contains("/Users/x/.local/bin/claude"))
+        assertTrue(paths.contains("/usr/bin/claude"))
+        assertTrue(paths.contains("/opt/homebrew/bin/claude"))
+    }
+
+    @Test fun theIdesOwnPathWinsOverGuesses() {
+        // If the IDE was launched from a terminal it already has the right entry, and that
+        // beats a hard-coded list that can go stale.
+        val paths = RemoteControlLauncher.candidatePaths(null, "/Users/x", "/opt/mine/bin")
+        assertTrue(paths.indexOf("/opt/mine/bin/claude") < paths.indexOf("/Users/x/.local/bin/claude"))
+    }
+
+    @Test fun anExplicitConfigPathOutranksEverything() {
+        val paths = RemoteControlLauncher.candidatePaths("/custom/claude", "/Users/x", "/usr/bin")
+        assertEquals("/custom/claude", paths.first())
+    }
+
+    @Test fun readsTheOverrideOutOfConfigJson() {
+        val cfg = RemoteControlLauncher.parseConfig("""{"remoteControl":{"claudePath":"/opt/claude"}}""")
+        assertEquals("/opt/claude", cfg.claudePath)
+        assertEquals(null, RemoteControlLauncher.parseConfig("""{"remoteControl":{}}""").claudePath)
+    }
+
+    @Test fun picksTheFirstCandidateThatIsActuallyThere() {
+        val present = setOf("/usr/local/bin/claude")
+        assertEquals(
+            "/usr/local/bin/claude",
+            RemoteControlLauncher.resolveExecutable(
+                listOf("/nope/claude", "/usr/local/bin/claude", "/usr/bin/claude"),
+            ) { it in present },
+        )
+        assertEquals(null, RemoteControlLauncher.resolveExecutable(listOf("/nope/claude")) { false })
+    }
+
+    @Test fun fallsBackToAShellOnlyWhenItHasTo() {
+        // The shell path stays: a working server with two stray forks beats no server.
+        val argv = RemoteControlLauncher.buildArgv(
+            RemoteControlLauncher.Config.DEFAULT, "app", shell = "/bin/zsh", executable = null,
+        )
+        assertEquals(listOf("/bin/zsh", "-l", "-i", "-c"), argv.take(4))
+    }
+
     @Test fun backgroundRunsThroughALoginInteractiveShell() {
         // An IDE launched from the Dock inherits a minimal PATH without ~/.local/bin, where
         // the CLI installs itself, so running `claude` directly died with
