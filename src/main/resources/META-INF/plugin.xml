@@ -1,7 +1,7 @@
 <idea-plugin>
     <id>com.claudetabs.rider-claude-tabs</id>
     <name>Claude Terminal Tab Persistence</name>
-    <version>1.0.32</version>
+    <version>1.0.36</version>
     <vendor email="ragnaraven.dev@gmail.com" url="https://github.com/Ragnaraven/RiderClaudeTabs">Ragnaraven</vendor>
 
     <description><![CDATA[
@@ -19,21 +19,11 @@
       <li><b>Remote Control on by default</b> &mdash; a <code>claude remote-control</code> tab per project, so this
       machine's sessions are reachable from claude.ai/code and the Claude mobile app. Disable via
       <code>remoteControl.enabled</code> in <code>~/.claude/rider-plugin/config.json</code>.</li>
-      <li><b>Auto-rename terminal tabs</b> based on the Claude conversation topic (or a name you give it)</li>
+      <li><b>Tabs named from Claude's own summary</b> of the conversation, read out of its session file &mdash; no turn
+      spent on naming. <code>/tab &lt;name&gt;</code> overrides it and is never overwritten.</li>
       <li><b>Race-condition-free</b> identification of each tab via <code>TERM_SESSION_ID</code> mapping</li>
       <li><b>Session save/restore</b> across IDE restarts — your named tabs come back</li>
-      <li><b>Session history</b> — browse and resume past Claude sessions with <code>/tabs-history</code></li>
       <li><b>Respects manual renames</b> — if you rename a tab yourself, the plugin backs off</li>
-    </ul>
-
-    <h3>Slash Commands (installed into ~/.claude/commands/)</h3>
-    <ul>
-      <li><code>/tab &lt;name&gt;</code> — rename current tab and snapshot to history</li>
-      <li><code>/tabs-status</code> — report of all active Claude sessions</li>
-      <li><code>/tabs-backup</code> — manually snapshot current sessions to history</li>
-      <li><code>/tabs-history</code> — browse and resume past sessions</li>
-      <li><code>/tabs-restore</code> — restore saved sessions from last close</li>
-      <li><code>/tabs-clear</code> — clear the rename cache</li>
     </ul>
 
     <p><b>Requirements:</b> Rider / IntelliJ 2026.1+ with the bundled Terminal plugin, and
@@ -50,6 +40,68 @@
     ]]></description>
 
     <change-notes><![CDATA[
+    <h3>1.0.36</h3>
+    <ul>
+      <li><b>"Is this tab still unnamed?" was answered in English only.</b> The IDE's default terminal name is
+      localised &mdash; <code>로컬</code> on a Korean IDE, <code>ローカル</code> on Japanese, <code>本地</code> on
+      Chinese &mdash; and the check only knew <code>Local</code> / <code>bash</code> / <code>pwsh</code>. An untouched
+      default tab therefore read as a name someone had deliberately chosen, everywhere that check is consulted: the
+      spare-terminal sweep kept it, automatic naming refused to touch it, and restore treated it as meaningful.</li>
+      <li>The name is now read at runtime from the terminal plugin's own bundle key
+      (<code>local.terminal.default.name</code>), so it is correct in whatever language the IDE is running &mdash;
+      rather than a list that grows one language at a time. The three packs JetBrains ships are hard-coded as a fallback
+      for when that lookup fails, read out of those plugins rather than guessed.</li>
+      <li>Numbered variants come along: <code>로컬 (2)</code> counts, exactly as <code>Local (2)</code> always did.</li>
+      <li>Found by the diagnostic added in 1.0.32, which reported the tab with every other guard passing:
+      <code>'로컬'(pid=91000 generic=false claude=false children=0[] ours=false &rarr; keep)</code>.</li>
+      <li>400 unit tests.</li>
+    </ul>
+
+    <h3>1.0.35</h3>
+    <ul>
+      <li><b>The six slash commands are gone</b> &mdash; <code>/tab</code>, <code>/tabs-status</code>,
+      <code>/tabs-backup</code>, <code>/tabs-history</code>, <code>/tabs-restore</code>, <code>/tabs-clear</code>. Every
+      one had been overtaken: naming is automatic now, the IDE's own right-click &rarr; Rename Session covers the
+      deliberate case (and the plugin never overwrites a title set there), and <code>/tabs-history</code> /
+      <code>/tabs-status</code> duplicated Claude's <code>/resume</code> and <code>claude agents</code> with less
+      information &mdash; they would happily offer to resume a session that was still running.</li>
+      <li>The three Node helpers and <code>tab.sh</code> that only existed to back them are gone too, and the five
+      <code>settings.json</code> permissions they needed are <i>withdrawn</i> on upgrade rather than merely no longer
+      added &mdash; otherwise an old install keeps allowing commands the plugin no longer ships.</li>
+      <li>Files left by earlier installs are removed on every start, not just on uninstall: a stale command that
+      half-works is worse than none.</li>
+      <li>394 unit tests (17 covering the removed scripts went with them).</li>
+    </ul>
+
+    <h3>1.0.34</h3>
+    <ul>
+      <li><b>Stops asking Claude to name the tab.</b> The instruction the plugin injects into
+      <code>~/.claude/CLAUDE.md</code> told Claude to run <code>rename-tab.sh</code> at the start of every
+      conversation, which spent a turn on something 1.0.33 now gets for free by reading the session name Claude already
+      maintains. The instruction now says the opposite: don't name the tab unless the user asks.</li>
+      <li>What it still covers, because those cannot be read from anywhere: use the user's <i>exact words</i> when they
+      do ask for a name, and never treat the status glyph as part of the name.</li>
+      <li>The deployed <code>CLAUDE.md</code> section is replaced between its markers on every start, so this applies
+      without any manual edit.</li>
+    </ul>
+
+    <h3>1.0.33</h3>
+    <ul>
+      <li><b>Tabs are named from Claude's own summary of the conversation.</b> Claude Code keeps a name for each
+      session in <code>~/.claude/sessions/&lt;pid&gt;.json</code> and records where it came from:
+      <code>derived</code> is built mechanically from the working directory
+      (<code>riderclaudetabs-29</code>), while <code>auto</code> is Claude's own summary of what the conversation is
+      about (<code>설치 스크립트 초기 설정 프로세스 개선</code>). Only <code>auto</code> and <code>user</code> are used;
+      a directory-derived name tells the tab nothing it doesn't already know.</li>
+      <li>A name typed via <code>/tab</code> still outranks everything &mdash; that is an explicit choice. Below it,
+      Claude's name now comes before the older fallbacks.</li>
+      <li>The label follows the conversation: it is re-applied when the tab is still generic, or when it is showing a
+      name this plugin put there. A title someone typed into the tab strip is never overwritten.</li>
+      <li>This costs nothing at runtime and needs no cooperation from the conversation, unlike the instruction the
+      plugin injects into <code>~/.claude/CLAUDE.md</code> asking Claude to call <code>rename-tab.sh</code> at the start
+      of every conversation &mdash; which spends a turn to do the same job.</li>
+    </ul>
+
     <h3>1.0.32</h3>
     <ul>
       <li><b>The spare-terminal sweep now says why it did nothing.</b> Twice in a row it silently skipped every tab and
