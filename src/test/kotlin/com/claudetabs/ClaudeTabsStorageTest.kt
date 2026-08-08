@@ -249,12 +249,12 @@ class ClaudeTabsStorageTest {
     @Test fun storagePaths_resolveUnderClaudeHome() {
         val home = tmp.root
         val s = ClaudeTabsStorage(home)
-        assertEquals(File(home, "rider-plugin"), s.stateDir)
-        assertEquals(File(home, "rider-plugin/tabs"), s.tabsDir)
-        assertEquals(File(home, "rider-plugin/session-map"), s.sessionMapDir)
-        assertEquals(File(home, "rider-plugin/snapshots"), s.snapshotsDir)
-        assertEquals(File(home, "rider-plugin/history.json"), s.historyFile)
-        assertEquals(File(home, "rider-plugin/config.json"), s.configFile)
+        assertEquals(File(home, "intellij-claude-terminal"), s.stateDir)
+        assertEquals(File(home, "intellij-claude-terminal/tabs"), s.tabsDir)
+        assertEquals(File(home, "intellij-claude-terminal/session-map"), s.sessionMapDir)
+        assertEquals(File(home, "intellij-claude-terminal/snapshots"), s.snapshotsDir)
+        assertEquals(File(home, "intellij-claude-terminal/history.json"), s.historyFile)
+        assertEquals(File(home, "intellij-claude-terminal/config.json"), s.configFile)
         assertEquals(File(home, "CLAUDE.md"), s.claudeMdFile)
         assertEquals(File(home, "settings.json"), s.settingsFile)
         assertEquals(File(home, "sessions"), s.sessionsDir)

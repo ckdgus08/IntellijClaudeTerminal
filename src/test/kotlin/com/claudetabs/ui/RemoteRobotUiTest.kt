@@ -91,7 +91,7 @@ class RemoteRobotUiTest {
     1. Launch sandbox via `./gradlew runIdeForUiTests` (would need to automate from here).
     2. Open a project with an empty terminal tool window.
     3. Open terminal tab, execute `node fake-claude.js sess-test-1`.
-    4. Execute `bash ~/.claude/rider-plugin/rename-tab.sh "UI Test Tab"`.
+    4. Execute `bash ~/.claude/intellij-claude-terminal/rename-tab.sh "UI Test Tab"`.
     5. Poll the tab title via Remote Robot; expect it to become "UI Test Tab" within 10s.
     6. Close the sandbox cleanly.
     7. Re-launch. Expect the plugin to:

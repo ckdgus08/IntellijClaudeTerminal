@@ -32,15 +32,15 @@ terminal tab strip you already use.
 
 ## Install
 
-**Settings → Plugins → Marketplace → search "Claude Terminal Tab Persistence" → Install → restart.**
+**Settings → Plugins → Marketplace → search "Claude Terminal Tabs" → Install → restart.**
 
 Or build it yourself and use **Settings → Plugins → ⚙ → Install Plugin from Disk…**:
 
 ```bash
-./gradlew buildPlugin      # → build/distributions/rider-claude-tabs-<version>.zip
+./gradlew buildPlugin      # → build/distributions/intellij-claude-terminal-<version>.zip
 ```
 
-Everything else (scripts, hooks, CLAUDE.md section, permissions) is set up on first start.
+Everything else (scripts, hooks, permissions) is set up on first start.
 
 ## How the status is detected
 
@@ -48,7 +48,7 @@ Two signals, reconciled — neither is sufficient alone.
 
 1. **Claude Code hooks** are the primary signal. The plugin registers `SessionStart`, `UserPromptSubmit`,
    `Notification`, `Stop` and `SessionEnd` in `~/.claude/settings.json`; each writes one line to
-   `~/.claude/rider-plugin/status/{sessionId}.json` at the moment the state changes. `SubagentStop` is deliberately not
+   `~/.claude/intellij-claude-terminal/status/{sessionId}.json` at the moment the state changes. `SubagentStop` is deliberately not
    subscribed — a subagent finishing is not the turn finishing.
 2. **Claude Code's own session file** (`~/.claude/sessions/{pid}.json`) carries a `status` field
    (`busy` / `shell` / `idle` / `waiting`). It's read alongside the hooks and covers what hooks structurally can't:
@@ -118,7 +118,7 @@ token usage for the same work.
 
 ## Config
 
-Optional. `~/.claude/rider-plugin/config.json`:
+Optional. `~/.claude/intellij-claude-terminal/config.json`:
 
 ```json
 {
@@ -135,7 +135,7 @@ Optional. `~/.claude/rider-plugin/config.json`:
 ```
 
 `mode` is `tab` (default, a visible terminal tab) or `background` (no tab; output goes to
-`~/.claude/rider-plugin/remote-control-<project>.log` and the server is stopped when the project closes).
+`~/.claude/intellij-claude-terminal/remote-control-<project>.log` and the server is stopped when the project closes).
 `spawnMode` is `same-dir` (default), `worktree`, or `session`; `extraArgs` is appended to the `claude remote-control`
 command verbatim. `claudePath` overrides where the executable is looked for in background mode. Restart the IDE after
 editing.
@@ -149,7 +149,7 @@ editing.
 
 ## Files it writes
 
-All under `~/.claude/rider-plugin/`:
+All under `~/.claude/intellij-claude-terminal/`:
 
 ```
 rename-tab.sh, session-start-hook.sh   # shell integration
@@ -165,14 +165,19 @@ config.json                            # user overrides
 settings.json.bak                      # one-shot copy of settings.json before first edit
 ```
 
-It also edits `~/.claude/settings.json` (hooks + Bash permissions) and appends a marked section to
-`~/.claude/CLAUDE.md`. Both edits are idempotent and reversible; the settings file is parsed and rewritten as JSON, and
-is left untouched if it can't be parsed.
+It also edits `~/.claude/settings.json` (hooks + Bash permissions). The edit is idempotent and reversible; the file is
+parsed and rewritten as JSON, and left untouched if it can't be parsed. Hooks left by an older version under a
+different script directory are removed rather than accumulated — a hook whose script has moved makes Claude run a
+missing path on every event.
+
+Earlier versions also appended a section to `~/.claude/CLAUDE.md` telling Claude how to name a tab. That is gone: names
+come from the conversation now and need no instruction, and the section is deleted on start if an older install left
+one behind. An instruction there is read on every turn of every session on the machine, so a stale one is not free.
 
 ## Running the tests
 
 ```bash
-./gradlew test        # Unit + storage + status + settings patcher (459 tests, <10s)
+./gradlew test        # Unit + storage + status + settings patcher (476 tests, <10s)
 ./gradlew verifyPlugin # IntelliJ Plugin Verifier against IntelliJ IDEA 2026.1.3
 ./gradlew uiTest      # UI tests via Remote Robot (optional, needs a sandbox IDE)
 ```
@@ -195,6 +200,11 @@ Plugins page → Uninstall → restart. All deployed files are removed.
 
 Licensed under the [Mozilla Public License 2.0](LICENSE). Free for personal and commercial use. You can modify, distribute, and bundle it; changes to MPL-covered files must remain under MPL-2.0 and be made available, but proprietary code that *uses* the plugin is unaffected.
 
+## Credits
+
+A fork of [RiderClaudeTabs](https://github.com/Ragnaraven/RiderClaudeTabs) by Ragnaraven, rebuilt for IntelliJ 2026.1's
+reworked terminal and extended since. Same MPL-2.0 licence as the original.
+
 ## Issues / PRs
 
-[github.com/Ragnaraven/RiderClaudeTabs](https://github.com/Ragnaraven/RiderClaudeTabs)
+[github.com/ckdgus08/IntellijClaudeTerminal](https://github.com/ckdgus08/IntellijClaudeTerminal)

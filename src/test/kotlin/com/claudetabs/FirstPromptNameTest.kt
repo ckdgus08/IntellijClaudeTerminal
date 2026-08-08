@@ -39,9 +39,9 @@ class FirstPromptNameTest {
     @Test fun usesTheFirstThingThePersonTyped() {
         val lines = sequenceOf(
             """{"type":"mode","mode":"normal","sessionId":"abc"}""",
-            userLine("빌드 다시 해줘"),
+            userLine("rebuild it"),
         )
-        assertEquals("빌드 다시 해줘", ClaudeTabsHelpers.firstPromptName(lines))
+        assertEquals("rebuild it", ClaudeTabsHelpers.firstPromptName(lines))
     }
 
     @Test fun skipsAssistantAndToolTurns() {
@@ -70,17 +70,17 @@ class FirstPromptNameTest {
      * boilerplate.
      */
     @Test fun slicesPastInjectedContext() {
-        val content = "<system-reminder>\nThe session's working directory has changed.\n</system-reminder>\n로그 확인해줘"
-        assertEquals("로그 확인해줘", ClaudeTabsHelpers.firstPromptName(listOf(userLine(content)).asSequence()))
+        val content = "<system-reminder>\nThe session's working directory has changed.\n</system-reminder>\ncheck the log"
+        assertEquals("check the log", ClaudeTabsHelpers.firstPromptName(listOf(userLine(content)).asSequence()))
     }
 
     @Test fun skipsSlashCommandEchoes() {
         val lines = sequenceOf(
             userLine("<command-name>/cd</command-name>\n<command-args>RiderClaudeTabs</command-args>"),
             userLine("<local-command-stdout>Moved to /Users/x</local-command-stdout>"),
-            userLine("현재 버전에서 호환되게 수정해줘"),
+            userLine("fix compatibility"),
         )
-        assertEquals("현재 버전에서 호환되게 수정해줘", ClaudeTabsHelpers.firstPromptName(lines))
+        assertEquals("fix compatibility", ClaudeTabsHelpers.firstPromptName(lines))
     }
 
     @Test fun skipsTheLocalCommandCaveatBanner() {
@@ -115,6 +115,9 @@ class FirstPromptNameTest {
     /**
      * Korean and Japanese run without spaces. Insisting on a word boundary would cut the
      * whole thing away and leave an ellipsis.
+     *
+     * The fixture has to stay in a language that writes this way — an English one would
+     * have spaces and would exercise the other branch, leaving this path untested.
      */
     @Test fun truncatesUnspacedTextWithoutLosingIt() {
         val long = "인텔리제이플러그인의터미널탭상태표시기능을전부다시구현해주세요그리고테스트도"
@@ -132,9 +135,9 @@ class FirstPromptNameTest {
     @Test fun neverNamesATabAfterAPastedCredential() {
         val lines = sequenceOf(
             userLine("ghp_EXAMPLEONLYnotarealtoken0123456789"),
-            userLine("이 토큰으로 레포 만들어줘"),
+            userLine("create a repo"),
         )
-        assertEquals("이 토큰으로 레포 만들어줘", ClaudeTabsHelpers.firstPromptName(lines))
+        assertEquals("create a repo", ClaudeTabsHelpers.firstPromptName(lines))
     }
 
     @Test fun recognisesTheCommonTokenShapes() {
@@ -158,7 +161,7 @@ class FirstPromptNameTest {
             "fix the login flow",
             "https://github.com/acme-org/example-service/pull/1234/files",
             "/Users/x/projects/example-service/src/main/kotlin/Application.kt",
-            "이 스크립트가 왜 실패하는지 확인해줘",
+            "why does this fail",
             "skip the cache",
         )) {
             assertFalse("should be allowed: $ok", ClaudeTabsHelpers.looksLikeSecret(ok))

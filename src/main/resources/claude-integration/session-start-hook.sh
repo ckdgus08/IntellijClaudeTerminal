@@ -16,8 +16,8 @@
 #   cross-wire when multiple instances called /tab simultaneously.
 #
 # Files written:
-#   ~/.claude/rider-plugin/session-map/{TERM_SESSION_ID} → session_id
-#   ~/.claude/rider-plugin/session-queue/{timestamp}    → session_id
+#   ~/.claude/intellij-claude-terminal/session-map/{TERM_SESSION_ID} → session_id
+#   ~/.claude/intellij-claude-terminal/session-queue/{timestamp}    → session_id
 #     (legacy queue kept for back-compat with older rename-tab.sh versions)
 # ─────────────────────────────────────────────────────────────────────
 
@@ -25,7 +25,7 @@ INPUT=$(cat)
 SID=$(echo "$INPUT" | sed -n 's/.*"session_id":"\([^"]*\)".*/\1/p')
 
 if [ -n "$SID" ]; then
-  MAP_DIR="$HOME/.claude/rider-plugin/session-map"
+  MAP_DIR="$HOME/.claude/intellij-claude-terminal/session-map"
   mkdir -p "$MAP_DIR"
 
   # Primary: per-tab mapping — race-condition free
@@ -36,7 +36,7 @@ if [ -n "$SID" ]; then
 
   # Legacy queue — kept so older rename-tab.sh versions keep working
   # across a plugin upgrade. New code paths should prefer the map above.
-  QUEUE_DIR="$HOME/.claude/rider-plugin/session-queue"
+  QUEUE_DIR="$HOME/.claude/intellij-claude-terminal/session-queue"
   mkdir -p "$QUEUE_DIR"
   TIMESTAMP=$(date +%s%N 2>/dev/null || date +%s)
   echo "$SID" > "$QUEUE_DIR/$TIMESTAMP"
