@@ -27,8 +27,10 @@ terminal tab strip you already use.
 
 - Saves your tabs when the IDE closes and restores them on reopen — each restored tab runs `claude --resume` for its
   session.
-- Names terminal tabs via a slash command or auto-naming so you can tell sessions apart.
-- Keeps a history of past sessions you can resume later.
+- **Names tabs from Claude's own summary of the conversation** — read straight out of
+  `~/.claude/sessions/<pid>.json`, so it costs the conversation nothing. Right-click → Rename Session to set one by
+  hand; a title you type there is never overwritten.
+- Keeps a history of past sessions, so a closed one can still be resumed with `claude --resume`.
 
 ## Install
 
@@ -40,7 +42,7 @@ Or build it yourself and use **Settings → Plugins → ⚙ → Install Plugin f
 ./gradlew buildPlugin      # → build/distributions/rider-claude-tabs-<version>.zip
 ```
 
-Everything else (scripts, hooks, commands, CLAUDE.md section, permissions) is set up on first start.
+Everything else (scripts, hooks, CLAUDE.md section, permissions) is set up on first start.
 
 ## How the status is detected
 
@@ -63,17 +65,6 @@ on, so any number of tabs stay independent.
 
 The status glyph is written to the live tab title only, and stripped everywhere a title is read back — `names.json`, the
 restore files and history all keep bare names, so a restored tab never comes back called `● backend`.
-
-## Slash commands
-
-| Command | What it does |
-|---|---|
-| `/tab [name]` | Renames this tab and snapshots it to history. If no name is given, Claude picks one (3–5 words) based on the current conversation. |
-| `/tabs-status` | Shows every active Claude session grouped by project, with session IDs. |
-| `/tabs-backup` | Writes currently-active sessions into history so you can resume them later, without waiting for the tab to close. |
-| `/tabs-history` | Numbered list of past closed/backed-up sessions (newest first). Pick one to resume. |
-| `/tabs-restore` | Shows what's in the auto-restore file (the set of tabs that will come back next Rider start). |
-| `/tabs-clear` | Clears the rename cache and per-project restore files. Doesn't touch history. |
 
 ## Remote Control
 
@@ -122,8 +113,8 @@ command verbatim. Restart the IDE after editing.
 
 - Rider / IntelliJ 2026.1+ (build 261; verified against IntelliJ IDEA 2026.1.3, IU-261.25134.95)
 - macOS and Windows are exercised; Linux should work but is less tested.
-- Requires Claude Code CLI (provides the `node` runtime the plugin's scripts use). The status indicator needs a CLI
-  recent enough to write `~/.claude/sessions/{pid}.json` — 2.1.x does; on older builds the hooks alone still drive it.
+- Requires Claude Code CLI. The status indicator and the automatic tab naming both read
+  `~/.claude/sessions/{pid}.json`, which 2.1.x writes; on older builds the hooks alone still drive the status.
 
 ## Files it writes
 
@@ -150,7 +141,7 @@ is left untouched if it can't be parsed.
 ## Running the tests
 
 ```bash
-./gradlew test        # Unit + storage + status + slash-command scripts (353 tests, <10s)
+./gradlew test        # Unit + storage + status + settings patcher (394 tests, <10s)
 ./gradlew verifyPlugin # IntelliJ Plugin Verifier against IntelliJ IDEA 2026.1.3
 ./gradlew uiTest      # UI tests via Remote Robot (optional, needs a sandbox IDE)
 ```

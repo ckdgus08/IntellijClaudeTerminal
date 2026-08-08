@@ -81,6 +81,11 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
          *  the bundled Node helpers used by /tab and /tabs-backup. */
         private val PERMISSION_ENTRIES = listOf(
             "Bash(bash ~/.claude/rider-plugin/rename-tab.sh *)",
+        )
+
+        /** Permissions earlier versions added for slash commands that no longer exist. Removed
+         *  from `settings.json` on start so an old install doesn't keep granting them. */
+        private val RETIRED_PERMISSION_ENTRIES = listOf(
             "Bash(bash ~/.claude/rider-plugin/tab.sh *)",
             "Bash(node ~/.claude/rider-plugin/tab-backup.js *)",
             "Bash(node ~/.claude/rider-plugin/backup-active.js)",
@@ -234,7 +239,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             val settings = File(CLAUDE_HOME, "settings.json")
             if (settings.exists()) {
                 try {
-                    ClaudeSettingsPatcher.unpatch(settings.readText(), PERMISSION_ENTRIES)
+                    ClaudeSettingsPatcher.unpatch(settings.readText(), PERMISSION_ENTRIES + RETIRED_PERMISSION_ENTRIES)
                         ?.let { settings.writeText(it) }
                 } catch (e: Exception) {
                     LOG.warn("[ClaudeTabs] settings.json cleanup skipped: ${e.message}")
@@ -243,17 +248,44 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
 
             // 3. Remove deployed scripts and data
             File(CLAUDE_HOME, "rider-plugin").deleteRecursively()
-            File(CLAUDE_HOME, "commands/tab.md").delete()
-            File(CLAUDE_HOME, "commands/tabs-clear.md").delete()
-            File(CLAUDE_HOME, "commands/tabs-restore.md").delete()
-            File(CLAUDE_HOME, "commands/tabs-history.md").delete()
-            File(CLAUDE_HOME, "commands/tabs-backup.md").delete()
-            File(CLAUDE_HOME, "commands/tabs-status.md").delete()
-            // Legacy command filenames (pre-rename)
-            File(CLAUDE_HOME, "commands/clear-tabs.md").delete()
-            File(CLAUDE_HOME, "commands/restore-tabs.md").delete()
-            File(CLAUDE_HOME, "commands/tab-history.md").delete()
-            File(CLAUDE_HOME, "commands/backup-tabs.md").delete()
+            removeRetiredSlashCommands()
+        }
+
+        /**
+         * Delete the slash commands this plugin used to install.
+         *
+         * They were `/tab`, `/tabs-status`, `/tabs-backup`, `/tabs-history`, `/tabs-restore`
+         * and `/tabs-clear`, and every one of them has been overtaken:
+         *
+         *  - naming is automatic now (the tab takes Claude's own session name), and the IDE's
+         *    own right-click → Rename Session covers the deliberate case — the plugin
+         *    respects a title typed there and never overwrites it
+         *  - `/tabs-history` and `/tabs-status` duplicated Claude's own `/resume` and
+         *    `claude agents`, and did it with less information: they would happily offer to
+         *    resume a session that was still running
+         *  - the rest only existed to poke the plugin's own state files
+         *
+         * Run on every start, not just on uninstall: an install that predates this leaves
+         * the files behind, and a stale command that half-works is worse than none.
+         */
+        private fun removeRetiredSlashCommands() {
+            val names = listOf(
+                "tab.md", "tabs-clear.md", "tabs-restore.md", "tabs-history.md",
+                "tabs-backup.md", "tabs-status.md",
+                // Pre-rename filenames, still out there on old installs.
+                "clear-tabs.md", "restore-tabs.md", "tab-history.md", "backup-tabs.md",
+            )
+            var removed = 0
+            for (n in names) {
+                val f = File(CLAUDE_HOME, "commands/$n")
+                if (f.exists() && runCatching { f.delete() }.getOrDefault(false)) removed++
+            }
+            // The Node helpers only ever existed to back those commands.
+            for (n in listOf("tab.sh", "tab-backup.js", "backup-active.js", "current-project.js")) {
+                val f = File(CLAUDE_HOME, "rider-plugin/$n")
+                if (f.exists() && runCatching { f.delete() }.getOrDefault(false)) removed++
+            }
+            if (removed > 0) LOG.info("[ClaudeTabs] Removed $removed retired slash-command file(s) — tab naming is automatic now; use right-click → Rename Session to set one by hand")
         }
     }
 
@@ -613,6 +645,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         }
         LOG.info("[ClaudeTabs] ════════════════════════════════════════════════════════")
         TABS_DIR.mkdirs()
+        resolveLocalizedDefaultTerminalName()
         maybeWriteConfigTemplate()
         loadConfig()
         deployClaudeIntegration()
@@ -1023,6 +1056,28 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         } catch (e: Exception) {
             LOG.debug("[ClaudeTabs][status] contentForWidget failed: ${e.message}")
             null
+        }
+    }
+
+    /**
+     * Ask the terminal plugin what it calls a default tab in this IDE's language.
+     *
+     * The generic-name list was English only, so on a Korean IDE the default tab (로컬) read
+     * as a deliberately chosen name — which made the plugin treat an untouched terminal as
+     * meaningful everywhere that predicate is used. Reading the same bundle key the terminal
+     * itself uses keeps this correct in any language, rather than growing a list.
+     */
+    private fun resolveLocalizedDefaultTerminalName() {
+        try {
+            val bundle = Class.forName("org.jetbrains.plugins.terminal.TerminalBundle")
+            val message = bundle.getMethod("message", String::class.java, Array<Any>::class.java)
+            val name = message.invoke(null, "local.terminal.default.name", arrayOf<Any>()) as? String
+            if (!name.isNullOrBlank()) {
+                ClaudeTabsHelpers.localizedDefaultNames = setOf(name.trim())
+                LOG.info("[ClaudeTabs] Localised default terminal name: '" + name.trim() + "' — untouched tabs with this name now count as generic")
+            }
+        } catch (e: Throwable) {
+            LOG.debug("[ClaudeTabs] Could not resolve the localised default terminal name (${e.javaClass.simpleName}) — falling back to the bundled list")
         }
     }
 
@@ -2655,17 +2710,58 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             //     as `skipAlreadyHave`. That's now fixed in `canonicalSessionIdFor` (always
             //     re-check Strategy 1 transcript-on-disk BEFORE consulting cache).
             //
-            // Name resolution: prefer names.json (durable), then last-applied (in-memory cache),
-            // then this tab's current title, then "Claude". Skip AI overlay titles like the
-            // scanner does — those are AI Assistant's status churn, not real names.
+            // Name resolution, in order of how much someone meant it:
+            //
+            //  1. A name typed via `/tab` — an explicit choice, so nothing outranks it.
+            //  2. Claude's own name for the session, when it is a summary of the
+            //     conversation rather than something derived from the directory. Free to
+            //     read and needs no cooperation from the conversation itself.
+            //  3. The pre-existing chain: names.json (any origin), the in-memory
+            //     last-applied cache, the live title, the previous save.
+            //
+            // AI overlay titles are skipped the way the scanner skips them — that is the AI
+            // Assistant's status churn, not a name.
+            val userChosen = try {
+                storage.loadNames()[sessionId]?.takeIf { it.setBy == "user" }?.name
+                    ?: storage.loadNames()[rawSessionId]?.takeIf { it.setBy == "user" }?.name
+            } catch (_: Exception) { null }
+            val claudesOwnName = ClaudeTabsHelpers.meaningfulSessionName(
+                extractJsonString(st, "name"),
+                extractJsonString(st, "nameSource"),
+            )
             val nameFromStore = storage.nameFor(sessionId) ?: storage.nameFor(rawSessionId)
             val tabTitle = tab.tabName
-            val title = nameFromStore
+            val title = userChosen
+                ?: claudesOwnName
+                ?: nameFromStore
                 ?: lastAppliedName[sessionId]
                 ?: lastAppliedName[rawSessionId]
                 ?: tabTitle?.takeUnless { ClaudeTabsHelpers.isAiOverlayName(it, project.name) }
                 ?: c.previousActive[sessionId]?.tabName
                 ?: "Claude"
+            // Put Claude's name on the tab, not just in the saved state.
+            //
+            // Applied when the tab is still showing something generic, or when it is showing
+            // a name we put there ourselves — the second case is what lets the label follow
+            // the conversation as Claude re-summarises it. A title someone typed in the tab
+            // strip is never one of those, so it is never overwritten.
+            if (claudesOwnName != null && userChosen == null) {
+                val currentTitle = tab.tabName
+                val oursAlready = lastAppliedName[sessionId] == currentTitle || lastAppliedName[rawSessionId] == currentTitle
+                val shouldApply = currentTitle != claudesOwnName && (
+                    currentTitle.isBlank() ||
+                        ClaudeTabsHelpers.isGenericTabName(currentTitle) ||
+                        ClaudeTabsHelpers.isAiOverlayName(currentTitle, project.name) ||
+                        oursAlready
+                    )
+                if (shouldApply) {
+                    LOG.info("[ClaudeTabs] Naming tab from Claude's own session name: '$currentTitle' → '$claudesOwnName' (sid=${sessionId.take(8)})")
+                    renameTab(project, tab, claudesOwnName, sessionId = sessionId)
+                    lastAppliedName[sessionId] = claudesOwnName
+                    lastAppliedName[rawSessionId] = claudesOwnName
+                    renamedSessions.add(sessionId)
+                }
+            }
 
             // Same resolution the status loop needs when it repaints between polls. Kept
             // bare — the glyph is added at write time, never stored.
@@ -4251,46 +4347,25 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
     private fun deployClaudeIntegration() {
         try {
             deployResource("claude-integration/rename-tab.sh", File(CLAUDE_HOME, "rider-plugin/rename-tab.sh"))
-            deployResource("claude-integration/tab.sh", File(CLAUDE_HOME, "rider-plugin/tab.sh"))
             deployResource("claude-integration/session-start-hook.sh", File(CLAUDE_HOME, "rider-plugin/session-start-hook.sh"))
             deployResource("claude-integration/status-hook.sh", File(CLAUDE_HOME, "rider-plugin/status-hook.sh"))
             statusStore.statusDir.mkdirs()
-            // Bundled Node helpers — slash commands invoke these as one-liners so the script body
-            // doesn't dump into the user's terminal on every /tab or /tabs-backup.
-            deployResource("claude-integration/tab-backup.js", File(CLAUDE_HOME, "rider-plugin/tab-backup.js"))
-            deployResource("claude-integration/backup-active.js", File(CLAUDE_HOME, "rider-plugin/backup-active.js"))
-            deployResource("claude-integration/current-project.js", File(CLAUDE_HOME, "rider-plugin/current-project.js"))
-            File(CLAUDE_HOME, "commands").mkdirs()
-            deployResource("claude-integration/tab.md", File(CLAUDE_HOME, "commands/tab.md"))
-            deployResource("claude-integration/tabs-clear.md", File(CLAUDE_HOME, "commands/tabs-clear.md"))
-            deployResource("claude-integration/tabs-restore.md", File(CLAUDE_HOME, "commands/tabs-restore.md"))
-            deployResource("claude-integration/tabs-history.md", File(CLAUDE_HOME, "commands/tabs-history.md"))
-            deployResource("claude-integration/tabs-backup.md", File(CLAUDE_HOME, "commands/tabs-backup.md"))
-            deployResource("claude-integration/tabs-status.md", File(CLAUDE_HOME, "commands/tabs-status.md"))
-            // Cleanup old command filenames (pre-rename)
-            File(CLAUDE_HOME, "commands/clear-tabs.md").delete()
-            File(CLAUDE_HOME, "commands/restore-tabs.md").delete()
-            File(CLAUDE_HOME, "commands/tab-history.md").delete()
-            File(CLAUDE_HOME, "commands/backup-tabs.md").delete()
+            removeRetiredSlashCommands()
 
             val claudeMd = File(CLAUDE_HOME, "CLAUDE.md")
             val existing = if (claudeMd.exists()) claudeMd.readText() else ""
             val claudeMdBlock = """
 $CLAUDE_MD_MARKER
 ## Terminal Tab Naming (Rider Plugin)
-At the **start of every conversation**, rename your Rider terminal tab by running:
+**You do not need to name the tab.** The plugin reads the session name Claude already maintains and puts it on the tab by itself. Do not run `rename-tab.sh` at the start of a conversation.
+
+Rename it only when the user actually asks — via `/tab`, or by saying "name it X", "call this X", "name this X tab":
 ```bash
-bash ~/.claude/rider-plugin/rename-tab.sh "Short Topic Name"
+bash ~/.claude/rider-plugin/rename-tab.sh "Their Exact Words"
 ```
+Use their **exact words**. "name this left tab" means the name IS "left tab" — never reinterpret it as a description. A name set this way outranks everything and is not overwritten.
 
-**Naming priority:**
-1. If the user provides a name — in their first message, via `/tab`, or by saying "name it X", "call this X", "name this X tab" — use their **exact words** as the tab name. "name this left tab" means the name IS "left tab". Never reinterpret the user's words as a description; take them literally as the desired name.
-2. Otherwise, pick a concise name (3-5 words) that describes the conversation's purpose.
-3. Update it if the topic shifts significantly.
-
-This applies to **new chats, resumed chats** (`--resume`), **and `/resume`**. On resume, re-use the previous tab name if the topic hasn't changed.
-
-**Tab status:** the plugin also prefixes each terminal tab with a live status glyph — `●` working, `⚠` waiting for input or a permission prompt, `✓` finished, `○` idle, `✕` exited. That prefix is applied to the tab title only and is **not** part of the tab's name: never include it when you pass a name to `rename-tab.sh`, and ignore it when reading a tab name back.
+**Tab status:** the plugin prefixes each terminal tab with a live status glyph — `●` working, `⚠` waiting for input or a permission prompt, `✓` finished, `○` idle, `✕` exited. That prefix is applied to the tab title only and is **not** part of the tab's name: never include it when you pass a name to `rename-tab.sh`, and ignore it when reading a tab name back.
 
 **Scope note:** This plugin manages **terminal-launched Claude CLI sessions only**. Sessions started in the JetBrains AI Assistant chat tool window (the "AI Agents" panel: Junie / Claude Agent / Codex) are managed by JetBrains and are not auto-restored across Rider restarts by this plugin.
 $CLAUDE_MD_MARKER
@@ -4328,7 +4403,7 @@ $CLAUDE_MD_MARKER
         val sf = File(CLAUDE_HOME, "settings.json")
         try {
             val before = if (sf.exists()) sf.readText() else null
-            val after = ClaudeSettingsPatcher.patch(before, PERMISSION_ENTRIES)
+            val after = ClaudeSettingsPatcher.patch(before, PERMISSION_ENTRIES, RETIRED_PERMISSION_ENTRIES)
             if (after == null) {
                 if (before != null && !before.isBlank()) {
                     try {
