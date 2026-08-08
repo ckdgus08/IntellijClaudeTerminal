@@ -281,6 +281,101 @@ internal object ClaudeTabsHelpers {
     }
 
     // ══════════════════════════════════════════════════════════════
+    // THE IDE'S OWN DEFAULT TERMINAL
+    // ══════════════════════════════════════════════════════════════
+
+    /**
+     * Whether a tab is the empty terminal the IDE opens for itself, safe to close after a
+     * restore has put the real ones back.
+     *
+     * When the terminal tool window is active at startup the IDE creates a default tab —
+     * observed 68ms after the plugin starts and three seconds before restore fires. Restore
+     * then adds the saved sessions on top, so reopening the IDE leaves one more terminal
+     * than there were when it closed.
+     *
+     * Closing someone's terminal is not something to do on a guess, so every one of these
+     * has to hold:
+     *
+     *  - [restoredAny] — a restore actually happened. With nothing restored, a lone empty
+     *    terminal is just the terminal, and closing it would leave an empty tool window.
+     *  - [isGenericName] — still called "Local" / "로컬" / "bash". A renamed tab is one
+     *    someone cared about.
+     *  - [hasClaude] is false — nothing of ours is running in it.
+     *  - [childProcessCount] is zero — the shell is idle. Anything running (a build, an ssh
+     *    session, a paused editor) means it is in use, whatever it is called.
+     *  - [isPluginSpawned] is false — never close our own restored tabs.
+     *
+     * The child-process check is why this is safe rather than merely likely: an untouched
+     * default terminal has a shell and nothing else.
+     */
+    fun isDisposableDefaultTerminal(
+        restoredAny: Boolean,
+        isGenericName: Boolean,
+        hasClaude: Boolean,
+        childProcessCount: Int,
+        isPluginSpawned: Boolean,
+    ): Boolean = restoredAny && isGenericName && !hasClaude && childProcessCount == 0 && !isPluginSpawned
+
+    // ══════════════════════════════════════════════════════════════
+    // RESTORE TIMING
+    // ══════════════════════════════════════════════════════════════
+
+    /**
+     * Whether the restore spawn should fire yet.
+     *
+     * Restore has to wait for the IDE to finish putting back the tabs it remembered from
+     * `workspace.xml`, so the empty leftovers can be closed before fresh ones are spawned.
+     * That used to be a flat five-second sleep, chosen as "plenty". It is: the tabs are
+     * usually in place in well under a second, and the rest is dead time the user watches —
+     * five of the nine seconds between the plugin starting and the first tab appearing.
+     *
+     * So wait for the tool window to stop changing instead of for the clock: fire once the
+     * terminal content count has held steady for [quietMs], and fire regardless once
+     * [ceilingMs] has passed so a tool window that never settles can't block restore forever.
+     *
+     * [lastChangeMs] is how long ago the content count last changed.
+     */
+    fun shouldFireRestore(
+        ageMs: Long,
+        lastChangeMs: Long,
+        quietMs: Long = 800,
+        ceilingMs: Long = 5_000,
+    ): Boolean {
+        if (ageMs >= ceilingMs) return true
+        return lastChangeMs >= quietMs
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // RESTORE ELIGIBILITY
+    // ══════════════════════════════════════════════════════════════
+
+    /**
+     * A session observed running right now: the id its process reports, and the canonical
+     * (transcript-backed) id it resolves to. After `claude --resume` these differ.
+     */
+    data class LiveSession(val rawSessionId: String, val canonicalSessionId: String)
+
+    /**
+     * True if [sessionId] should be spawned into a fresh terminal tab.
+     *
+     * The one rule that was missing: **a session that is already running must never be
+     * restored.** Restoring means `claude --resume <id>` in a new tab, so doing it to a live
+     * session produces a second process attached to the same conversation — the original tab
+     * stays open and a duplicate appears beside it.
+     *
+     * This is not hypothetical. Installing the plugin reloads the project without killing
+     * anything, so the restore file written seconds earlier still lists every session, and
+     * every one of them is still alive in the tab it has always been in. The result was N
+     * duplicate tabs on install, each resuming a conversation that was already open.
+     *
+     * Matching is on both ids because the restore file stores canonical ids while a live
+     * resumed process reports a rotated one; comparing only one side would miss the very
+     * case that produces duplicates.
+     */
+    fun shouldRestoreSession(sessionId: String, liveSessions: Collection<LiveSession>): Boolean =
+        liveSessions.none { it.rawSessionId == sessionId || it.canonicalSessionId == sessionId }
+
+    // ══════════════════════════════════════════════════════════════
     // SESSION KIND — which sessions can be a terminal tab at all
     // ══════════════════════════════════════════════════════════════
 

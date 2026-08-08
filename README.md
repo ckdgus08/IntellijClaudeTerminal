@@ -75,6 +75,27 @@ restore files and history all keep bare names, so a restored tab never comes bac
 | `/tabs-restore` | Shows what's in the auto-restore file (the set of tabs that will come back next Rider start). |
 | `/tabs-clear` | Clears the rename cache and per-project restore files. Doesn't touch history. |
 
+## Remote Control
+
+On IDE start the plugin opens one terminal tab per project running `claude remote-control`, so the sessions on this
+machine can be driven from [claude.ai/code](https://claude.ai/code) and the Claude mobile app with no setup.
+
+**This exposes control of local Claude sessions to your Claude account for as long as the IDE is open.** If that isn't
+what you want, turn it off:
+
+```json
+{ "remoteControl": { "enabled": false } }
+```
+
+It never starts a second server for a directory that already has one — including one you started by hand in another
+terminal. The Remote Control tab is deliberately not tracked as a chat session, so it is never saved for auto-restore.
+
+Don't want the tab? Set `"mode": "background"` and it runs with no tab at all. That trades away what the tab is for,
+though: the connection state, and the runtime `w` key that toggles worktree mode.
+
+Remote Control is a control plane: sessions still run locally under the same account and model, so it does not change
+token usage for the same work.
+
 ## Config
 
 Optional. `~/.claude/rider-plugin/config.json`:
@@ -82,11 +103,20 @@ Optional. `~/.claude/rider-plugin/config.json`:
 ```json
 {
   "historyMaxAgeDays": 90,
-  "snapshotKeepCount": 10
+  "snapshotKeepCount": 10,
+  "remoteControl": {
+    "enabled": true,
+    "mode": "tab",
+    "spawnMode": "same-dir",
+    "extraArgs": ""
+  }
 }
 ```
 
-Restart Rider after editing.
+`mode` is `tab` (default, a visible terminal tab) or `background` (no tab; output goes to
+`~/.claude/rider-plugin/remote-control-<project>.log` and the server is stopped when the project closes).
+`spawnMode` is `same-dir` (default), `worktree`, or `session`; `extraArgs` is appended to the `claude remote-control`
+command verbatim. Restart the IDE after editing.
 
 ## Compatibility
 
@@ -120,7 +150,7 @@ is left untouched if it can't be parsed.
 ## Running the tests
 
 ```bash
-./gradlew test        # Unit + storage + status + slash-command scripts (323 tests, <10s)
+./gradlew test        # Unit + storage + status + slash-command scripts (353 tests, <10s)
 ./gradlew verifyPlugin # IntelliJ Plugin Verifier against IntelliJ IDEA 2026.1.3
 ./gradlew uiTest      # UI tests via Remote Robot (optional, needs a sandbox IDE)
 ```
