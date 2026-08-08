@@ -129,6 +129,20 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         private var statusSnapshotAt = 0L
         private const val STATUS_SNAPSHOT_TTL_MS = 300L
 
+        /**
+         * How far into a transcript to look for the opening question. The first user turn is
+         * within the first few lines; the budget only exists so a transcript that somehow
+         * has none isn't read end to end.
+         */
+        private const val PROMPT_SCAN_LINES = 40
+
+        /**
+         * How far into a transcript to look for its `permission-mode` record. It sits in the
+         * first couple of lines on every transcript checked; the budget only bounds the read
+         * for one that somehow has none.
+         */
+        private const val PERMISSION_SCAN_LINES = 10
+
         private fun sharedStatusSnapshot(): Map<String, ClaudeStatusStore.Reading> =
             synchronized(statusSnapshotLock) {
                 val now = System.currentTimeMillis()
@@ -350,6 +364,24 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
      * write when nothing changed. Without it, every 400ms tick would repaint every tab.
      */
     private val appliedStatus = java.util.concurrent.ConcurrentHashMap<String, ClaudeStatus>()
+
+    /**
+     * When the plugin spawned a tab for a session, so a restored tab that hasn't started its
+     * `claude --resume` yet isn't painted as dead. See [ClaudeTabsHelpers.shouldPaintExited].
+     */
+    private val tabSpawnedAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    /** Sessions observed in any state other than exited — the other half of that check. */
+    private val sessionEverRunning = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    /**
+     * A transcript's opening question, and the file mtime it was read at. A null [name]
+     * records "nothing usable *yet*", which is why the mtime is kept — see [transcriptName].
+     */
+    private data class PromptName(val name: String?, val mtime: Long)
+
+    /** `sessionId → ` the label derived from the transcript's opening question, memoised. */
+    private val promptNameCache = java.util.concurrent.ConcurrentHashMap<String, PromptName>()
 
     /** A tab handle plus the project window that owns it. See [tabForSession]. */
     private data class TrackedTab(val tab: TabInfo, val projectHash: String)
@@ -951,6 +983,13 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             // A resumed session's hook files are keyed by the rotated id Claude reported at
             // hook time, while everything else here is keyed by the canonical one.
             val reading = readings[sid] ?: readings[rawIdFor(sid)] ?: continue
+            if (reading.status != ClaudeStatus.EXITED) {
+                sessionEverRunning.add(sid)
+            } else if (!ClaudeTabsHelpers.shouldPaintExited(tabSpawnedAt[sid], sid in sessionEverRunning, now)) {
+                // Restored tab whose Claude hasn't started yet — the EXITED it reads is the
+                // dead process from before the restart, not this one.
+                continue
+            }
             if (appliedStatus[sid] == reading.status) continue
             pending.add(Triple(sid, tracked.tab, reading.status))
         }
@@ -978,24 +1017,47 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
     }
 
     /**
-     * Write `<glyph> <name>` onto [tab]'s live title and `<name> — <label>` onto its
-     * tooltip. Returns false if no title surface could be reached, which the caller treats
-     * as "this tab is gone".
+     * The title to write for a tab in [status]: the bare name when the tab carries the
+     * status icon, glyph-prefixed when it doesn't.
+     *
+     * Both used to go on at once, and that turned out to be more than redundant. Writing
+     * `userDefinedTitle` does not stay on the frontend: the platform's own title listeners
+     * propagate it to `Content.displayName` *and* to the backend tab name, which is the one
+     * persisted into `workspace.xml`. So every status change wrote its glyph into saved
+     * state, and a stale one came back on the next start — observed as a backend tab
+     * literally named `⚠ 로컬` outliving the session it described.
+     *
+     * The glyph is now the fallback for the case that justified it in the first place: a tab
+     * whose `Content` the platform won't hand over, which can show no icon and would
+     * otherwise show no state at all.
+     */
+    private fun titleFor(baseName: String, status: ClaudeStatus?, content: Content?): String =
+        if (content != null) baseName else StatusDecoration.decorate(baseName, status)
+
+    /**
+     * Put [status] on [tab]: the icon when the tab can carry one, the glyph in the title
+     * when it can't, and the tooltip either way. Returns false if no surface could be
+     * reached, which the caller treats as "this tab is gone".
      *
      * Only the frontend surfaces are touched. The backend tab name (the one that persists
      * into `workspace.xml`) keeps the bare name written by [renameTab] — a glyph there would
      * outlive the session it describes and reappear, stale, on the next IDE start.
      */
     private fun applyStatusToTab(tab: TabInfo, baseName: String, status: ClaudeStatus, project: Project? = null): Boolean {
-        val display = StatusDecoration.decorate(baseName, status)
-        var applied = false
-
-        // Coloured tab icon. The glyph still goes on regardless: tabs this plugin spawned are
-        // reached through their widget and may have no Content to hang an icon on, and a tab
-        // without an icon still has to show its state.
         val content = tab.content ?: project?.let { contentForWidget(it, tab.widget) }
+        val display = titleFor(baseName, status, content)
+        var applied = false
         if (content != null) {
             try {
+                // Setting the icon is not enough to see one. A tool window hides its
+                // contents' icons unless the content opts in via ToolWindow.SHOW_CONTENT_ICON,
+                // so every icon written before this went somewhere real and rendered nowhere —
+                // which is why the glyph, not the icon, was doing all the work.
+                //
+                // Reflective because the key sits in intellij.platform.ide.core, which this
+                // plugin doesn't depend on; the icon is a nice-to-have and must not be able
+                // to take the status path down with it.
+                enableContentIcon(content)
                 content.icon = ClaudeStatusIcons.forStatus(status)
                 applied = true
             } catch (e: Exception) {
@@ -1036,6 +1098,35 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
      * looked up here and cached; the mapping only changes when tabs are created or closed.
      */
     private val contentForWidgetCache = java.util.concurrent.ConcurrentHashMap<TerminalWidget, Content>()
+
+    /** Contents already opted in to showing an icon — the key only needs setting once. */
+    private val iconEnabledContents = java.util.Collections.newSetFromMap(
+        java.util.WeakHashMap<Content, Boolean>()
+    )
+
+    /**
+     * Opt [content] in to having its icon drawn on the tool-window tab.
+     *
+     * `Content.setIcon` alone paints nothing: a tool window only renders its contents' icons
+     * when the content carries `ToolWindow.SHOW_CONTENT_ICON`. Without it the icon is stored
+     * and never shown, which is exactly what happened — the heartbeat could report that every
+     * tracked tab had a reachable `Content` while the tab strip showed no icons at all.
+     *
+     * Logged once per content, because "the platform refused the key" and "the icon is drawn
+     * but you don't like it" are otherwise indistinguishable from the outside.
+     */
+    private fun enableContentIcon(content: Content) {
+        if (!iconEnabledContents.add(content)) return
+        try {
+            val twCls = Class.forName("com.intellij.openapi.wm.ToolWindow")
+            @Suppress("UNCHECKED_CAST")
+            val key = twCls.getField("SHOW_CONTENT_ICON").get(null) as com.intellij.openapi.util.Key<Boolean>
+            content.putUserData(key, true)
+            LOG.info("[ClaudeTabs][status] Enabled tab icons for '${content.displayName}' via ToolWindow.SHOW_CONTENT_ICON")
+        } catch (e: Throwable) {
+            LOG.info("[ClaudeTabs][status] Could not enable tab icons (${e.javaClass.simpleName}: ${e.message}) — the glyph in the tab name stays the only indicator")
+        }
+    }
 
     private fun contentForWidget(project: Project, widget: TerminalWidget?): Content? {
         if (widget == null) return null
@@ -1110,8 +1201,15 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                 "${sid.take(8)}:$st(hook=$hook,claude=$claude)"
             }.ifBlank { "none" }
             val termMap = try { statusStore.termSessionMap().size } catch (_: Exception) { -1 }
+            // How many tracked tabs expose a `Content` for the icon to be written to. This
+            // is reachability only — it says the write lands somewhere real, NOT that the
+            // tab strip draws it. Named for what it measures: reading the old `icons=2/2` as
+            // "icons work" was wrong, and the icons were in fact invisible the whole time
+            // for want of ToolWindow.SHOW_CONTENT_ICON.
+            val withContent = mine.count { (_, t) -> (t.tab.content ?: contentForWidget(project, t.tab.widget)) != null }
             LOG.info(
-                "[ClaudeTabs][status] tabs=$tabCount tracked=${mine.size} readings=${readings.size} termMap=$termMap " +
+                "[ClaudeTabs][status] tabs=$tabCount tracked=${mine.size} iconTarget=$withContent/${mine.size} " +
+                    "readings=${readings.size} termMap=$termMap " +
                     "hookDir=${statusStore.statusDir.absolutePath} exists=${statusStore.statusDir.exists()} — $shown"
             )
             if (mine.isEmpty()) logTabIdentityProbe(project)
@@ -1169,6 +1267,92 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         }
     }
 
+    /**
+     * Hand a tab over from a session that `/clear` replaced to the one that replaced it.
+     *
+     * Without this the tab stays bound to the old id forever. The old id's last hook event
+     * is `SessionEnd`, which [StatusResolver] treats as terminal by design, so the tab sits
+     * at `✕` while the conversation in it is actively running — and it never picks up the
+     * new conversation's name either, because the name is derived per session id.
+     *
+     * Re-keying [spawnedWidgets] is the load-bearing part: it is what Strategy 0 of
+     * [attachStatusTabs] rebuilds `tabForSession` from, so leaving the old key there would
+     * re-attach the dead session on the very next pass.
+     *
+     * See [ClaudeStatusStore.supersededSessions] for how the two ids are linked.
+     */
+    private fun rebindSupersededSessions() {
+        val superseded = try { statusStore.supersededSessions() } catch (_: Exception) { return }
+        if (superseded.isEmpty()) return
+
+        for ((oldSid, newSid) in superseded) {
+            if (oldSid == newSid) continue
+
+            // Carry the permission mode across, before anything else — this is the only
+            // moment both sessions are linkable, and the successor's transcript records no
+            // mode of its own. Unconditional on whether a tab is being rebound: the value
+            // has to reach the restore file either way. See readPermissionMode.
+            if (!inheritedPermissionMode.containsKey(newSid) &&
+                transcriptPermissionMode(null, newSid) == null
+            ) {
+                transcriptPermissionMode(null, oldSid)?.let { mode ->
+                    inheritedPermissionMode[newSid] = mode
+                    LOG.info("[ClaudeTabs] ${newSid.take(8)} inherits permission mode '$mode' from ${oldSid.take(8)} — /clear writes none of its own")
+                }
+            }
+
+            val widget = spawnedWidgets.remove(oldSid)
+            val trackedTab = tabForSession.remove(oldSid)
+            if (widget == null && trackedTab == null) continue
+
+            if (widget != null) spawnedWidgets.putIfAbsent(newSid, widget)
+            if (trackedTab != null) tabForSession.putIfAbsent(newSid, trackedTab)
+
+            // A name the user typed belongs to the *tab*, not to the conversation that
+            // happened to be in it, so it follows the hand-over and keeps outranking
+            // everything. Without this, `/clear` would quietly overwrite it — the successor
+            // has no names.json entry of its own, so nothing would be left to protect.
+            carryUserChosenName(oldSid, newSid)
+
+            // The plugin's own last-applied name moves too, so the title now on the tab
+            // still counts as ours. That is what lets the new conversation's name replace
+            // it; dropping the entry instead would leave the tab advertising the cleared
+            // conversation forever, since a non-generic title we no longer recognise is
+            // treated as someone's deliberate choice.
+            lastAppliedName.remove(oldSid)?.let { lastAppliedName.putIfAbsent(newSid, it) }
+
+            // Everything else is per-conversation and must be re-derived.
+            appliedStatus.remove(oldSid)
+            baseNameForSession.remove(oldSid)
+            promptNameCache.remove(oldSid)
+            sessionEverRunning.remove(oldSid)
+            tabSpawnedAt.remove(oldSid)?.let { tabSpawnedAt.putIfAbsent(newSid, it) }
+
+            LOG.info("[ClaudeTabs][status] ${oldSid.take(8)} was replaced in place (/clear) — handing its tab to ${newSid.take(8)}")
+        }
+    }
+
+    /**
+     * Copy a `setBy=user` name from [oldSid] to [newSid], so a hand-over can't lose it.
+     *
+     * Both `/tab` and right-click → Rename Session land in `names.json` as `setBy=user`,
+     * and that entry is the single thing that makes a name un-overwritable. It is keyed by
+     * session id, so after `/clear` the successor starts with none — the protection would
+     * evaporate at exactly the moment the tab is about to be renamed.
+     */
+    private fun carryUserChosenName(oldSid: String, newSid: String) {
+        try {
+            val names = storage.loadNames()
+            if (names[newSid]?.setBy == "user") return
+            val chosen = names[oldSid]?.takeIf { it.setBy == "user" }?.name ?: return
+            storage.upsertName(newSid, chosen, "user")
+            lastAppliedName[newSid] = chosen
+            LOG.info("[ClaudeTabs] Carried the user's tab name '$chosen' across to ${newSid.take(8)}")
+        } catch (e: Exception) {
+            LOG.debug("[ClaudeTabs] carrying user name failed: ${e.message}")
+        }
+    }
+
     /** The rotated (pre-canonicalisation) id aliased to [canonicalSid], if one is known. */
     private fun rawIdFor(canonicalSid: String): String =
         sessionAliases.entries.firstOrNull { it.value == canonicalSid }?.key ?: canonicalSid
@@ -1194,6 +1378,8 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         project: Project,
         sessionsAlreadyTracked: Set<String>,
     ): Set<String> {
+        rebindSupersededSessions()
+
         val termMap = try { statusStore.termSessionMap() } catch (_: Exception) { emptyMap() }
 
         val attached = mutableSetOf<String>()
@@ -1932,7 +2118,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         // here is what lets the status loop repaint later without re-deriving it.
         if (sessionId != null) baseNameForSession[sessionId] = name
         val status = sessionId?.let { appliedStatus[it] }
-        val display = StatusDecoration.decorate(name, status)
+        val display = titleFor(name, status, tab.content ?: contentForWidget(project, tab.widget))
 
         // Redundancy short-circuit: skip the rename APIs only if both the backend name AND the
         // TerminalTitle's userDefinedTitle already match. The backend can be correct (restored
@@ -2088,9 +2274,12 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                             rateLimitedLogAt[sessionId] = now
                         }
                         try {
-                            // Re-apply with the status glyph so an overlay overwrite doesn't
-                            // silently drop the indicator until the next status transition.
-                            t.change { userDefinedTitle = StatusDecoration.decorate(desired, appliedStatus[sessionId]) }
+                            // Re-apply through the same rule the status loop uses, so an
+                            // overlay overwrite doesn't silently drop the indicator — and
+                            // doesn't reintroduce a glyph on a tab that shows an icon.
+                            val tabNow = tabForSession[sessionId]?.tab
+                            val contentNow = tabNow?.let { it.content ?: contentForWidget(project, it.widget) }
+                            t.change { userDefinedTitle = titleFor(desired, appliedStatus[sessionId], contentNow) }
                         } catch (e: Exception) {
                             LOG.debug("[ClaudeTabs] re-apply via change() failed: ${e.message}")
                         }
@@ -2716,7 +2905,11 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             //  2. Claude's own name for the session, when it is a summary of the
             //     conversation rather than something derived from the directory. Free to
             //     read and needs no cooperation from the conversation itself.
-            //  3. The pre-existing chain: names.json (any origin), the in-memory
+            //  3. The conversation's opening question, off the transcript. In practice this
+            //     is the one that fires: Claude only auto-names *background* sessions, so a
+            //     terminal session's own name stays directory-derived forever and step 2
+            //     never produces anything. See ClaudeTabsHelpers.meaningfulSessionName.
+            //  4. The pre-existing chain: names.json (any origin), the in-memory
             //     last-applied cache, the live title, the previous save.
             //
             // AI overlay titles are skipped the way the scanner skips them — that is the AI
@@ -2728,7 +2921,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             val claudesOwnName = ClaudeTabsHelpers.meaningfulSessionName(
                 extractJsonString(st, "name"),
                 extractJsonString(st, "nameSource"),
-            )
+            ) ?: transcriptName(cwd, sessionId)
             val nameFromStore = storage.nameFor(sessionId) ?: storage.nameFor(rawSessionId)
             val tabTitle = tab.tabName
             val title = userChosen
@@ -2808,6 +3001,9 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                 val staleTab = tabForSession.remove(sid)?.tab
                 val hadStatus = appliedStatus.remove(sid)
                 val base = baseNameForSession.remove(sid)
+                tabSpawnedAt.remove(sid)
+                sessionEverRunning.remove(sid)
+                promptNameCache.remove(sid)
                 // A tab whose Claude process ended but whose shell is still open keeps
                 // existing as a plain terminal. Take the glyph back off it — otherwise it
                 // sits there advertising a state that stopped being true, with nothing left
@@ -2959,6 +3155,8 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         if (c.pollCount % 12 == 0) {
             LOG.info("[ClaudeTabs] STEP 6b: SESSIONS_DIR scan — ${scan.statusLine()}")
         }
+
+        applyConversationNames(project, activeSessions)
 
         if (c.pollCount % 12 == 0) {
             if (claudeSessions.isNotEmpty()) LOG.info("[ClaudeTabs] STEP 6: Claude sessions found: $claudeSessions")
@@ -3444,8 +3642,17 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                     }
                 }
 
+                // The restore file is the plugin's own data, but it is plain JSON in the home
+                // directory and its session ids are typed into a live terminal by
+                // buildResumeCmd. Anything that isn't a plain id is dropped here rather than
+                // being allowed to become a command. See ClaudeTabsHelpers.isSafeSessionId.
+                val (safe, unsafe) = parsed.partition { ClaudeTabsHelpers.isSafeSessionId(it.sessionId) }
+                if (unsafe.isNotEmpty()) {
+                    LOG.warn("[ClaudeTabs] Refusing to restore ${unsafe.size} session(s) whose id is not a plain identifier — the id is typed into a terminal, so this is not restorable: ${unsafe.joinToString { "'" + it.sessionId.take(40) + "'" }}")
+                }
+
                 val c = ctx(project)
-                c.pendingRestores.addAll(parsed)
+                c.pendingRestores.addAll(safe)
                 c.pendingRestoresLoadedAt = System.currentTimeMillis()
                 val provenance = if (index == 0) "live restore file" else "snapshot (${source.name})"
                 LOG.info("[ClaudeTabs] ${c.pendingRestores.size} session(s) to restore from $provenance")
@@ -3650,6 +3857,9 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
      * Must be called on EDT (the call site hops via `withContext(Dispatchers.Main)` already).
      */
     private fun spawnNewTabAndRestore(project: Project, s: SavedSession): Boolean {
+        // Decided before a tab is created: a session whose id can't be typed safely has no
+        // restorable command, so opening a terminal for it would leave an empty tab.
+        val resumeCmd = buildResumeCmd(s) ?: return false
         return try {
             val mgr = TerminalToolWindowManager.getInstance(project)
             val tw = com.intellij.openapi.wm.ToolWindowManager.getInstance(project).getToolWindow("Terminal")
@@ -3690,6 +3900,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             // can't reliably find tabs we spawned this way (see [spawnedWidgets] docs), so
             // [handleRename] looks here first before falling back to [getAllTabs].
             spawnedWidgets[s.sessionId] = widget
+            tabSpawnedAt[s.sessionId] = System.currentTimeMillis()
             val pinUserTitle = !isGenericTabName(s.tabName)
             if (pinUserTitle) {
                 lastAppliedName[s.sessionId] = s.tabName
@@ -3705,7 +3916,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             // as long-lived tabs do via renameTab() — covers the case where we pinned the
             // user's name and the AI Assistant overlay tries to overwrite it later.
             try { installTitleListener(project, widget.terminalTitle, s.sessionId) } catch (_: Exception) { }
-            val cmd = buildResumeCmd(s)
+            val cmd = resumeCmd
             // sendCommandToExecute is the engine-agnostic API; safe on both classic and
             // reworked widgets. With defer=false the shell is started by now so the command
             // is typed into the live TTY rather than queued indefinitely.
@@ -3793,7 +4004,11 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
      * closes, so a hidden server can't outlive the window that started it.
      */
     private fun startRemoteControlHeadless(project: Project) {
-        val argv = RemoteControlLauncher.buildArgv(remoteControl, project.name)
+        val executable = resolveClaudeExecutable()
+        val argv = RemoteControlLauncher.buildArgv(remoteControl, project.name, executable = executable)
+        if (executable == null) {
+            LOG.info("[ClaudeTabs][rc] No `claude` executable found on PATH or at any known install location — falling back to a login+interactive shell. That works, but the shell's prompt framework may leave orphaned forks behind; set remoteControl.claudePath in config.json to avoid it.")
+        }
         val log = File(STATE_DIR, "remote-control-${projectHash(project)}.log")
         val lock = remoteControlLockFile(project)
         try {
@@ -3819,17 +4034,18 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             }
 
             Disposer.register(project as Disposable) {
-                // Kill the tree, not just the shell we hold. `$SHELL -l -i -c` means the
-                // server is a *child* of the process we started, so destroying only the
-                // parent leaves the real server reparented to launchd — observed as
-                // `ppid=1` remote-control shells surviving across IDE restarts, which then
-                // look to the duplicate check like a server that is already serving.
+                // Kill the tree, not just the process we hold. In the shell fallback the
+                // server is a *child* of what we started, so destroying only the parent
+                // leaves the real server reparented to launchd — observed as `ppid=1`
+                // remote-control shells surviving across IDE restarts, which then look to
+                // the duplicate check like a server that is already serving.
                 if (process.isAlive) {
                     val descendants = try { process.toHandle().descendants().toList() } catch (_: Exception) { emptyList() }
                     descendants.forEach { runCatching { it.destroy() } }
                     process.destroy()
                     LOG.info("[ClaudeTabs][rc] Stopped background Remote Control (pid ${process.pid()} + ${descendants.size} child process(es)) — project closed")
                 }
+                reapOrphanedRemoteControl(argv)
                 try { lock.delete() } catch (_: Exception) { }
             }
             LOG.info("[ClaudeTabs][rc] Started background Remote Control for '${project.name}' (pid ${process.pid()}), no tab. Output: ${log.absolutePath}. Set remoteControl.enabled=false in ~/.claude/rider-plugin/config.json to stop this.")
@@ -3881,6 +4097,55 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         val cause = (e as? java.lang.reflect.InvocationTargetException)?.targetException ?: e
         LOG.info("[ClaudeTabs][rc] pty unavailable (${cause.javaClass.simpleName}: ${cause.message}) — falling back to a plain pipe, which Remote Control may refuse")
         null
+    }
+
+    /**
+     * The `claude` executable to run Remote Control with, or null to fall back to a shell.
+     *
+     * Resolved once per start; the search is a handful of `File.canExecute()` calls.
+     */
+    private fun resolveClaudeExecutable(): String? {
+        val exeName = if (System.getProperty("os.name").orEmpty().startsWith("Windows", ignoreCase = true)) "claude.cmd" else "claude"
+        val candidates = RemoteControlLauncher.candidatePaths(
+            override = remoteControl.claudePath,
+            home = System.getProperty("user.home"),
+            pathEnv = System.getenv("PATH"),
+            exeName = exeName,
+        )
+        val found = RemoteControlLauncher.resolveExecutable(candidates) { path ->
+            try { File(path).let { it.isFile && it.canExecute() } } catch (_: Exception) { false }
+        }
+        if (found != null) LOG.info("[ClaudeTabs][rc] Using claude at $found — no shell needed")
+        return found
+    }
+
+    /**
+     * Kill processes carrying our exact [argv] that have been reparented to init.
+     *
+     * The shell fallback can leave these behind: an interactive shell sources the user's
+     * prompt framework, and powerlevel10k's `gitstatus` daemon double-forks — the fork keeps
+     * the shell's command line but is no longer in our process tree, so the descendant walk
+     * above never sees it. One IDE start leaked two of them.
+     *
+     * Matching is on the *whole* argv joined, not on "looks like remote control": the point
+     * is to reap what this project started, never a server the user is running by hand.
+     * A no-op once [resolveClaudeExecutable] finds the CLI, since then there is no shell.
+     */
+    private fun reapOrphanedRemoteControl(argv: List<String>) {
+        val signature = argv.joinToString(" ")
+        try {
+            val reaped = ProcessHandle.allProcesses()
+                .filter { it.isAlive }
+                .filter { it.parent().map { p -> p.pid() == 1L }.orElse(false) }
+                .filter { it.info().commandLine().orElse("") == signature }
+                .toList()
+            reaped.forEach { runCatching { it.destroy() } }
+            if (reaped.isNotEmpty()) {
+                LOG.info("[ClaudeTabs][rc] Reaped ${reaped.size} orphaned launcher process(es) (${reaped.joinToString { it.pid().toString() }}) left behind by the shell fallback")
+            }
+        } catch (e: Exception) {
+            LOG.debug("[ClaudeTabs][rc] orphan reap failed: ${e.message}")
+        }
     }
 
     /** `rc-<projectHash>.lock` — the pid of the background server this project started. */
@@ -4080,9 +4345,24 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
      * `auto`, which is the wrong default and a real security concern: it would silently
      * elevate a session's permission level across a restart.
      */
-    private fun buildResumeCmd(s: SavedSession): String = buildString {
-        append("claude --resume ${s.sessionId}")
-        if (s.bypassPermissions) append(" --dangerously-skip-permissions")
+    /**
+     * The command a restored tab runs. Returns null for a session id that must not be typed
+     * into a shell — this string goes to a live terminal, so the id is the one field here
+     * that becomes executable. Callers skip the tab rather than spawn it.
+     *
+     * The load path already filters these out; this is the second check, next to the
+     * interpolation itself, so a future caller that reaches here by another route cannot
+     * reintroduce the hole.
+     */
+    private fun buildResumeCmd(s: SavedSession): String? {
+        if (!ClaudeTabsHelpers.isSafeSessionId(s.sessionId)) {
+            LOG.warn("[ClaudeTabs] Refusing to build a resume command for session id '${s.sessionId.take(40)}' — not a plain identifier")
+            return null
+        }
+        return buildString {
+            append("claude --resume ${s.sessionId}")
+            if (s.bypassPermissions) append(" --dangerously-skip-permissions")
+        }
     }
 
     /**
@@ -4185,22 +4465,136 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         return canonical
     }
 
+    /**
+     * Name every tracked tab after its conversation, and carry that name into what gets saved.
+     *
+     * This exists separately from the naming block inside the tab walk because on IntelliJ
+     * 2026.1's reworked terminal that block never executes: the platform's tab enumeration
+     * returns nothing for tabs this plugin spawned, so the loop it lives in iterates an empty
+     * list. Measured on a real 1.0.37 start — `STEP 4: Total: 0` on every poll while two
+     * sessions were tracked and saved fine. [tabForSession] is the handle that does work
+     * here; it is the same one the status indicator paints through.
+     *
+     * Runs over [sessions] (which carry cwd, needed to find the transcript) and rewrites
+     * their names in place, so the restore file gets the conversation name too rather than
+     * the placeholder the scanner fell back to.
+     */
+    private fun applyConversationNames(project: Project, sessions: MutableList<SavedSession>) {
+        if (sessions.isEmpty()) return
+        val thisProjectHash = projectHash(project)
+        val names = try { storage.loadNames() } catch (_: Exception) { emptyMap() }
+
+        for (i in sessions.indices) {
+            val s = sessions[i]
+            val sid = s.sessionId
+            // A name someone typed is a decision, not a guess — never overwrite it, and never
+            // let the derived name replace it in the save either.
+            val userChosen = names[sid]?.takeIf { it.setBy == "user" }?.name
+                ?: names[rawIdFor(sid)]?.takeIf { it.setBy == "user" }?.name
+            if (userChosen != null) continue
+
+            val derived = transcriptName(s.cwd, sid) ?: continue
+            if (s.tabName != derived) sessions[i] = s.copy(tabName = derived)
+            baseNameForSession[sid] = derived
+
+            val tracked = tabForSession[sid] ?: continue
+            if (tracked.projectHash != thisProjectHash) continue
+            val current = tracked.tab.tabName
+            // Apply while the tab shows a placeholder, or a name we put there ourselves —
+            // never over a title the user typed into the tab strip.
+            val oursAlready = lastAppliedName[sid] == current || lastAppliedName[rawIdFor(sid)] == current
+            val shouldApply = current != derived && (
+                current.isNullOrBlank() ||
+                    ClaudeTabsHelpers.isGenericTabName(current) ||
+                    ClaudeTabsHelpers.isAiOverlayName(current, project.name) ||
+                    oursAlready
+                )
+            if (!shouldApply) continue
+            LOG.info("[ClaudeTabs] Naming tab from the conversation: '$current' → '$derived' (sid=${sid.take(8)})")
+            renameTab(project, tracked.tab, derived, sessionId = sid)
+            lastAppliedName[sid] = derived
+            lastAppliedName[rawIdFor(sid)] = derived
+        }
+    }
+
+    /**
+     * A tab label built from the conversation's opening question — the fallback for what
+     * Claude's own `name` field can't give an interactive session. See
+     * [ClaudeTabsHelpers.firstPromptName].
+     *
+     * Cached forever per session: the first user turn is by definition immutable, and the
+     * poll runs every 60s over every tab. Only the head of the transcript is read, so a
+     * megabyte-scale conversation costs the same as a fresh one.
+     */
+    private fun transcriptName(cwd: String?, sessionId: String): String? {
+        val f = ClaudeTabsHelpers.findTranscript(File(CLAUDE_HOME, "projects"), sessionId, cwd) ?: return null
+        val cached = promptNameCache[sessionId]
+        // A name, once found, is final — it comes from the first user turn, which never
+        // changes. Re-reading would only burn IO.
+        cached?.name?.let { return it }
+        // A miss is *not* final, and treating it as one was a bug worth naming: a terminal
+        // opened a moment ago has a transcript with no user turn in it yet, so the first
+        // look finds nothing. Caching that permanently left a live conversation's tab
+        // called '로컬' for as long as it stayed open. Re-read whenever the file has
+        // changed since the last unsuccessful look, which costs one `lastModified` per poll
+        // in the steady state.
+        val mtime = f.lastModified()
+        if (cached != null && cached.mtime == mtime) return null
+        val name = try {
+            BufferedReader(FileReader(f)).use { r ->
+                ClaudeTabsHelpers.firstPromptName(generateSequence { r.readLine() }.take(PROMPT_SCAN_LINES))
+            }
+        } catch (e: Exception) {
+            LOG.debug("[ClaudeTabs] transcript name read failed: ${e.message}")
+            null
+        }
+        promptNameCache[sessionId] = PromptName(name, mtime)
+        return name
+    }
+
+    /**
+     * Whether a restored tab's `claude --resume` should carry
+     * `--dangerously-skip-permissions`, i.e. whether this session runs with permission
+     * prompts bypassed.
+     *
+     * Read from the transcript, which records it — except after `/clear`, which starts a new
+     * transcript with no `permission-mode` line while the process, and therefore the mode,
+     * carries on unchanged. Without the fallback a session that had bypass on came back
+     * without it after a restart, which is what this fixes.
+     *
+     * The fallback is deliberately narrow: it applies only when the record is *absent* and
+     * only to a session known to have replaced another one in the same process. It carries
+     * a mode the user already chose across a `/clear`; it never turns bypass on for a session
+     * that didn't have it, and an explicitly recorded non-bypass mode always wins.
+     */
     private fun readPermissionMode(cwd: String, sessionId: String): Boolean {
-        val h = cwd.replace("\\", "/").replace(":/", "--").replace("/", "-")
-        val f = File(File(CLAUDE_HOME, "projects/$h"), "$sessionId.jsonl")
-        if (!f.exists()) return false
+        val recorded = transcriptPermissionMode(cwd, sessionId)
+        if (recorded != null) return recorded == "bypassPermissions"
+        return inheritedPermissionMode[sessionId] == "bypassPermissions"
+    }
+
+    /** The `permission-mode` record in [sessionId]'s transcript, or null if it has none. */
+    private fun transcriptPermissionMode(cwd: String?, sessionId: String): String? {
+        val f = ClaudeTabsHelpers.findTranscript(File(CLAUDE_HOME, "projects"), sessionId, cwd) ?: return null
         return try {
             BufferedReader(FileReader(f)).use { r ->
-                repeat(5) {
-                    val l = r.readLine() ?: return@use false
-                    if (l.contains("\"permission-mode\"")) return@use extractJsonString(l, "permissionMode") == "bypassPermissions"
-                }; false
+                ClaudeTabsHelpers.permissionModeFrom(generateSequence { r.readLine() }.take(PERMISSION_SCAN_LINES))
             }
         } catch (e: Exception) {
             LOG.debug("[ClaudeTabs] session jsonl read failed: ${e.message}")
-            false
+            null
         }
     }
+
+    /**
+     * `sessionId → ` the permission mode inherited from the session it replaced.
+     *
+     * Only reachable while the predecessor's hook file and the shared process are both still
+     * around, which is why it is captured as soon as the supersession is observed rather
+     * than looked up on demand. Once captured it reaches the restore file through the next
+     * poll's save, so it survives the restart that would otherwise drop it.
+     */
+    private val inheritedPermissionMode = java.util.concurrent.ConcurrentHashMap<String, String>()
 
     // ══════════════════════════════════════════════════════════════
     // CLAUDE DETECTION
