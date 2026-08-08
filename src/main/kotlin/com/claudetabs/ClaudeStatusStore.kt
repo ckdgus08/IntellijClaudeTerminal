@@ -5,7 +5,7 @@ import java.io.File
 /**
  * Reads the two on-disk status signals and folds them into `sessionId → `[ClaudeStatus].
  *
- *  - **Hook edges** live in `~/.claude/rider-plugin/status/<sessionId>.json`, written by
+ *  - **Hook edges** live in `~/.claude/intellij-claude-terminal/status/<sessionId>.json`, written by
  *    `status-hook.sh` on every `SessionStart` / `UserPromptSubmit` / `Notification` / `Stop`
  *    / `SessionEnd`.
  *  - **Claude's own reading** lives in `~/.claude/sessions/<pid>.json` as a `status` field.
@@ -18,7 +18,7 @@ import java.io.File
  */
 internal class ClaudeStatusStore(claudeHome: File) {
 
-    val statusDir = File(claudeHome, "rider-plugin/status")
+    val statusDir = File(claudeHome, "intellij-claude-terminal/status")
     private val sessionsDir = File(claudeHome, "sessions")
 
     // ══════════════════════════════════════════════════════════════

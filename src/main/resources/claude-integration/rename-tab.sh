@@ -3,7 +3,7 @@
 # rename-tab.sh — Renames the Rider terminal tab for the current
 #                 Claude Code session.
 # ─────────────────────────────────────────────────────────────────────
-# Usage: bash ~/.claude/rider-plugin/rename-tab.sh "Tab Name"
+# Usage: bash ~/.claude/intellij-claude-terminal/rename-tab.sh "Tab Name"
 #
 # How it works:
 #   Writes a rename directive as "{sessionId}.json" into the plugin's
@@ -24,12 +24,12 @@
 
 NAME="$1"
 if [ -z "$NAME" ]; then
-  echo "Usage: bash ~/.claude/rider-plugin/rename-tab.sh \"Tab Name\""
+  echo "Usage: bash ~/.claude/intellij-claude-terminal/rename-tab.sh \"Tab Name\""
   exit 1
 fi
 
-TABS_DIR="$HOME/.claude/rider-plugin/tabs"
-MAP_DIR="$HOME/.claude/rider-plugin/session-map"
+TABS_DIR="$HOME/.claude/intellij-claude-terminal/tabs"
+MAP_DIR="$HOME/.claude/intellij-claude-terminal/session-map"
 mkdir -p "$TABS_DIR"
 
 # ── Detect OS for process-liveness check ───────────────────────────

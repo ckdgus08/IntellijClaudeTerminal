@@ -68,6 +68,9 @@ internal object ClaudeTabsHelpers {
      * than a guess at every language that might exist.
      */
     private val BUNDLED_LOCALIZED_DEFAULTS = setOf("로컬", "ローカル", "本地")
+    // Not translatable: these are the literal strings the IDE displays in those languages.
+    // Replacing them with English would silently switch the fallback off for the users it
+    // exists for.
 
     /** Status/spinner glyph prefix the AI Assistant terminal overlay puts on tab names while
      *  a Claude session is active. Covers:
@@ -145,7 +148,7 @@ internal object ClaudeTabsHelpers {
     /**
      * Persistent record of a user-given (or hook-assigned) tab name for a Claude session.
      *
-     * Lives in `~/.claude/rider-plugin/names.json` keyed by sessionId. This file is the
+     * Lives in `~/.claude/intellij-claude-terminal/names.json` keyed by sessionId. This file is the
      * authoritative source of truth for "what should this tab be called" — the save loop
      * reads from here, never from the live terminal widget title (which gets clobbered by
      * the AI Assistant overlay and was the recurring cause of restored-with-wrong-name bugs).
@@ -319,7 +322,7 @@ internal object ClaudeTabsHelpers {
      *  - `derived` — mechanically built from the working directory (`riderclaudetabs-29`,
      *    `projects-68`). No better than the tab's default, so it is ignored.
      *  - `auto` — Claude's own summary of what the conversation is about
-     *    (`설치 스크립트 초기 설정 프로세스 개선`).
+     *    (`install script setup rework`).
      *  - `user` — set deliberately.
      *
      * **`auto` never arrives for a terminal session.** In Claude Code 2.1.226 the whole

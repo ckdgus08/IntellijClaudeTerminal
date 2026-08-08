@@ -37,7 +37,7 @@ fs.writeFileSync(sessionFile, JSON.stringify({
 // so /tab's TERM_SESSION_ID lookup finds us.
 const termSid = process.env.TERM_SESSION_ID;
 if (termSid) {
-  const mapDir = path.join(os.homedir(), '.claude', 'rider-plugin', 'session-map');
+  const mapDir = path.join(os.homedir(), '.claude', 'intellij-claude-terminal', 'session-map');
   fs.mkdirSync(mapDir, { recursive: true });
   fs.writeFileSync(path.join(mapDir, termSid), sessionId);
 }

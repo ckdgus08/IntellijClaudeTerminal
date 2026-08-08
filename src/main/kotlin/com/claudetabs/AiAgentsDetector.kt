@@ -23,7 +23,7 @@ internal object AiAgentsDetector {
     private val LOG = Logger.getInstance(AiAgentsDetector::class.java)
 
     /** Registry key — registered in plugin.xml — flipping to `false` reverts to legacy 1.0.3 behavior. */
-    const val REGISTRY_KEY = "rider.claude.tabs.respectAiAgents"
+    const val REGISTRY_KEY = "claude.terminal.tabs.respectAiAgents"
 
     /**
      * Tool window IDs that signal an AI-agent host is registered in this project. Match is

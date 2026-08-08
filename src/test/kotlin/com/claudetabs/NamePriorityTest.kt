@@ -30,7 +30,7 @@ class NamePriorityTest {
         current: String?,
         userChosen: String? = null,
         lastAppliedByUs: String? = null,
-        derived: String = "새 대화 이름",
+        derived: String = "new name",
         projectName: String = "projects",
     ): Boolean {
         if (userChosen != null) return false
@@ -61,7 +61,7 @@ class NamePriorityTest {
      * conversation's name replace it.
      */
     @Test fun replacesItsOwnNameAfterAClear() {
-        val ours = "이전 대화 이름"
+        val ours = "previous name"
         assertTrue(mayRename(current = ours, lastAppliedByUs = ours))
     }
 
@@ -69,10 +69,10 @@ class NamePriorityTest {
 
     @Test fun neverOverwritesANameTheUserTyped() {
         // Strongest rule in the system: true regardless of what the tab currently shows.
-        assertFalse(mayRename(current = "내 탭", userChosen = "내 탭"))
-        assertFalse(mayRename(current = "로컬", userChosen = "내 탭"))
-        assertFalse(mayRename(current = null, userChosen = "내 탭"))
-        assertFalse(mayRename(current = "내 탭", userChosen = "내 탭", lastAppliedByUs = "내 탭"))
+        assertFalse(mayRename(current = "my tab", userChosen = "my tab"))
+        assertFalse(mayRename(current = "로컬", userChosen = "my tab"))
+        assertFalse(mayRename(current = null, userChosen = "my tab"))
+        assertFalse(mayRename(current = "my tab", userChosen = "my tab", lastAppliedByUs = "my tab"))
     }
 
     /**
@@ -81,12 +81,12 @@ class NamePriorityTest {
      */
     @Test fun leavesUnrecognisedTitlesAlone() {
         assertFalse(mayRename(current = "backend deploy"))
-        assertFalse(mayRename(current = "이전 대화 이름", lastAppliedByUs = "다른 이름"))
+        assertFalse(mayRename(current = "previous name", lastAppliedByUs = "다른 이름"))
     }
 
     @Test fun doesNotRewriteTheNameItAlreadyApplied() {
         // Same value: a no-op that would otherwise churn the title on every poll.
-        assertFalse(mayRename(current = "새 대화 이름", derived = "새 대화 이름"))
+        assertFalse(mayRename(current = "new name", derived = "new name"))
     }
 
     /**
