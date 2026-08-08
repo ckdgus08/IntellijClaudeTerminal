@@ -35,6 +35,12 @@ EVENT="$1"
 INPUT=$(cat)
 SID=$(echo "$INPUT" | sed -n 's/.*"session_id":"\([^"]*\)".*/\1/p')
 
+# SessionStart carries how the session began: startup | resume | clear | compact.
+# It is the difference between "brand new, no turns yet" and "picked an existing
+# conversation back up", which look identical from the event name alone — and
+# getting that wrong makes a finished chat come back as idle after an IDE restart.
+SOURCE=$(echo "$INPUT" | sed -n 's/.*"source":"\([^"]*\)".*/\1/p')
+
 STATUS_DIR="$HOME/.claude/rider-plugin/status"
 mkdir -p "$STATUS_DIR" 2>/dev/null || exit 0
 
@@ -47,7 +53,7 @@ case "$NOW_NS" in
   *)           TS=$(( NOW_NS / 1000000 )) ;;
 esac
 
-PAYLOAD="{\"event\":\"$EVENT\",\"sessionId\":\"$SID\",\"ts\":$TS,\"pid\":$PPID}"
+PAYLOAD="{\"event\":\"$EVENT\",\"source\":\"$SOURCE\",\"sessionId\":\"$SID\",\"ts\":$TS,\"pid\":$PPID}"
 
 if [ -n "$SID" ]; then
   echo "$PAYLOAD" > "$STATUS_DIR/$SID.json"

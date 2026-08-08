@@ -1,7 +1,7 @@
 <idea-plugin>
     <id>com.claudetabs.rider-claude-tabs</id>
     <name>Claude Terminal Tab Persistence</name>
-    <version>1.0.19</version>
+    <version>1.0.32</version>
     <vendor email="ragnaraven.dev@gmail.com" url="https://github.com/Ragnaraven/RiderClaudeTabs">Ragnaraven</vendor>
 
     <description><![CDATA[
@@ -16,6 +16,9 @@
       <li><b>Live status glyph on every tab</b> &mdash; <code>&#x25CF;</code> working, <code>&#x26A0;</code> waiting for
       input or a permission prompt, <code>&#x2713;</code> finished, <code>&#x25CB;</code> idle, <code>&#x2715;</code>
       exited. Driven by Claude Code hooks, so it lands within a fraction of a second. Hover the tab for the wording.</li>
+      <li><b>Remote Control on by default</b> &mdash; a <code>claude remote-control</code> tab per project, so this
+      machine's sessions are reachable from claude.ai/code and the Claude mobile app. Disable via
+      <code>remoteControl.enabled</code> in <code>~/.claude/rider-plugin/config.json</code>.</li>
       <li><b>Auto-rename terminal tabs</b> based on the Claude conversation topic (or a name you give it)</li>
       <li><b>Race-condition-free</b> identification of each tab via <code>TERM_SESSION_ID</code> mapping</li>
       <li><b>Session save/restore</b> across IDE restarts — your named tabs come back</li>
@@ -47,6 +50,222 @@
     ]]></description>
 
     <change-notes><![CDATA[
+    <h3>1.0.32</h3>
+    <ul>
+      <li><b>The spare-terminal sweep now says why it did nothing.</b> Twice in a row it silently skipped every tab and
+      the log gave no way to tell which guard rejected them. Each candidate is now reported with the value of every
+      input: <code>'로컬'(pid=67036 generic=true claude=false children=0[] ours=false &rarr; CLOSE)</code>.</li>
+      <li><b>It retries for 20 seconds after a restore instead of running once.</b> At the instant restore finishes the
+      IDE's default shell can transiently own a child process — this machine's <code>.zshrc</code> ends in
+      <code>exec zsh</code> — and a single shot reads that as "in use" and never looks again. Past the window it stops:
+      by then a spare terminal is one someone has been looking at, and closing it would be a surprise rather than
+      tidying.</li>
+    </ul>
+
+    <h3>1.0.31</h3>
+    <ul>
+      <li><b>The spare terminal is actually closed now.</b> 1.0.29 added the cleanup and it never once fired: it asked
+      the widget for a process id, but the IDE's own default tab reports its id through the <i>backend session</i>
+      instead — <code>STEP 3b: [로컬&rarr;PID67036(sess)]</code> alongside <code>skipNoPid=2</code> in the same poll. The
+      pid came back null every time and every tab was skipped. It now goes through the same tab enumeration the rest of
+      the plugin uses, which tries both routes. All the safety guards are unchanged.</li>
+      <li><b>Background Remote Control no longer leaves orphans behind.</b> Running through
+      <code>$SHELL -l -i -c</code> makes the server a <i>child</i> of the process we hold, so stopping only that parent
+      left the real server reparented to launchd — seen as <code>ppid=1</code> remote-control shells surviving IDE
+      restarts, which the duplicate check would then read as a server already serving. The whole process tree is
+      terminated on project close.</li>
+    </ul>
+
+    <h3>1.0.30</h3>
+    <ul>
+      <li><b>Background Remote Control actually starts now.</b> 1.0.29's attempt failed with
+      <code>Cannot run program "claude" &hellip; error=2 (No such file or directory)</code>: an IDE launched from the
+      Dock inherits a minimal PATH that has no <code>~/.local/bin</code>, where the CLI installs itself. The pty attempt
+      failed for the same reason and reported it as a bare <code>InvocationTargetException: null</code>.</li>
+      <li>It now runs through <code>$SHELL -l -i -c</code>, the same login <i>and interactive</i> flags the IDE's own
+      terminal tab uses. Both flags are load-bearing: measured against a stripped environment,
+      <code>zsh -l -c 'command -v claude'</code> still fails, because a login shell reads <code>.zprofile</code> while
+      the PATH entry lives in <code>.zshrc</code> — which only an interactive shell sources.</li>
+      <li>Reflective failures are unwrapped before logging, so the next one names the actual cause instead of the
+      wrapper.</li>
+      <li>401 unit tests.</li>
+    </ul>
+
+    <h3>1.0.29</h3>
+    <ul>
+      <li><b>Coloured tab icons.</b> Each tab gets a dot in the colour of its state — blue working, amber waiting,
+      green finished, hollow grey idle, hollow red exited. The glyph stays: tabs this plugin spawned are reached
+      through their widget and can't always be resolved to a <code>Content</code> to hang an icon on, and a tab without
+      an icon still has to show its state. Tab <i>label</i> colour is not used — that lives in the tool window's
+      internal <code>JBTabs</code>, the same layer that has broken repeatedly here; <code>Content.setIcon</code> is a
+      plain, stable API.</li>
+      <li><b>Reopening leaves the same number of terminals it closed with.</b> When the terminal tool window is active
+      at startup the IDE creates a default tab of its own — measured at 68ms after the plugin starts, three seconds
+      before restore fires — and restore then added the saved sessions on top. That spare tab is now closed, but only
+      when a restore actually happened, only while it still has its default name, only with no Claude in it, and only
+      when its shell has no child processes at all. Anything running in it, or a name someone chose, keeps it.</li>
+      <li><b><code>remoteControl.mode = "background"</code> now works.</b> Remote Control is interactive and exits at
+      once without a terminal on the other end, which is why the first attempt at this mode looked simply broken. It
+      now runs on a real pty (pty4j, which ships with the platform and is what the IDE's own terminal uses), with its
+      output drained to <code>remote-control-&lt;project&gt;.log</code>. A plain pipe remains the fallback, and an
+      immediate exit is reported rather than left looking like success.</li>
+      <li><b>Duplicate Remote Control servers are actually prevented now.</b> The argv-plus-<code>lsof</code> scan was
+      the only check and the log shows it never once fired — seven starts across restarts, twice inside a single IDE
+      run. The server's pid is now recorded in <code>rc-&lt;project&gt;.lock</code> and checked directly, which doesn't
+      depend on argv being readable or on <code>lsof</code> output shape. The scan stays, for servers started by hand.</li>
+      <li>400 unit tests.</li>
+    </ul>
+
+    <h3>1.0.28</h3>
+    <ul>
+      <li><b>A finished chat stays <code>&#x2713;</code> across an IDE restart instead of reverting to
+      <code>&#x25CB;</code>.</b> Restarting resumes every saved conversation, which fires <code>SessionStart</code>
+      again, and that was mapped to Idle wholesale &mdash; so a chat you left finished came back marked as if it had
+      never run a turn. The restart is the IDE's business, not the conversation's.</li>
+      <li>The hook now records <code>SessionStart</code>'s <code>source</code>: <code>startup</code> and
+      <code>clear</code> mean nothing has run yet (Idle), <code>resume</code> means an existing conversation picked back
+      up at the prompt with its last turn behind it (Finished). <code>compact</code> fires mid-conversation, often
+      mid-turn, so it says nothing about whether Claude is working and now leaves the current state alone rather than
+      resetting it.</li>
+      <li>A hook file with no recorded source keeps the old meaning, so nothing changes until the updated script has
+      run once.</li>
+      <li>393 unit tests.</li>
+    </ul>
+
+    <h3>1.0.27</h3>
+    <ul>
+      <li><b>Restored tabs appear in about a second instead of nine.</b> The spawns themselves were already parallel
+      &mdash; three tabs in 6ms, their shells starting concurrently &mdash; so the wall-clock was almost entirely fixed
+      waiting before the first spawn: a 3s head start plus a flat 5s "settle" sleep.</li>
+      <li>The settle now waits for the terminal tool window to stop changing rather than for the clock: it fires once the
+      content count has held steady for 800ms, with the old 5s constant kept as a ceiling so a tool window that never
+      settles can't block restore. The wait exists so leftover empty tabs the IDE remembered from
+      <code>workspace.xml</code> can be closed before fresh ones are spawned &mdash; that still happens, it just stops
+      costing five seconds when the tabs were in place after one.</li>
+      <li>The poll loop's head start drops from 3s to 1s, since readiness is now detected rather than assumed.</li>
+    </ul>
+
+    <h3>1.0.26</h3>
+    <ul>
+      <li><b>The indicator appears within a couple of seconds of a tab, instead of up to a minute later.</b> Attaching
+      used to happen only inside the save poll, which returns early during its startup grace &mdash; up to 60 seconds
+      while restored tabs are still coming up. Measured on a real start: plugin up at 20:01:54, first attach at
+      20:02:21. Twenty-seven seconds of blank tabs, which is the first thing anyone notices.</li>
+      <li>The status loop now runs its own attach pass on a 1.5s throttle and starts 1.5s after the project opens rather
+      than 4s. The poll still attaches too, which is what keeps handles fresh as tabs are moved between split panes.</li>
+    </ul>
+
+    <h3>1.0.25</h3>
+    <ul>
+      <li><b>The status indicator attaches to tabs this plugin spawned, using the widget it already holds.</b> Measured
+      on 2026.1: the tab managers reported <i>one</i> tab (an empty shell) while <code>ContentManager</code> held four,
+      and the three they didn't know about were exactly the three the plugin had spawned &mdash; restored sessions and
+      the Remote Control tab. Those are the tabs that most need the indicator, and every identity route missed them:
+      no shell PID, <code>getSession()</code> throws, and their widgets are <code>TerminalWidgetBridge</code> over
+      <code>com.jetbrains.rdserver.terminal.BackendTtyConnector</code>.</li>
+      <li>But the plugin created those tabs, so it has held the widget keyed by session id since spawn time
+      (<code>spawnedWidgets</code>). Painting a title needs nothing more than that. No reflection, no PID, no
+      <code>TERM_SESSION_ID</code> &mdash; the earlier routes stay as fallbacks for tabs opened by hand.</li>
+      <li>382 unit tests.</li>
+    </ul>
+
+    <h3>1.0.24</h3>
+    <ul>
+      <li><b>Second route for attaching the status indicator, via <code>ContentManager</code>.</b> The backend and
+      frontend tab managers intermittently report zero tabs while <code>ContentManager</code> still holds every one of
+      them (observed: <code>Backend has 0 tabs</code> alongside <code>contents=3</code>), which left the
+      <code>TERM_SESSION_ID</code> bridge with nothing to read an id from. The identity probe showed the widgets are
+      <code>TerminalWidgetBridge</code> and do expose <code>getSession()</code>, so the id is reachable from there.</li>
+      <li>The search matches on <i>value</i>, not on accessor name: it walks a couple of levels of zero-argument
+      accessors and takes the first object whose string form contains a <code>TERM_SESSION_ID</code> the hook has
+      already recorded. The shape inside these objects has moved twice across releases, so hard-coding the next accessor
+      name would buy exactly one version; the id being a UUID is the part that stays true. Bounded by an accessor
+      allowlist, a depth limit, identity tracking and a node budget &mdash; a widget transitively reaches the whole
+      editor.</li>
+      <li>The identity probe now prints the reachable <i>values</i> and the UUIDs being looked for, so a failure says
+      which of the two is missing rather than just that nothing matched.</li>
+      <li>382 unit tests.</li>
+    </ul>
+
+    <h3>1.0.23</h3>
+    <ul>
+      <li><b>Fixes a live background agent being read as dead.</b> The installed CLI is a versioned binary whose filename
+      is the version &mdash; <code>~/.local/share/claude/versions/2.1.226</code> &mdash; and sessions the daemon launches
+      run it directly instead of through the <code>~/.local/bin/claude</code> shim. Every name-based check missed them, so
+      a running background agent looked dead, its session looked restorable, and restore ran <code>claude --resume</code>
+      against it &mdash; which Claude refuses outright with "currently running as a background agent". Recognition now
+      also matches the install path.</li>
+      <li>The liveness check the restore path uses deliberately counts non-interactive sessions too: a running background
+      agent is a reason not to restore its session, even though it could never have been a tab.</li>
+      <li><b>Identity probe for the remaining status gap.</b> When nothing can be attached, the log now dumps what is
+      actually reachable from each terminal <code>Content</code> &mdash; widget class plus any member that could carry a
+      session id or the process environment. Both existing routes have been seen failing on this platform (shell PIDs
+      absent or belonging to a different tab; backend/frontend tab managers intermittently reporting zero tabs while
+      <code>ContentManager</code> holds several), and this replaces guessing at another API with one log excerpt.</li>
+      <li>374 unit tests.</li>
+    </ul>
+
+    <h3>1.0.22</h3>
+    <ul>
+      <li><b>The status indicator now attaches by <code>TERM_SESSION_ID</code>, not by process id.</b> This is what makes
+      it actually appear on IntelliJ 2026.1's reworked terminal. The PID route collapses there: the platform hands out
+      shell PIDs belonging to <i>empty</i> tabs while the tabs actually hosting Claude report no PID at all &mdash;
+      observed on a real install as three enumerated tabs whose shells were childless <code>zsh</code>, alongside six
+      live Claude sessions on shells the enumeration never mentioned. Walking <code>shell pid &rarr; child claude</code>
+      cannot work when the shell pid belongs to a different tab.</li>
+      <li>The bridge has no PID in it anywhere: the backend tab exposes its <code>TERM_SESSION_ID</code>, every process
+      the tab spawns inherits it, and the status hook records <code>TERM_SESSION_ID &rarr; sessionId</code> from inside
+      the session. A terminal reused for a second session resolves to the session in it now, decided by timestamp rather
+      than by directory order.</li>
+      <li>Additive: tabs the PID walk does resolve keep using it, and this only fills the gaps.</li>
+      <li>The status heartbeat now reports <code>termMap=N</code>, which separates "no session has fired a hook yet"
+      (hooks missing, or every session predates their install and needs restarting) from "mappings exist but no tab
+      matched one".</li>
+      <li>370 unit tests.</li>
+    </ul>
+
+    <h3>1.0.21</h3>
+    <ul>
+      <li><b>Fixes duplicate tabs on install / project reload.</b> Restore spawned a tab for every session in the restore
+      file without checking whether that session was still running. Installing the plugin reloads the project without
+      killing anything, so every session was still alive in the tab it had always been in &mdash; and each got a second
+      tab beside it running <code>claude --resume</code> against the same conversation. A session that is already running
+      is now never restored. Matching covers both the reported and the canonical id, since a resumed process reports a
+      rotated one and the restore file stores the canonical.</li>
+      <li><b>Remote Control can run without a tab.</b> Set <code>"mode": "background"</code> under
+      <code>remoteControl</code> in <code>~/.claude/rider-plugin/config.json</code>: the server runs detached with its
+      output going to <code>~/.claude/rider-plugin/remote-control-&lt;project&gt;.log</code>, and is stopped when the
+      project closes. Note this trades away what the tab is for &mdash; the connection state and the runtime
+      <code>w</code> (worktree) toggle. If the server needs a TTY it will exit immediately, and the log line says so.</li>
+      <li>363 unit tests.</li>
+    </ul>
+
+    <h3>1.0.20</h3>
+    <ul>
+      <li><b>Remote Control starts automatically, once per project.</b> On IDE start the plugin opens a terminal tab
+      running <code>claude remote-control</code> for the project directory, so this machine's sessions can be driven
+      from <a href="https://claude.ai/code">claude.ai/code</a> and the Claude mobile app without setting anything up.
+      <b>This exposes control of local Claude sessions to your Claude account for as long as the IDE is open.</b> Turn
+      it off with <code>"remoteControl": {"enabled": false}</code> in
+      <code>~/.claude/rider-plugin/config.json</code>.</li>
+      <li><b>Never a second server for the same directory.</b> Before starting, the plugin looks for a remote-control
+      process already serving that path — including one you started by hand in another terminal — by matching argv and
+      then reading the process's working directory. The <code>rc</code> alias is matched as a whole token, so a path
+      containing <code>src/</code> can't be mistaken for it.</li>
+      <li><b>The Remote Control tab is not tracked as a chat.</b> It hosts a server, and the session that server
+      pre-creates belongs to the server — tracking it would put it in the restore file and bring it back after a restart
+      as a plain tab running <code>claude --resume</code> against it.</li>
+      <li>The project name is passed as <code>--name</code> so several machines and projects stay distinguishable on the
+      phone. It is shell-quoted: it is a directory name reaching a real shell.</li>
+      <li><code>spawnMode</code> (<code>same-dir</code> / <code>worktree</code> / <code>session</code>) and
+      <code>extraArgs</code> are configurable; an unrecognised spawn mode is dropped rather than passed through to fail
+      inside the tab.</li>
+      <li><b>Diagnosability:</b> a status heartbeat now logs every ~minute with the three inputs that decide whether a
+      glyph appears (tab count, tracked sessions, signal readings). The most likely failure — no glyphs at all — used to
+      produce no log output whatsoever.</li>
+      <li>353 unit tests.</li>
+    </ul>
+
     <h3>1.0.19</h3>
     <ul>
       <li><b>Claude Code status on the terminal tab.</b> Each tab is prefixed with a glyph for the state of the Claude

@@ -100,6 +100,16 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
          *  would be *slower* than this loop. Each tick stats a handful of small files. */
         private const val STATUS_POLL_MS = 400L
 
+        /** How often the status loop looks for tabs it hasn't attached to yet. Short enough
+         *  that a tab picks up its glyph within a couple of seconds of appearing, long
+         *  enough that the reflective fallback routes don't run on every 400ms tick. */
+        private const val STATUS_ATTACH_INTERVAL_MS = 1_500L
+
+        /** How long after a restore the spare-terminal sweep keeps looking. Long enough to
+         *  outlast a shell that is still settling, short enough that it can never close a
+         *  terminal someone has since started using. */
+        private const val DEFAULT_TERMINAL_SWEEP_WINDOW_MS = 20_000L
+
         /**
          * Last status snapshot, shared by every open project window.
          *
@@ -152,6 +162,10 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         var snapshotKeepCount: Int = 10
             private set
 
+        /** Remote Control auto-start settings. See [RemoteControlLauncher.Config]. */
+        internal var remoteControl: RemoteControlLauncher.Config = RemoteControlLauncher.Config.DEFAULT
+            private set
+
         /**
          * Load [CONFIG_FILE] and apply any recognised fields, falling back to defaults for
          * anything missing or malformed. Accepted fields:
@@ -161,10 +175,12 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         private fun loadConfig() {
             if (!CONFIG_FILE.exists()) return
             try {
-                val cfg = ClaudeTabsHelpers.parseConfig(CONFIG_FILE.readText())
+                val text = CONFIG_FILE.readText()
+                val cfg = ClaudeTabsHelpers.parseConfig(text)
                 historyMaxAgeMs = cfg.historyMaxAgeMs
                 snapshotKeepCount = cfg.snapshotKeepCount
-                LOG.info("[ClaudeTabs] Config loaded: historyMaxAgeDays=${historyMaxAgeMs / (24*60*60*1000)}, snapshotKeepCount=$snapshotKeepCount")
+                remoteControl = RemoteControlLauncher.parseConfig(text)
+                LOG.info("[ClaudeTabs] Config loaded: historyMaxAgeDays=${historyMaxAgeMs / (24*60*60*1000)}, snapshotKeepCount=$snapshotKeepCount, remoteControl.enabled=${remoteControl.enabled}")
             } catch (e: Exception) {
                 LOG.warn("[ClaudeTabs] Config load failed (using defaults): ${e.message}")
             }
@@ -179,7 +195,15 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                     """{
   "_comment": "Claude Terminal Tab Persistence — edit values and restart Rider to apply.",
   "historyMaxAgeDays": 90,
-  "snapshotKeepCount": 10
+  "snapshotKeepCount": 10,
+
+  "_remoteControl": "Starts `claude remote-control` once per project so you can drive this machine's sessions from claude.ai/code or the Claude mobile app. This exposes control of local sessions to your Claude account while the IDE is open — set enabled=false to turn it off. mode: tab (visible terminal tab) | background (no tab; output goes to remote-control-<project>.log). spawnMode: same-dir | worktree | session.",
+  "remoteControl": {
+    "enabled": true,
+    "mode": "tab",
+    "spawnMode": "same-dir",
+    "extraArgs": ""
+  }
 }
 """
                 )
@@ -322,6 +346,22 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
      */
     private val baseNameForSession = java.util.concurrent.ConcurrentHashMap<String, String>()
 
+    /**
+     * Shell PIDs of tabs hosting a `claude remote-control` server.
+     *
+     * The tab-walk must skip these. A Remote Control server is not a chat session: the tab
+     * hosts a server process, and whatever session it pre-creates belongs to the server,
+     * not to this tab. Tracking it would put the server's session in the restore file and
+     * bring it back after a restart as a plain tab running `claude --resume` against it.
+     *
+     * The session-kind filter already rejects `kind: "rc"`, but this does not depend on
+     * Claude tagging the pre-created session the way we expect.
+     */
+    private val remoteControlShellPids = java.util.concurrent.ConcurrentHashMap.newKeySet<Long>()
+
+    /** Throttle for the status loop's own attach pass. See [STATUS_ATTACH_INTERVAL_MS]. */
+    @Volatile private var lastStatusAttachAt = 0L
+
     /** Resolve [sid] to its canonical form. Two-tier:
      *
      *  1. Cached alias (populated by [poll] after the first canonical resolution).
@@ -424,10 +464,24 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
          *  Rider has time to repopulate any remembered tab titles, and we can detect/close
          *  the stale empty-shell ones before spawning our own. */
         var pendingRestoresLoadedAt: Long = 0L,
+        /** Terminal tool-window content count and when it last changed — the signal the
+         *  restore settle waits on instead of a fixed sleep. */
+        var lastContentCount: Int = -1,
+        var lastContentChangeAt: Long = 0L,
         /** True once the create-restore has fired for this project on the current Rider run.
          *  Prevents a second pass from spawning duplicate tabs if the restore file isn't yet
          *  deleted (e.g. a save races us before we get to clean up). */
         var restoreFired: Boolean = false,
+        /** Set once [ensureRemoteControl] has run for this project, so a failed spawn isn't
+         *  retried on every poll and a second window of the same project can't double-start. */
+        var remoteControlStarted: Boolean = false,
+        /** When the restore spawn completed. The spare-terminal sweep retries for a short
+         *  window after this, rather than running once: at the instant restore finishes the
+         *  IDE's default shell can transiently have a child (this machine's .zshrc ends in
+         *  `exec zsh`), and a single shot would read that as "in use" and never look again. */
+        var restoreFiredAt: Long = 0L,
+        /** Set once the sweep has closed something or its window has expired. */
+        var defaultTerminalSweepDone: Boolean = false,
         /** Sessions seen active at least once in this project. Used to detect closures and write
          *  history — must be project-scoped or one project's poll will mark the other's sessions
          *  as closed every cycle. */
@@ -728,7 +782,10 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
 
         // Main poll loop
         scope.launch {
-            delay(3_000)
+            // Short head start only — the restore path waits for the terminal tool window to
+            // settle on its own (see processPendingRestores), so a long fixed delay here is
+            // just added latency before the first tab appears.
+            delay(1_000)
 
             // Load restore file
             withContext(Dispatchers.Main) { loadRestoreFile(project) }
@@ -751,6 +808,36 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             }
         }
 
+        // Remote Control server — one per project, started after the restore spawn has had
+        // time to settle so it doesn't compete with restored tabs for the terminal tool
+        // window. `isRemoteControlServing` shells out to lsof, so this stays off the EDT
+        // until the actual tab creation.
+        scope.launch {
+            delay(12_000)
+            try {
+                val start = withContext(Dispatchers.Default) {
+                    RemoteControlLauncher.decide(
+                        config = remoteControl,
+                        alreadyStartedThisRun = ctx(project).remoteControlStarted,
+                        // Two independent checks: a pid we recorded ourselves (decidable,
+                        // survives an IDE restart) and a scan for one started by hand.
+                        externalServerForThisDir = remoteControlAlreadyRunning(project) ||
+                            isRemoteControlServing(project.basePath),
+                        projectBasePath = project.basePath,
+                    )
+                }
+                if (start is RemoteControlLauncher.Decision.Skip) {
+                    LOG.info("[ClaudeTabs][rc] Not starting Remote Control — ${start.reason}")
+                } else {
+                    withContext(Dispatchers.Main) { startRemoteControlTab(project) }
+                }
+            } catch (_: ProcessCanceledException) {
+                // project closed mid-probe
+            } catch (e: Exception) {
+                LOG.warn("[ClaudeTabs][rc] startup failed: ${e.message}")
+            }
+        }
+
         // Status indicator loop — deliberately separate from the poll above.
         //
         // The save poll is expensive (four reflective tab enumerations, a process-ancestry
@@ -760,7 +847,9 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         // handful of small files, diff against what's already on screen, and touch only the
         // tabs that actually changed.
         scope.launch {
-            delay(4_000)
+            // Starts early: the loop now attaches on its own, so there is nothing to wait
+            // for. 1.5s is just enough for the terminal tool window to exist.
+            delay(1_500)
             while (isActive) {
                 try {
                     refreshStatuses(project)
@@ -791,8 +880,32 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
      * and is swallowed, and the next poll drops the entry.
      */
     private suspend fun refreshStatuses(project: Project) {
-        if (tabForSession.isEmpty()) return
         val thisProjectHash = projectHash(project)
+
+        // Attach on this loop rather than waiting for poll().
+        //
+        // poll() returns early during its startup grace — up to 60s while restored tabs are
+        // still coming up — and the attach used to live after that return, so the indicator
+        // could not appear at all until the grace ended. Measured on a real start: plugin up
+        // at 20:01:54, first attach at 20:02:21. Twenty-seven seconds of blank tabs, which is
+        // the first thing anyone notices.
+        //
+        // Attaching is cheap for the case that matters (a map walk over spawnedWidgets), so
+        // it runs here on a short throttle instead. poll() still calls it, which is what
+        // keeps handles fresh as tabs move.
+        val now = System.currentTimeMillis()
+        if (now - lastStatusAttachAt >= STATUS_ATTACH_INTERVAL_MS) {
+            lastStatusAttachAt = now
+            withContext(Dispatchers.Main) {
+                try {
+                    attachStatusTabs(project, tabForSession.keys.toSet())
+                } catch (e: Exception) {
+                    LOG.debug("[ClaudeTabs][status] attach from status loop failed: ${e.message}")
+                }
+            }
+        }
+
+        if (tabForSession.isEmpty()) return
 
         val readings = sharedStatusSnapshot()
         if (readings.isEmpty()) return
@@ -818,7 +931,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                     ?: lastAppliedName[sid]
                     ?: storage.nameFor(sid)
                     ?: tab.tabName
-                if (applyStatusToTab(tab, base, status)) {
+                if (applyStatusToTab(tab, base, status, project)) {
                     LOG.info("[ClaudeTabs][status] ${sid.take(8)} ${previous?.name ?: "-"} → ${status.name} ('$base')")
                 } else {
                     // The tab is gone or its title surface is unreachable. Drop the cached
@@ -840,9 +953,22 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
      * into `workspace.xml`) keeps the bare name written by [renameTab] — a glyph there would
      * outlive the session it describes and reappear, stale, on the next IDE start.
      */
-    private fun applyStatusToTab(tab: TabInfo, baseName: String, status: ClaudeStatus): Boolean {
+    private fun applyStatusToTab(tab: TabInfo, baseName: String, status: ClaudeStatus, project: Project? = null): Boolean {
         val display = StatusDecoration.decorate(baseName, status)
         var applied = false
+
+        // Coloured tab icon. The glyph still goes on regardless: tabs this plugin spawned are
+        // reached through their widget and may have no Content to hang an icon on, and a tab
+        // without an icon still has to show its state.
+        val content = tab.content ?: project?.let { contentForWidget(it, tab.widget) }
+        if (content != null) {
+            try {
+                content.icon = ClaudeStatusIcons.forStatus(status)
+                applied = true
+            } catch (e: Exception) {
+                LOG.debug("[ClaudeTabs][status] setIcon failed: ${e.message}")
+            }
+        }
 
         val title = try { findTerminalTitle(tab) } catch (_: Exception) { null }
         if (title != null) {
@@ -855,7 +981,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         }
 
         try {
-            tab.content?.let {
+            content?.let {
                 it.displayName = display
                 it.description = StatusDecoration.tooltip(baseName, status)
                 applied = true
@@ -868,6 +994,39 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
     }
 
     /**
+     * The `Content` hosting [widget], found by asking the tool window which widget each of
+     * its contents holds.
+     *
+     * Tabs this plugin spawned are tracked by widget, because that is the only handle the
+     * platform reliably gives us for them — but an icon needs a `Content`. Rather than
+     * threading one through at spawn time (where it isn't available yet either), it is
+     * looked up here and cached; the mapping only changes when tabs are created or closed.
+     */
+    private val contentForWidgetCache = java.util.concurrent.ConcurrentHashMap<TerminalWidget, Content>()
+
+    private fun contentForWidget(project: Project, widget: TerminalWidget?): Content? {
+        if (widget == null) return null
+        val cmgr = try {
+            TerminalToolWindowManager.getInstance(project).toolWindow?.contentManager
+        } catch (_: Exception) { null } ?: return null
+
+        contentForWidgetCache[widget]?.let { cached ->
+            // A closed tab's Content would otherwise stay in the map, and writing to it
+            // silently paints nothing. Still being in the manager is the liveness test.
+            if (cmgr.contents.any { it === cached }) return cached
+            contentForWidgetCache.remove(widget)
+        }
+        return try {
+            cmgr.contents.firstOrNull { c ->
+                try { TerminalToolWindowManager.findWidgetByContent(c) === widget } catch (_: Exception) { false }
+            }?.also { contentForWidgetCache[widget] = it }
+        } catch (e: Exception) {
+            LOG.debug("[ClaudeTabs][status] contentForWidget failed: ${e.message}")
+            null
+        }
+    }
+
+    /**
      * Periodic one-liner describing why the status indicator is (or isn't) showing anything.
      *
      * Every transition already logs, but the most likely failure — no glyphs at all — is
@@ -876,11 +1035,13 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
      * prints the inputs at the same cadence as the STEP 6b/6d counters, so "the glyphs never
      * appeared" can be diagnosed from a log excerpt instead of a debugger.
      *
-     * Reading it: `tabs=0` means the platform didn't give us tabs (the reworked-terminal
-     * PID problem — compare `skipNoPid` on the getAllTabs line). `tracked=0` with `tabs>0`
-     * means tabs exist but none resolved to a Claude process. `readings=0` means neither the
-     * hooks nor Claude's own session files produced anything — check that the hooks are in
-     * `~/.claude/settings.json` and that the sessions predate nothing.
+     * Reading it:
+     *  - `tracked=0` with `tabs>0` — no tab resolved to a session. If `termMap=0` too, no
+     *    session has fired a hook yet: either the hooks aren't in `~/.claude/settings.json`,
+     *    or every running session predates their installation and needs restarting.
+     *  - `termMap>0` but still `tracked=0` — the bridge has mappings but no backend tab's
+     *    session id matched one of them.
+     *  - `readings=0` — neither the hooks nor Claude's own session files produced any state.
      */
     private fun logStatusHeartbeat(project: Project, tabCount: Int) {
         try {
@@ -893,18 +1054,308 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                 val claude = readings[sid]?.sessionStatus ?: readings[rawIdFor(sid)]?.sessionStatus ?: "-"
                 "${sid.take(8)}:$st(hook=$hook,claude=$claude)"
             }.ifBlank { "none" }
+            val termMap = try { statusStore.termSessionMap().size } catch (_: Exception) { -1 }
             LOG.info(
-                "[ClaudeTabs][status] tabs=$tabCount tracked=${mine.size} readings=${readings.size} " +
+                "[ClaudeTabs][status] tabs=$tabCount tracked=${mine.size} readings=${readings.size} termMap=$termMap " +
                     "hookDir=${statusStore.statusDir.absolutePath} exists=${statusStore.statusDir.exists()} — $shown"
             )
+            if (mine.isEmpty()) logTabIdentityProbe(project)
         } catch (e: Exception) {
             LOG.debug("[ClaudeTabs][status] heartbeat failed: ${e.message}")
+        }
+    }
+
+    /**
+     * Dump what identity is reachable from each terminal `Content`, for the case where
+     * nothing could be attached.
+     *
+     * Both routes to a tab's identity have now been observed failing on IntelliJ 2026.1:
+     * the shell PID is either absent or belongs to a different (empty) tab, and the
+     * backend/frontend tab managers intermittently report zero tabs while `ContentManager`
+     * still holds several — which leaves the `TERM_SESSION_ID` bridge with nothing to read
+     * the id from.
+     *
+     * Rather than guess at another API, this prints the shape of what is actually reachable
+     * from a Content on this build: the widget class and any member that looks like it could
+     * carry a session id or the process environment. One log excerpt then says which handle
+     * to use, instead of another round of speculative reflection.
+     */
+    private fun logTabIdentityProbe(project: Project) {
+        try {
+            val cmgr = TerminalToolWindowManager.getInstance(project).toolWindow?.contentManager ?: return
+            val contents = cmgr.contents
+            if (contents.isEmpty()) return
+            val report = contents.joinToString(" | ") { content ->
+                val name = try { content.displayName ?: "?" } catch (_: Exception) { "?" }
+                val widget = try { TerminalToolWindowManager.findWidgetByContent(content) } catch (_: Exception) { null }
+                if (widget == null) return@joinToString "'$name'(no-widget)"
+                val cls: Class<*> = widget.javaClass
+                // The *values* reachable from the widget, not just the member names: the
+                // attach path matches a known TERM_SESSION_ID by string content, so what
+                // matters is whether any of these actually carries one.
+                val values = buildList {
+                    for (m in cls.methods) {
+                        if (m.parameterCount != 0) continue
+                        val n = m.name.lowercase()
+                        if (!(n.startsWith("getsession") || n == "getid" || n == "getsessionid" ||
+                                n == "getttyconnector" || n == "getttyconnectoraccessor")
+                        ) continue
+                        val v = try { m.isAccessible = true; m.invoke(widget) } catch (_: Throwable) { "<threw>" }
+                        val text = try { v?.toString()?.take(120) ?: "null" } catch (_: Exception) { "<toString threw>" }
+                        add("${m.name}()=[${v?.javaClass?.simpleName ?: "null"}] $text")
+                    }
+                }
+                "'$name'(${cls.simpleName}: ${values.joinToString(" ; ").ifBlank { "nothing-identity-like" }})"
+            }
+            val candidates = try { statusStore.termSessionMap().keys.joinToString(",") { it.take(8) } } catch (_: Exception) { "?" }
+            LOG.info("[ClaudeTabs][status] identity probe — ${contents.size} content(s), looking for TERM_SESSION_IDs [$candidates]: $report")
+        } catch (e: Exception) {
+            LOG.debug("[ClaudeTabs][status] identity probe failed: ${e.message}")
         }
     }
 
     /** The rotated (pre-canonicalisation) id aliased to [canonicalSid], if one is known. */
     private fun rawIdFor(canonicalSid: String): String =
         sessionAliases.entries.firstOrNull { it.value == canonicalSid }?.key ?: canonicalSid
+
+    /**
+     * Attach sessions to tabs by `TERM_SESSION_ID`, for the tabs the PID walk can't reach.
+     *
+     * On IntelliJ 2026.1's reworked terminal the PID route collapses: the platform hands out
+     * shell PIDs belonging to *empty* tabs while the tabs actually hosting Claude report no
+     * PID at all. Observed on a real install — `getAllTabs` returned three tabs whose shells
+     * were childless `zsh`, while six live Claude sessions hung off shells the enumeration
+     * never mentioned. `shell pid → child claude` can't work when the shell pid is wrong.
+     *
+     * `TERM_SESSION_ID` doesn't have that problem. The backend tab exposes it, every process
+     * the tab spawns inherits it, and the status hook records `TERM_SESSION_ID → sessionId`
+     * from inside the session. No PID anywhere in the chain.
+     *
+     * Additive: [sessionsAlreadyTracked] are the ones the PID walk did resolve, and they win
+     * — this only fills the gaps. Returns the sids it attached so the caller can keep them
+     * out of the prune.
+     */
+    private fun attachStatusTabs(
+        project: Project,
+        sessionsAlreadyTracked: Set<String>,
+    ): Set<String> {
+        val termMap = try { statusStore.termSessionMap() } catch (_: Exception) { emptyMap() }
+
+        val attached = mutableSetOf<String>()
+        val thisProjectHash = projectHash(project)
+
+        // Strategy 0 — tabs this plugin spawned, straight out of [spawnedWidgets].
+        //
+        // These are the ones that need the indicator most and that every other route
+        // misses. Measured on 2026.1: the tab managers reported 1 tab (an empty shell)
+        // while ContentManager held 4, and the three they didn't know about were exactly
+        // the three the plugin had spawned — their widgets carry no PID, and their
+        // `getSession()` throws.
+        //
+        // But the plugin created them, so it already holds the widget keyed by session id.
+        // No reflection, no PID, no TERM_SESSION_ID — just the handle we were given at
+        // spawn time.
+        for ((spawnSid, widget) in spawnedWidgets) {
+            val canonical = canonicalize(spawnSid)
+            if (canonical in sessionsAlreadyTracked || spawnSid in sessionsAlreadyTracked) continue
+            if (canonical in attached) continue
+            val name = try { StatusDecoration.strip(widget.terminalTitle.buildTitle()) } catch (_: Exception) { "" }
+            val handle = TabInfo(
+                content = null,
+                widget = widget,
+                pid = -1L,
+                reworkedSession = null,
+                reworkedTabId = null,
+                rawTabName = name,
+            )
+            tabForSession[canonical] = TrackedTab(handle, thisProjectHash)
+            baseNameForSession.putIfAbsent(
+                canonical,
+                storage.nameFor(canonical) ?: name.takeIf { it.isNotBlank() && !isGenericTabName(it) } ?: "Claude",
+            )
+            attached.add(canonical)
+        }
+
+        if (termMap.isEmpty()) return attached
+
+        try {
+            val tmCls = Class.forName("com.intellij.terminal.backend.TerminalTabsManager")
+            val tm = tmCls.getMethod("getInstance", Project::class.java).invoke(null, project) ?: return emptySet()
+            val backendTabs = invokeSuspend(tm, tmCls.methods.first { it.name == "getTerminalTabs" }) as? List<*>
+                ?: return emptySet()
+
+            // Frontend tabs pair with backend tabs by index — the same assumption getAllTabs
+            // makes. The Content is what carries the title we repaint.
+            val contents = mutableListOf<Content?>()
+            val views = mutableListOf<Any?>()
+            try {
+                val feMgrCls = Class.forName("com.intellij.terminal.frontend.toolwindow.TerminalToolWindowTabsManager")
+                val feMgr = feMgrCls.getMethod("getInstance", Project::class.java).invoke(null, project)
+                val feTabs = feMgr?.javaClass?.getMethod("getTabs")?.invoke(feMgr) as? List<*>
+                feTabs?.forEach { feTab ->
+                    contents.add(try { feTab?.javaClass?.getMethod("getContent")?.invoke(feTab) as? Content } catch (_: Exception) { null })
+                    views.add(try { feTab?.javaClass?.getMethod("getView")?.invoke(feTab) } catch (_: Exception) { null })
+                }
+            } catch (_: ClassNotFoundException) {
+                // Classic terminal only — no frontend view list to pair with.
+            }
+
+            backendTabs.forEachIndexed { index, tab ->
+                tab ?: return@forEachIndexed
+                try {
+                    val sessIdStr = tab.javaClass.getMethod("getSessionId").invoke(tab)?.toString()
+                        ?: return@forEachIndexed
+                    // The backend may report the id bare or wrapped (TerminalSessionId(uuid)),
+                    // so compare the same loose way handleTermSessionRename does.
+                    val sid = termMap.entries.firstOrNull { (termSessionId, _) ->
+                        sessIdStr == termSessionId ||
+                            sessIdStr.contains(termSessionId) ||
+                            termSessionId.contains(sessIdStr)
+                    }?.value ?: return@forEachIndexed
+
+                    val canonical = canonicalize(sid)
+                    if (canonical in sessionsAlreadyTracked || sid in sessionsAlreadyTracked) return@forEachIndexed
+
+                    val content = contents.getOrNull(index)
+                    val view = views.getOrNull(index)
+                    val widget = content?.let {
+                        try { TerminalToolWindowManager.findWidgetByContent(it) } catch (_: Exception) { null }
+                    }
+                    if (content == null && widget == null && view == null) return@forEachIndexed
+
+                    val name = tab.javaClass.getMethod("getName").invoke(tab) as? String ?: ""
+                    // pid = -1: this handle exists only to paint a title. It is never added
+                    // to the tab list poll() walks, so nothing tries to find a Claude under it.
+                    val handle = TabInfo(
+                        content = content,
+                        widget = widget,
+                        pid = -1L,
+                        reworkedSession = view,
+                        reworkedTabId = null,
+                        rawTabName = name,
+                    )
+                    tabForSession[canonical] = TrackedTab(handle, thisProjectHash)
+                    baseNameForSession.putIfAbsent(
+                        canonical,
+                        storage.nameFor(canonical) ?: handle.tabName.takeIf { it.isNotBlank() && !isGenericTabName(it) } ?: "Claude",
+                    )
+                    attached.add(canonical)
+                } catch (e: Exception) {
+                    LOG.debug("[ClaudeTabs][status] termsess attach failed for tab $index: ${e.message}")
+                }
+            }
+        } catch (_: ClassNotFoundException) {
+            // Reworked backend absent — the PID path is all there is on this IDE.
+        } catch (e: Exception) {
+            LOG.debug("[ClaudeTabs][status] termsess attach pass failed: ${e.message}")
+        }
+
+        // Strategy B — go through ContentManager instead of the tab managers.
+        //
+        // The managers above intermittently report zero tabs while ContentManager still
+        // holds every one of them (observed: `Backend has 0 tabs` alongside `contents=3`),
+        // which leaves Strategy A with nothing to read an id from. ContentManager keeps
+        // working, and its widgets expose `getSession()`, so the terminal id is reachable
+        // from there — just not under a name we can hard-code across IDE versions.
+        val stillUnmatched = termMap.keys.filter { termMap[it] !in attached }
+        if (stillUnmatched.isNotEmpty()) {
+            attached += attachViaContentManager(project, termMap, sessionsAlreadyTracked + attached, thisProjectHash)
+        }
+        return attached
+    }
+
+    /**
+     * Attach by scanning each terminal widget for a `TERM_SESSION_ID` we already know.
+     *
+     * Deliberately searches by value rather than by accessor name. The identity probe on
+     * 2026.1 found `TerminalWidgetBridge.getSession()` / `getTtyConnector()`, but the shape
+     * *inside* those has already changed twice across releases and hard-coding the next
+     * accessor name just buys one more version. What is stable is the value: the terminal's
+     * id is a UUID, and [known] already holds every UUID the hook has seen. So walk a couple
+     * of levels of zero-argument accessors and take the first object whose string form
+     * contains one of them.
+     */
+    private fun attachViaContentManager(
+        project: Project,
+        termMap: Map<String, String>,
+        alreadyTracked: Set<String>,
+        thisProjectHash: String,
+    ): Set<String> {
+        val attached = mutableSetOf<String>()
+        try {
+            val cmgr = TerminalToolWindowManager.getInstance(project).toolWindow?.contentManager ?: return attached
+            for (content in cmgr.contents) {
+                val widget = try { TerminalToolWindowManager.findWidgetByContent(content) } catch (_: Exception) { null }
+                    ?: continue
+                val termSessionId = findKnownIdentifier(widget, termMap.keys) ?: continue
+                val sid = termMap[termSessionId] ?: continue
+                val canonical = canonicalize(sid)
+                if (canonical in alreadyTracked || sid in alreadyTracked) continue
+
+                val name = try { content.displayName ?: "" } catch (_: Exception) { "" }
+                val handle = TabInfo(
+                    content = content,
+                    widget = widget,
+                    pid = -1L,
+                    reworkedSession = null,
+                    reworkedTabId = null,
+                    rawTabName = name,
+                )
+                tabForSession[canonical] = TrackedTab(handle, thisProjectHash)
+                baseNameForSession.putIfAbsent(
+                    canonical,
+                    storage.nameFor(canonical) ?: handle.tabName.takeIf { it.isNotBlank() && !isGenericTabName(it) } ?: "Claude",
+                )
+                attached.add(canonical)
+                LOG.info("[ClaudeTabs][status] attached '${handle.tabName}' → ${canonical.take(8)} via ContentManager widget scan (TERM_SESSION_ID=${termSessionId.take(8)})")
+            }
+        } catch (e: Exception) {
+            LOG.debug("[ClaudeTabs][status] ContentManager attach failed: ${e.message}")
+        }
+        return attached
+    }
+
+    /**
+     * Breadth-first search from [root] for an object whose string form contains one of
+     * [known], following zero-argument accessors.
+     *
+     * Bounded hard: only members that could plausibly hold a session identity are followed,
+     * and the walk stops at [maxNodes]. Reflection over an arbitrary object graph is exactly
+     * the kind of thing that silently becomes a per-poll performance problem, and a widget
+     * transitively reaches the whole editor.
+     */
+    private fun findKnownIdentifier(root: Any, known: Set<String>, maxNodes: Int = 40): String? {
+        if (known.isEmpty()) return null
+        val queue = ArrayDeque<Pair<Any, Int>>().apply { add(root to 0) }
+        val seen = java.util.Collections.newSetFromMap(java.util.IdentityHashMap<Any, Boolean>())
+        var visited = 0
+
+        while (queue.isNotEmpty() && visited < maxNodes) {
+            val (node, depth) = queue.removeFirst()
+            if (!seen.add(node)) continue
+            visited++
+
+            val asText = try { node.toString() } catch (_: Exception) { "" }
+            if (asText.length <= 512) {
+                known.firstOrNull { asText.contains(it) }?.let { return it }
+            }
+            if (depth >= 2) continue
+
+            for (m in node.javaClass.methods) {
+                if (m.parameterCount != 0) continue
+                val n = m.name.lowercase()
+                if (!(n.startsWith("getsession") || n == "getid" || n == "getsessionid" ||
+                        n == "getttyconnector" || n == "getttyconnectoraccessor" || n == "get")
+                ) continue
+                val child = try {
+                    m.isAccessible = true
+                    m.invoke(node)
+                } catch (_: Throwable) { null } ?: continue
+                queue.add(child to depth + 1)
+            }
+        }
+        return null
+    }
 
     // ══════════════════════════════════════════════════════════════
     // TERMINAL TAB ACCESS — stable API, all panels
@@ -1883,6 +2334,9 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         val tabs = getAllTabs(project)
 
         for (tab in tabs) {
+            // The Remote Control tab hosts a server, not a chat. Its Claude process — and
+            // any session that process pre-creates — belongs to the server, not the tab.
+            if (tab.pid in remoteControlShellPids) continue
             val claudeProcess = findClaudeChild(tab.pid) ?: continue
             val claudePid = claudeProcess.pid()
             val sf = File(SESSIONS_DIR, "$claudePid.json")
@@ -2064,6 +2518,9 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         val tabWalkSeenSids = mutableSetOf<String>()
 
         for (tab in tabs) {
+            // The Remote Control tab hosts a server, not a chat. Its Claude process — and
+            // any session that process pre-creates — belongs to the server, not the tab.
+            if (tab.pid in remoteControlShellPids) continue
             val claudeProcess = findClaudeChild(tab.pid) ?: continue
             val claudePid = claudeProcess.pid()
 
@@ -2220,6 +2677,22 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             activeSessions.add(SavedSession(sessionId, cwd, title, bypass))
             tabWalkOwnedSids.add(sessionId)
             claimedByTabWalk[sessionId] = projectHash(project)
+        }
+
+        // Retry the spare-terminal sweep while its window is open — see
+        // closeIdeDefaultTerminal for why one shot at restore time isn't enough.
+        if (c.restoreFired && !c.defaultTerminalSweepDone && c.restoreFiredAt > 0) {
+            closeIdeDefaultTerminal(project)
+        }
+
+        // Fill in the tabs the PID walk couldn't reach, by TERM_SESSION_ID. On the reworked
+        // terminal this is what actually attaches the indicator — see the method doc.
+        val termAttached = attachStatusTabs(project, tabWalkSeenSids)
+        if (termAttached.isNotEmpty()) {
+            tabWalkSeenSids.addAll(termAttached)
+            if (c.pollCount % 12 == 0) {
+                LOG.info("[ClaudeTabs][status] attached ${termAttached.size} tab(s) the PID walk missed: ${termAttached.joinToString { it.take(8) }}")
+            }
         }
 
         // Drop status bookkeeping for tabs this window no longer has, so the fast loop
@@ -2930,11 +3403,25 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         val c = ctx(project)
         if (c.restoreFired || c.pendingRestores.isEmpty()) return
 
-        // Settle delay — let Rider finish restoring its own remembered tab titles before we
-        // start closing/creating tabs, so we see the full leftover set.
+        // Settle — let the IDE finish restoring its own remembered tab titles before we start
+        // closing/creating tabs, so we see the full leftover set.
+        //
+        // Waits for the tool window to stop changing rather than for a fixed five seconds:
+        // the tabs are normally in place in well under a second, and the remainder was dead
+        // time the user sat watching (five of the nine seconds from plugin start to the first
+        // tab appearing). The old constant survives as the ceiling.
         val now = System.currentTimeMillis()
         val ageMs = if (c.pendingRestoresLoadedAt > 0) now - c.pendingRestoresLoadedAt else 0
-        if (ageMs < RESTORE_SETTLE_MS) return
+        val contentCount = try {
+            TerminalToolWindowManager.getInstance(project).toolWindow?.contentManager?.contents?.size ?: 0
+        } catch (_: Exception) { 0 }
+        if (contentCount != c.lastContentCount) {
+            c.lastContentCount = contentCount
+            c.lastContentChangeAt = now
+        }
+        val quietMs = if (c.lastContentChangeAt > 0) now - c.lastContentChangeAt else 0
+        if (!ClaudeTabsHelpers.shouldFireRestore(ageMs, quietMs, ceilingMs = RESTORE_SETTLE_MS)) return
+        LOG.info("[ClaudeTabs] Restore settling done after ${ageMs}ms (terminal contents=$contentCount, unchanged for ${quietMs}ms)")
 
         val sessions = c.pendingRestores.toList()
         val savedTabNames = sessions.map { it.tabName }.toSet()
@@ -2983,8 +3470,18 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         // Step 2: Spawn a fresh tab per saved session. The sessionId is bound to the tab
         // at creation time, so we cannot type the wrong resume command into the wrong tab.
         val restored = mutableListOf<SavedSession>()
+        val live = liveSessionsNow()
         for (s in sessions) {
             if (s.sessionId in c.spawnedForSession) continue
+            // Never resume a conversation that is already open. See
+            // ClaudeTabsHelpers.shouldRestoreSession — without this, reloading the project
+            // (which is what installing the plugin does) spawns a duplicate tab for every
+            // session that is still running in the tab it has always been in.
+            if (!ClaudeTabsHelpers.shouldRestoreSession(s.sessionId, live)) {
+                c.spawnedForSession.add(s.sessionId)
+                LOG.info("[ClaudeTabs] Restore SKIPPED for '${s.tabName}' (${s.sessionId.take(8)}) — that session is already running; restoring it would open a duplicate tab")
+                continue
+            }
             if (spawnNewTabAndRestore(project, s)) {
                 c.spawnedForSession.add(s.sessionId)
                 restored.add(s)
@@ -2998,6 +3495,8 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             c.restoredThisRun.addAll(restored)
             writeLastRestoreSnapshot(project)
             LOG.info("[ClaudeTabs] Restore complete: spawned ${restored.size} fresh tab(s)")
+            c.restoreFiredAt = System.currentTimeMillis()
+            closeIdeDefaultTerminal(project)
         }
 
         // Delete restore file so a future poll's saveState doesn't see stale entries.
@@ -3126,6 +3625,326 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         } catch (e: Throwable) {
             LOG.warn("[ClaudeTabs] spawnNewTabAndRestore failed for '${s.tabName}': ${e.message}")
             false
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // REMOTE CONTROL
+    // ══════════════════════════════════════════════════════════════
+
+    /**
+     * Start `claude remote-control` for [project] in its own terminal tab, unless one is
+     * already serving this directory.
+     *
+     * Runs once per project per IDE start, after the restore spawn has settled, so it never
+     * competes with restored tabs for focus or for the terminal tool window's attention.
+     *
+     * A dedicated tab rather than a background process: Remote Control prints the
+     * connection state and accepts keystrokes at runtime (`w` toggles worktree mode), so it
+     * has to be somewhere the user can actually see and reach. It is a terminal tab like any
+     * other, which keeps the promise that the plugin adds no UI of its own.
+     */
+    private fun startRemoteControlTab(project: Project) {
+        val c = ctx(project)
+        // Re-check the cheap in-run guard on the EDT. The decision was made off-thread, so
+        // two windows of the same project could have raced through it; the expensive lsof
+        // probe is deliberately not repeated here.
+        if (c.remoteControlStarted) {
+            LOG.info("[ClaudeTabs][rc] Not starting Remote Control — already started for this project in this IDE run")
+            return
+        }
+        // Set before spawning: a spawn that throws must not leave the door open for the
+        // next attempt to retry forever.
+        c.remoteControlStarted = true
+
+        if (remoteControl.isBackground) {
+            startRemoteControlHeadless(project)
+            return
+        }
+
+        val cmd = RemoteControlLauncher.buildCommand(remoteControl, project.name)
+        try {
+            val mgr = TerminalToolWindowManager.getInstance(project)
+            val widget = createNewSessionReflective(mgr, project.basePath, "Remote Control", null, false, false)
+            extractPidFromWidget(widget)?.let { remoteControlShellPids.add(it) }
+            // Pin the title: this tab has no Claude chat whose name should surface, and
+            // leaving it generic would let the names.json re-apply logic rename it.
+            try {
+                widget.terminalTitle.change { userDefinedTitle = "Remote Control" }
+            } catch (e: Exception) {
+                LOG.debug("[ClaudeTabs][rc] title pin failed: ${e.message}")
+            }
+            ApplicationManager.getApplication().invokeLater {
+                try {
+                    widget.sendCommandToExecute(cmd)
+                    LOG.info("[ClaudeTabs][rc] Started Remote Control for '${project.name}' at ${project.basePath} — `$cmd`. Local sessions are now controllable from claude.ai/code and the Claude mobile app; set remoteControl.enabled=false in ~/.claude/rider-plugin/config.json to stop this.")
+                } catch (e: Exception) {
+                    LOG.warn("[ClaudeTabs][rc] sendCommandToExecute failed: ${e.message}")
+                }
+            }
+        } catch (e: Throwable) {
+            LOG.warn("[ClaudeTabs][rc] Failed to start Remote Control: ${e.message}")
+        }
+    }
+
+    /**
+     * Start Remote Control as a detached process with no terminal tab
+     * (`remoteControl.mode = "background"`).
+     *
+     * Output goes to `~/.claude/rider-plugin/remote-control-<projectHash>.log` — without a
+     * tab there is nowhere else for the connection URL, or for whatever it says if it
+     * refuses to run without a TTY, to appear. The process is killed when the project
+     * closes, so a hidden server can't outlive the window that started it.
+     */
+    private fun startRemoteControlHeadless(project: Project) {
+        val argv = RemoteControlLauncher.buildArgv(remoteControl, project.name)
+        val log = File(STATE_DIR, "remote-control-${projectHash(project)}.log")
+        val lock = remoteControlLockFile(project)
+        try {
+            log.parentFile?.mkdirs()
+            // A pty, not a plain pipe. Remote Control is an interactive program: without a
+            // terminal on the other end it exits at once, which is what made the first
+            // attempt at this mode look simply broken. pty4j ships with the platform (it is
+            // what the IDE's own terminal runs on), so there is a real pty available; it is
+            // reached reflectively so a missing or moved class degrades to the pipe rather
+            // than failing the whole startup path.
+            val process = startInPty(argv, File(project.basePath!!), log)
+                ?: ProcessBuilder(argv)
+                    .directory(File(project.basePath!!))
+                    .redirectErrorStream(true)
+                    .redirectOutput(ProcessBuilder.Redirect.appendTo(log))
+                    .start()
+
+            try {
+                lock.parentFile?.mkdirs()
+                lock.writeText("""{"pid":${process.pid()},"startedAt":${System.currentTimeMillis()},"cwd":"${esc(project.basePath!!)}"}""")
+            } catch (e: Exception) {
+                LOG.debug("[ClaudeTabs][rc] lock write failed: ${e.message}")
+            }
+
+            Disposer.register(project as Disposable) {
+                // Kill the tree, not just the shell we hold. `$SHELL -l -i -c` means the
+                // server is a *child* of the process we started, so destroying only the
+                // parent leaves the real server reparented to launchd — observed as
+                // `ppid=1` remote-control shells surviving across IDE restarts, which then
+                // look to the duplicate check like a server that is already serving.
+                if (process.isAlive) {
+                    val descendants = try { process.toHandle().descendants().toList() } catch (_: Exception) { emptyList() }
+                    descendants.forEach { runCatching { it.destroy() } }
+                    process.destroy()
+                    LOG.info("[ClaudeTabs][rc] Stopped background Remote Control (pid ${process.pid()} + ${descendants.size} child process(es)) — project closed")
+                }
+                try { lock.delete() } catch (_: Exception) { }
+            }
+            LOG.info("[ClaudeTabs][rc] Started background Remote Control for '${project.name}' (pid ${process.pid()}), no tab. Output: ${log.absolutePath}. Set remoteControl.enabled=false in ~/.claude/rider-plugin/config.json to stop this.")
+            // A server that dies on startup (no pty, `claude` not on PATH, already-bound
+            // port) would otherwise be indistinguishable from one running fine.
+            if (process.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)) {
+                LOG.warn("[ClaudeTabs][rc] Background Remote Control exited immediately with code ${process.exitValue()} — see ${log.absolutePath}. Falling back is not automatic; set remoteControl.mode=\"tab\" if it needs a visible terminal.")
+                try { lock.delete() } catch (_: Exception) { }
+            }
+        } catch (e: Exception) {
+            LOG.warn("[ClaudeTabs][rc] Background start failed (${argv.joinToString(" ")}): ${e.message}")
+        }
+    }
+
+    /**
+     * Start [argv] attached to a real pseudo-terminal, draining its output into [log].
+     *
+     * Returns null if pty4j isn't reachable, leaving the caller to fall back to a pipe.
+     * Reflective on purpose: pty4j is a platform library rather than a declared dependency,
+     * and this whole feature is optional — a class that moved between IDE builds must not
+     * take the startup path down with it.
+     */
+    private fun startInPty(argv: List<String>, dir: File, log: File): Process? = try {
+        val builderCls = Class.forName("com.pty4j.PtyProcessBuilder")
+        val builder = builderCls.getConstructor(Array<String>::class.java).newInstance(argv.toTypedArray())
+        builderCls.getMethod("setDirectory", String::class.java).invoke(builder, dir.absolutePath)
+        builderCls.getMethod("setRedirectErrorStream", Boolean::class.javaPrimitiveType).invoke(builder, true)
+        // Inherit the IDE's environment and mark it a terminal, which is what the program
+        // checks for.
+        val env = HashMap(System.getenv()).apply { put("TERM", "xterm-256color") }
+        builderCls.getMethod("setEnvironment", Map::class.java).invoke(builder, env)
+        val process = builderCls.getMethod("start").invoke(builder) as Process
+
+        // Something has to read the pty or the buffer fills and the program blocks.
+        Thread {
+            try {
+                process.inputStream.use { input ->
+                    java.io.FileOutputStream(log, true).use { out -> input.copyTo(out) }
+                }
+            } catch (_: Exception) { /* process ended */ }
+        }.apply { isDaemon = true; name = "ClaudeTabs-rc-drain" }.start()
+
+        LOG.info("[ClaudeTabs][rc] Background Remote Control running under a pty (pid ${process.pid()})")
+        process
+    } catch (e: Throwable) {
+        // Unwrap: a reflective call reports everything as InvocationTargetException, whose
+        // own message is null. The first attempt logged exactly that and said nothing about
+        // the actual failure, which was a missing executable.
+        val cause = (e as? java.lang.reflect.InvocationTargetException)?.targetException ?: e
+        LOG.info("[ClaudeTabs][rc] pty unavailable (${cause.javaClass.simpleName}: ${cause.message}) — falling back to a plain pipe, which Remote Control may refuse")
+        null
+    }
+
+    /** `rc-<projectHash>.lock` — the pid of the background server this project started. */
+    private fun remoteControlLockFile(project: Project) = File(STATE_DIR, "rc-${projectHash(project)}.lock")
+
+    /**
+     * True if the server recorded in this project's lock file is still running.
+     *
+     * The argv-plus-`lsof` scan was the only duplicate check, and the log shows it never
+     * once fired: Remote Control was started seven times across restarts, twice within a
+     * single IDE run, with no "already serving" skip. A recorded pid is decidable without
+     * depending on argv being readable or on `lsof` output shape.
+     */
+    private fun remoteControlAlreadyRunning(project: Project): Boolean {
+        val lock = remoteControlLockFile(project)
+        if (!lock.exists()) return false
+        return try {
+            val text = lock.readText()
+            val pid = Regex(""""pid"\s*:\s*(\d+)""").find(text)?.groupValues?.get(1)?.toLongOrNull()
+                ?: return false.also { lock.delete() }
+            val handle = ProcessHandle.of(pid).orElse(null)
+            if (handle == null || !handle.isAlive) {
+                lock.delete()
+                return false
+            }
+            // Guard against a recycled pid now belonging to something else entirely.
+            val cmdLine = handle.info().commandLine().orElse("")
+            val stillOurs = cmdLine.isBlank() || RemoteControlLauncher.looksLikeRemoteControl(cmdLine)
+            if (!stillOurs) lock.delete()
+            stillOurs
+        } catch (e: Exception) {
+            LOG.debug("[ClaudeTabs][rc] lock check failed: ${e.message}")
+            false
+        }
+    }
+
+    /**
+     * True if some already-running process is a Remote Control server for [basePath].
+     *
+     * Covers both a server the user started by hand in another terminal and one left over
+     * from a previous IDE window; two servers for one directory is never wanted.
+     *
+     * A process's working directory isn't exposed by [ProcessHandle], so it's read via
+     * `lsof` on Unix. That's a subprocess, but this runs once per project startup over the
+     * handful of processes that look like Remote Control at all. On Windows there's no
+     * equivalent cheap probe, so the answer is "no" and the in-run guard is what prevents
+     * duplicates — the worst case there is a second server after an IDE restart.
+     */
+    private fun isRemoteControlServing(basePath: String?): Boolean {
+        if (basePath.isNullOrBlank()) return false
+        if (System.getProperty("os.name").orEmpty().startsWith("Windows", ignoreCase = true)) return false
+        return try {
+            val target = File(basePath).canonicalPath
+            ProcessHandle.allProcesses()
+                .filter { it.isAlive }
+                .filter { h ->
+                    val info = h.info()
+                    SessionsDirScanner.looksLikeClaude(
+                        SessionsDirScanner.ProcessInfo(
+                            command = info.command().orElse(""),
+                            commandLine = info.commandLine().orElse(""),
+                        )
+                    ) && RemoteControlLauncher.looksLikeRemoteControl(info.commandLine().orElse(""))
+                }
+                .anyMatch { h -> processCwd(h.pid())?.let { it == target } == true }
+        } catch (e: Exception) {
+            LOG.debug("[ClaudeTabs][rc] running-server probe failed: ${e.message}")
+            false
+        }
+    }
+
+    /** Working directory of [pid] via `lsof`, or null if it can't be determined. */
+    private fun processCwd(pid: Long): String? = try {
+        val p = ProcessBuilder("lsof", "-a", "-p", pid.toString(), "-d", "cwd", "-Fn")
+            .redirectErrorStream(true)
+            .start()
+        val out = p.inputStream.bufferedReader().readText()
+        if (!p.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)) p.destroyForcibly()
+        // -Fn output is one field per line; the cwd path line starts with 'n'.
+        out.lineSequence()
+            .firstOrNull { it.startsWith("n/") }
+            ?.removePrefix("n")
+            ?.let { File(it).canonicalPath }
+    } catch (e: Exception) {
+        LOG.debug("[ClaudeTabs][rc] lsof for pid $pid failed: ${e.message}")
+        null
+    }
+
+    /**
+     * Close the empty terminal the IDE opened for itself, so reopening leaves the same
+     * number of terminals there were on close.
+     *
+     * See [ClaudeTabsHelpers.isDisposableDefaultTerminal] for why each guard is there. The
+     * short version: only a shell with nothing running in it, still under its default name,
+     * and only once real tabs are back.
+     */
+    private fun closeIdeDefaultTerminal(project: Project) {
+        val c = ctx(project)
+        if (c.defaultTerminalSweepDone) return
+        // Give up after the window: past that point a spare terminal is just a terminal the
+        // user has been looking at, and closing it would be a surprise rather than tidying.
+        if (c.restoreFiredAt > 0 && System.currentTimeMillis() - c.restoreFiredAt > DEFAULT_TERMINAL_SWEEP_WINDOW_MS) {
+            c.defaultTerminalSweepDone = true
+            LOG.info("[ClaudeTabs] Default-terminal sweep window closed without finding an empty default tab")
+            return
+        }
+        try {
+            val mgr = TerminalToolWindowManager.getInstance(project)
+            val ourWidgets = spawnedWidgets.values.toSet()
+
+            // Via getAllTabs, not by walking ContentManager and asking the widget for a pid.
+            // The first attempt did the latter and never fired: the IDE's default tab reports
+            // its pid through the *backend session*, not the widget
+            // (`STEP 3b: [로컬→PID67036(sess)]` alongside `skipNoPid=2`), so the pid always
+            // came back null and every tab was skipped. getAllTabs already tries both routes.
+            // Every candidate is reported with the value of each guard. Two builds in a row
+            // this silently did nothing, and each time the reason was a single input being
+            // something other than assumed — with no way to tell which from the log.
+            val tabs = getAllTabs(project)
+            val verdicts = mutableListOf<String>()
+
+            for (tab in tabs) {
+                val name = tab.tabName
+                val content = tab.content
+                val pid = tab.pid
+                if (content == null) { verdicts.add("'$name'(no-content)"); continue }
+                if (pid <= 0) { verdicts.add("'$name'(no-pid)"); continue }
+
+                val children = try {
+                    ProcessHandle.of(pid).orElse(null)?.children()?.toList()
+                } catch (_: Exception) { null }
+                // A pid we can't inspect is treated as busy: an unclosed spare tab is a much
+                // smaller problem than closing live work.
+                val childCount = children?.size ?: 1
+                val childNames = children?.joinToString(",") { it.info().command().orElse("?").substringAfterLast('/') } ?: "unreadable"
+                val generic = isGenericTabName(name)
+                val hasClaude = findClaudeChild(pid) != null
+                val spawned = tab.widget != null && tab.widget in ourWidgets
+
+                val disposable = ClaudeTabsHelpers.isDisposableDefaultTerminal(
+                    restoredAny = true,
+                    isGenericName = generic,
+                    hasClaude = hasClaude,
+                    childProcessCount = childCount,
+                    isPluginSpawned = spawned,
+                )
+                verdicts.add("'$name'(pid=$pid generic=$generic claude=$hasClaude children=$childCount[$childNames] ours=$spawned → ${if (disposable) "CLOSE" else "keep"})")
+                if (!disposable) continue
+
+                try {
+                    mgr.closeTab(content)
+                    c.defaultTerminalSweepDone = true
+                    LOG.info("[ClaudeTabs] Closed the IDE's empty default terminal '$name' (pid=$pid, no children) — it is created at startup and would otherwise leave one tab more than before the restart")
+                } catch (e: Exception) {
+                    LOG.warn("[ClaudeTabs] closeTab failed for '$name': ${e.message}")
+                }
+            }
+            LOG.info("[ClaudeTabs] Default-terminal sweep — ${tabs.size} tab(s) considered: ${verdicts.joinToString(" | ").ifBlank { "none" }}")
+        } catch (e: Exception) {
+            LOG.debug("[ClaudeTabs] default-terminal cleanup failed: ${e.message}")
         }
     }
 
@@ -3290,6 +4109,55 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
     // ══════════════════════════════════════════════════════════════
     // CLAUDE DETECTION
     // ══════════════════════════════════════════════════════════════
+
+    /**
+     * Every Claude session running on this machine right now, with both the id its process
+     * reports and the canonical id it resolves to.
+     *
+     * Used by the restore path to avoid resuming a conversation that is already open. Reads
+     * the same `~/.claude/sessions/<pid>.json` files as everything else and keeps only live,
+     * genuinely-Claude processes — a stale file from a crashed process must not make a
+     * restorable session look alive.
+     */
+    private fun liveSessionsNow(): List<ClaudeTabsHelpers.LiveSession> = liveSessionsNow(includeNonInteractive = true)
+
+    /**
+     * @param includeNonInteractive when true, background agents / daemon / desktop / remote
+     * sessions are included. The restore path wants them: a live background agent is a
+     * reason NOT to restore its session, even though it could never have been a tab.
+     */
+    private fun liveSessionsNow(includeNonInteractive: Boolean): List<ClaudeTabsHelpers.LiveSession> {
+        val out = mutableListOf<ClaudeTabsHelpers.LiveSession>()
+        try {
+            for (sf in SESSIONS_DIR.listFiles { f -> f.name.endsWith(".json") } ?: emptyArray()) {
+                val pid = sf.nameWithoutExtension.toLongOrNull() ?: continue
+                val handle = ProcessHandle.of(pid).orElse(null) ?: continue
+                if (!handle.isAlive) continue
+                val info = handle.info()
+                val looksClaude = SessionsDirScanner.looksLikeClaude(
+                    SessionsDirScanner.ProcessInfo(
+                        command = info.command().orElse(""),
+                        commandLine = info.commandLine().orElse(""),
+                    )
+                )
+                if (!looksClaude) continue
+                val text = try { sf.readText() } catch (_: Exception) { continue }
+                val rawSid = extractJsonString(text, "sessionId") ?: continue
+                val cwd = extractJsonString(text, "cwd") ?: continue
+                if (!includeNonInteractive &&
+                    !ClaudeTabsHelpers.isTerminalTabSessionKind(extractJsonString(text, "kind"))
+                ) continue
+                val startedAt = Regex(""""startedAt":(\d+)""").find(text)?.groupValues?.get(1)
+                    ?.toLongOrNull() ?: System.currentTimeMillis()
+                out.add(
+                    ClaudeTabsHelpers.LiveSession(rawSid, canonicalSessionIdFor(pid, cwd, rawSid, startedAt))
+                )
+            }
+        } catch (e: Exception) {
+            LOG.debug("[ClaudeTabs] liveSessionsNow failed: ${e.message}")
+        }
+        return out
+    }
 
     /**
      * Find the currently-alive Claude process PID that owns the given [sessionId],

@@ -105,3 +105,52 @@ class SessionKindFilterTest {
         assertTrue(scan(dir, "/Users/x/projects").statusLine().contains("skipNotInteractive=1"))
     }
 }
+
+/**
+ * Recognising the Claude CLI by its executable path.
+ *
+ * The installed CLI is a versioned binary whose filename is the version, not "claude".
+ * Sessions the daemon launches run it directly instead of through the `~/.local/bin/claude`
+ * shim, so every name-based check misses them — and a live background agent reading as
+ * "dead" is what made the restore path try `claude --resume` on a session that was still
+ * running, which Claude refuses outright.
+ */
+class ClaudeProcessRecognitionTest {
+
+    private fun info(command: String, commandLine: String = command) =
+        SessionsDirScanner.ProcessInfo(command, commandLine)
+
+    @Test fun recognisesTheVersionedBinaryTheDaemonLaunches() {
+        // Observed verbatim for a live background agent (pid 79242).
+        assertTrue(
+            SessionsDirScanner.looksLikeClaude(
+                info(
+                    "/Users/x/.local/share/claude/versions/2.1.226",
+                    "/Users/x/.local/share/claude/versions/2.1.226 --session-id 28f38574-9879-48d7-924c-c821967d7f13 --fork-session",
+                )
+            )
+        )
+    }
+
+    @Test fun recognisesTheBundledAppWrapper() {
+        assertTrue(
+            SessionsDirScanner.looksLikeClaude(
+                info("/Users/x/.local/share/claude/ClaudeCode.app/Contents/MacOS/claude")
+            )
+        )
+    }
+
+    @Test fun stillRecognisesTheOrdinaryShim() {
+        assertTrue(SessionsDirScanner.looksLikeClaude(info("/Users/x/.local/bin/claude", "claude --dangerously-skip-permissions")))
+        assertTrue(SessionsDirScanner.looksLikeClaude(info("claude")))
+        assertTrue(SessionsDirScanner.looksLikeClaude(info("C:\\bin\\claude.exe")))
+    }
+
+    @Test fun doesNotClaimUnrelatedProcesses() {
+        assertFalse(SessionsDirScanner.looksLikeClaude(info("/bin/zsh", "/bin/zsh --login -i")))
+        assertFalse(SessionsDirScanner.looksLikeClaude(info("/usr/bin/git", "git status")))
+        // A path merely mentioning claude isn't the CLI — the install-root match is anchored
+        // on the real layout, not on the word appearing anywhere.
+        assertFalse(SessionsDirScanner.looksLikeClaude(info("/Users/x/projects/claude-notes/bin/tool", "tool")))
+    }
+}

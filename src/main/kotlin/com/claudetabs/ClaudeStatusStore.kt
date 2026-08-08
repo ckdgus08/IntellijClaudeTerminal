@@ -52,6 +52,41 @@ internal class ClaudeStatusStore(claudeHome: File) {
         return result
     }
 
+    /**
+     * `TERM_SESSION_ID` → Claude `sessionId`, from the `termsess-*.json` files the hook
+     * writes alongside the session-keyed ones.
+     *
+     * This is the PID-free bridge between a terminal tab and the session running in it, and
+     * on IntelliJ 2026.1's reworked terminal it is the only one that works: the platform
+     * reports shell PIDs for the wrong tabs (empty shells) and none at all for the tabs that
+     * actually host Claude, so walking `shell pid → child claude` finds nothing. The tab's
+     * own `TERM_SESSION_ID` is stable and is inherited by every process the tab spawns, so
+     * the hook can record the mapping from the inside.
+     *
+     * Only sessions that have fired at least one hook appear here — a session started before
+     * the hooks were installed has no entry until it restarts.
+     */
+    fun termSessionMap(): Map<String, String> {
+        val files = statusDir.listFiles { f -> f.isFile && f.name.startsWith("termsess-") && f.name.endsWith(".json") }
+            ?: return emptyMap()
+        val out = mutableMapOf<String, String>()
+        val seenAt = mutableMapOf<String, Long>()
+        for (f in files) {
+            val termSessionId = f.nameWithoutExtension.removePrefix("termsess-")
+            val text = try { f.readText() } catch (_: Exception) { continue }
+            val sid = ClaudeTabsHelpers.extractJsonString(text, "sessionId")?.takeIf { it.isNotBlank() } ?: continue
+            val ts = Regex(""""ts"\s*:\s*(\d+)""").find(text)?.groupValues?.get(1)?.toLongOrNull()
+                ?: f.lastModified()
+            // A terminal is reused across sessions (the user exits Claude and starts it
+            // again in the same tab), so the newest write is the session in it now.
+            if (ts >= (seenAt[termSessionId] ?: Long.MIN_VALUE)) {
+                out[termSessionId] = sid
+                seenAt[termSessionId] = ts
+            }
+        }
+        return out
+    }
+
     /** `status/<sessionId>.json` → `{"event":"Stop","sessionId":"...","ts":1786179029939}`. */
     private fun readHookSignals(): Map<String, StatusResolver.HookSignal> {
         val files = statusDir.listFiles { f -> f.isFile && f.name.endsWith(".json") } ?: return emptyMap()
@@ -67,8 +102,10 @@ internal class ClaudeStatusStore(claudeHome: File) {
                 ?: f.nameWithoutExtension
             val ts = Regex(""""ts"\s*:\s*(\d+)""").find(text)?.groupValues?.get(1)?.toLongOrNull()
                 ?: f.lastModified()
+            // Only SessionStart carries one; blank for everything else.
+            val source = ClaudeTabsHelpers.extractJsonString(text, "source")?.takeIf { it.isNotBlank() }
             val existing = out[sid]
-            if (existing == null || ts >= existing.ts) out[sid] = StatusResolver.HookSignal(event, ts)
+            if (existing == null || ts >= existing.ts) out[sid] = StatusResolver.HookSignal(event, ts, source)
         }
         return out
     }
