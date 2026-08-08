@@ -87,6 +87,43 @@ internal class ClaudeStatusStore(claudeHome: File) {
         return out
     }
 
+    /**
+     * `oldSessionId → newSessionId` for sessions that were replaced in place.
+     *
+     * `/clear` does not end anything the user can see: the terminal, the process and the tab
+     * all survive, and only Claude's session id rotates. The old id gets a `SessionEnd` hook
+     * and vanishes from `sessions/<pid>.json`, so anything still bound to it resolves to
+     * [ClaudeStatus.EXITED] and stays there — a live conversation sitting under a `✕`.
+     * Observed exactly that way:
+     *
+     *   70000004  SessionEnd  pid=12001          ← the hook record
+     *   sessions/12001.json → 10000002, busy     ← same process, new session
+     *
+     * The pid is the join. A process outlives the session ids it runs, so a `SessionEnd`
+     * whose pid now hosts a *different, live* session means "replaced", not "gone". Nothing
+     * else on disk links the two: the new session gets its own transcript and its own hook
+     * file, and `termsess-*.json` only ever keeps the newest id per terminal.
+     */
+    fun supersededSessions(
+        isAlive: (Long) -> Boolean = { pid -> ProcessHandle.of(pid).map { it.isAlive }.orElse(false) },
+    ): Map<String, String> {
+        val files = statusDir.listFiles { f -> f.isFile && f.name.endsWith(".json") } ?: return emptyMap()
+        val out = mutableMapOf<String, String>()
+        for (f in files) {
+            if (f.name.startsWith("termsess-")) continue
+            val text = try { f.readText() } catch (_: Exception) { continue }
+            if (ClaudeTabsHelpers.extractJsonString(text, "event") != "SessionEnd") continue
+            val oldSid = ClaudeTabsHelpers.extractJsonString(text, "sessionId") ?: continue
+            val pid = Regex(""""pid"\s*:\s*(\d+)""").find(text)?.groupValues?.get(1)?.toLongOrNull() ?: continue
+            if (!isAlive(pid)) continue
+            val sessionText = try { File(sessionsDir, "$pid.json").readText() } catch (_: Exception) { continue }
+            val newSid = ClaudeTabsHelpers.extractJsonString(sessionText, "sessionId") ?: continue
+            if (newSid.isBlank() || newSid == oldSid) continue
+            out[oldSid] = newSid
+        }
+        return out
+    }
+
     /** `status/<sessionId>.json` → `{"event":"Stop","sessionId":"...","ts":1786179029939}`. */
     private fun readHookSignals(): Map<String, StatusResolver.HookSignal> {
         val files = statusDir.listFiles { f -> f.isFile && f.name.endsWith(".json") } ?: return emptyMap()
@@ -104,8 +141,11 @@ internal class ClaudeStatusStore(claudeHome: File) {
                 ?: f.lastModified()
             // Only SessionStart carries one; blank for everything else.
             val source = ClaudeTabsHelpers.extractJsonString(text, "source")?.takeIf { it.isNotBlank() }
+            val notificationType = ClaudeTabsHelpers.extractJsonString(text, "notificationType")?.takeIf { it.isNotBlank() }
             val existing = out[sid]
-            if (existing == null || ts >= existing.ts) out[sid] = StatusResolver.HookSignal(event, ts, source)
+            if (existing == null || ts >= existing.ts) {
+                out[sid] = StatusResolver.HookSignal(event, ts, source, notificationType)
+            }
         }
         return out
     }
