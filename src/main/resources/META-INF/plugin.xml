@@ -30,11 +30,11 @@
       <li><code>/tabs-clear</code> — clear the rename cache</li>
     </ul>
 
-    <p><b>Requirements:</b> Rider / IntelliJ 2024.3+ with the bundled Terminal plugin, and
+    <p><b>Requirements:</b> Rider / IntelliJ 2026.1+ with the bundled Terminal plugin, and
     <a href="https://docs.claude.com/s/claude-code">Claude Code CLI</a> installed. Currently Windows-focused
     (the session-detection logic uses <code>tasklist</code>); macOS / Linux compatibility is in progress.</p>
 
-    <p><b>Compatibility:</b> Rider / IntelliJ 2024.3 through 2026.1+. On Rider 2026.1 the plugin coexists
+    <p><b>Compatibility:</b> Rider / IntelliJ 2026.1 and newer. On Rider 2026.1 the plugin coexists
     with the JetBrains AI Assistant chat tool window (the "AI Agents" panel: Junie / Claude Agent / Codex)
     and Anthropic's official Claude Code [Beta] plugin. <i>This plugin manages terminal-launched Claude CLI
     sessions only</i> — chat tabs in the AI Agents panel are managed by JetBrains and are not auto-restored

@@ -1,8 +1,9 @@
+import org.jetbrains.intellij.platform.gradle.IntelliJPlatformType
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
-    id("org.jetbrains.intellij.platform") version "2.10.0"
-    kotlin("jvm") version "2.3.0"
+    id("org.jetbrains.intellij.platform") version "2.18.1"
+    kotlin("jvm") version "2.3.21"
 }
 
 group = "com.claudetabs"
@@ -27,8 +28,11 @@ repositories {
 // helper into intellijIdea() (intellijIdeaCommunity is legacy-only).
 dependencies {
     intellijPlatform {
-        intellijIdea("2026.1")
+        intellijIdea("2026.1.3")
         bundledPlugin("org.jetbrains.plugins.terminal")
+
+        // `verifyPlugin` needs the standalone IntelliJ Plugin Verifier CLI.
+        pluginVerifier()
     }
 
     // JUnit 4 — IntelliJ platform brings its own version, but declaring it here makes the
@@ -40,13 +44,13 @@ dependencies {
     testImplementation("com.intellij.remoterobot:remote-fixtures:0.11.23")
 }
 
-// IntelliJ Platform 2026.1 requires JVM target 17. Pin Java + Kotlin to 17 so the build
-// works regardless of the local JDK (matters when the only available JDK on the build
-// machine is JDK 21+, which would otherwise default `compileJava` to 21 and fail the
-// platform verifier).
+// IntelliJ Platform 2026.1 runs on JDK 21 bytecode. Pin the compile JDK via a toolchain so
+// the build is identical regardless of the JDK on PATH (developer machines now commonly
+// carry 24/25/26, which the Kotlin compiler and the platform verifier both reject).
 java {
-    sourceCompatibility = JavaVersion.VERSION_17
-    targetCompatibility = JavaVersion.VERSION_17
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
 }
 
 intellijPlatform {
@@ -62,6 +66,15 @@ intellijPlatform {
         }
     }
     instrumentCode = false
+
+    // `./gradlew verifyPlugin` checks the built plugin against the IDE builds it claims to
+    // support. Pinned to the 2026.1 line the plugin is compiled against; `recommended()`
+    // would also drag in Rider/older releases the descriptor's since-build already excludes.
+    pluginVerification {
+        ides {
+            create(IntelliJPlatformType.IntellijIdeaUltimate, "2026.1.3")
+        }
+    }
 }
 
 tasks {
@@ -72,11 +85,11 @@ tasks {
     }
 
     compileKotlin {
-        compilerOptions.jvmTarget.set(JvmTarget.JVM_17)
+        compilerOptions.jvmTarget.set(JvmTarget.JVM_21)
     }
 
     compileTestKotlin {
-        compilerOptions.jvmTarget.set(JvmTarget.JVM_17)
+        compilerOptions.jvmTarget.set(JvmTarget.JVM_21)
     }
 
     // Shared test logging — print test names + pass/fail + summary so you don't
