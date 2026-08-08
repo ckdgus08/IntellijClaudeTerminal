@@ -961,9 +961,14 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         val now = System.currentTimeMillis()
         if (now - lastStatusAttachAt >= STATUS_ATTACH_INTERVAL_MS) {
             lastStatusAttachAt = now
+            // Read the disk *before* going to the UI thread. Both of these are file I/O —
+            // measured at ~1.9ms together — and they used to run inside the EDT block below,
+            // which is a UI stall every 1.5s for work that touches no UI at all.
+            rebindSupersededSessions()
+            val termMap = try { statusStore.termSessionMap() } catch (_: Exception) { emptyMap() }
             withContext(Dispatchers.Main) {
                 try {
-                    attachStatusTabs(project, tabForSession.keys.toSet())
+                    attachStatusTabs(project, tabForSession.keys.toSet(), termMap)
                 } catch (e: Exception) {
                     LOG.debug("[ClaudeTabs][status] attach from status loop failed: ${e.message}")
                 }
@@ -1193,7 +1198,9 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         try {
             val thisProjectHash = projectHash(project)
             val mine = tabForSession.filterValues { it.projectHash == thisProjectHash }
-            val readings = try { statusStore.snapshot() } catch (_: Exception) { emptyMap() }
+            // The memo, not a fresh read: this is a log line, and the status loop has
+            // already paid for a snapshot within the last 300ms.
+            val readings = try { sharedStatusSnapshot() } catch (_: Exception) { emptyMap() }
             val shown = mine.keys.joinToString(", ") { sid ->
                 val st = appliedStatus[sid]?.name ?: "-"
                 val hook = readings[sid]?.hookEvent ?: readings[rawIdFor(sid)]?.hookEvent ?: "-"
@@ -1282,7 +1289,11 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
      * See [ClaudeStatusStore.supersededSessions] for how the two ids are linked.
      */
     private fun rebindSupersededSessions() {
-        val superseded = try { statusStore.supersededSessions() } catch (_: Exception) { return }
+        // Only sessions we hold a tab for can be handed over, and scoping the lookup to them
+        // is what stops this costing more on a machine that has simply run Claude a lot:
+        // every other SessionEnd on disk belongs to a conversation with no tab to give away.
+        val ours = tabForSession.keys + spawnedWidgets.keys
+        val superseded = try { statusStore.supersededSessions(ours) } catch (_: Exception) { return }
         if (superseded.isEmpty()) return
 
         for ((oldSid, newSid) in superseded) {
@@ -1377,10 +1388,17 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
     private fun attachStatusTabs(
         project: Project,
         sessionsAlreadyTracked: Set<String>,
+        /**
+         * The `TERM_SESSION_ID → sessionId` bridge. Passed in rather than read here so the
+         * caller can do the file I/O off the UI thread; null means "read it yourself",
+         * which is what the 5s poll does since it is already on the EDT for tab access.
+         */
+        termSessionMap: Map<String, String>? = null,
     ): Set<String> {
-        rebindSupersededSessions()
+        if (termSessionMap == null) rebindSupersededSessions()
 
-        val termMap = try { statusStore.termSessionMap() } catch (_: Exception) { emptyMap() }
+        val termMap = termSessionMap
+            ?: try { statusStore.termSessionMap() } catch (_: Exception) { emptyMap() }
 
         val attached = mutableSetOf<String>()
         val thisProjectHash = projectHash(project)
