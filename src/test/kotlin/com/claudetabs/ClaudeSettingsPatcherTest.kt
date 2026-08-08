@@ -161,3 +161,50 @@ class ClaudeSettingsPatcherTest {
         assertNull(ClaudeSettingsPatcher.unpatch("{ not json", perms))
     }
 }
+
+/**
+ * Withdrawing permissions for features that no longer exist.
+ *
+ * Earlier versions granted Bash permissions for six slash commands the plugin has since
+ * retired. Leaving those in `settings.json` would keep allowing commands it no longer
+ * ships — an upgrade has to take them back, not just stop adding them.
+ */
+class RetiredPermissionTest {
+
+    private val kept = listOf("Bash(bash ~/.claude/rider-plugin/rename-tab.sh *)")
+    private val retired = listOf(
+        "Bash(bash ~/.claude/rider-plugin/tab.sh *)",
+        "Bash(node ~/.claude/rider-plugin/current-project.js)",
+    )
+
+    @Suppress("UNCHECKED_CAST")
+    private fun allowList(text: String): List<Any?> {
+        val root = MiniJson.parse(text) as Map<String, Any?>
+        return (root["permissions"] as Map<String, Any?>)["allow"] as List<Any?>
+    }
+
+    @Test fun takesBackPermissionsForRemovedCommands() {
+        val before = """{"permissions":{"allow":[
+            "Bash(bash ~/.claude/rider-plugin/rename-tab.sh *)",
+            "Bash(bash ~/.claude/rider-plugin/tab.sh *)",
+            "Bash(node ~/.claude/rider-plugin/current-project.js)"
+        ]}}"""
+        val allow = allowList(ClaudeSettingsPatcher.patch(before, kept, retired)!!)
+        assertEquals(listOf<Any?>("Bash(bash ~/.claude/rider-plugin/rename-tab.sh *)"), allow)
+    }
+
+    @Test fun leavesThePermissionsSomeoneElseGranted() {
+        val before = """{"permissions":{"allow":["Bash(ls)","Bash(bash ~/.claude/rider-plugin/tab.sh *)","Bash(git *)"]}}"""
+        val allow = allowList(ClaudeSettingsPatcher.patch(before, kept, retired)!!)
+        assertTrue(allow.contains("Bash(ls)"))
+        assertTrue(allow.contains("Bash(git *)"))
+        assertFalse(allow.contains("Bash(bash ~/.claude/rider-plugin/tab.sh *)"))
+    }
+
+    @Test fun aFileWithNothingRetiredIsNotRewrittenForThisReason() {
+        // Only the hooks are missing here, so the patch happens — but a file that already
+        // has everything and nothing retired must report no change at all.
+        val settled = ClaudeSettingsPatcher.patch(null, kept, retired)!!
+        assertNull(ClaudeSettingsPatcher.patch(settled, kept, retired))
+    }
+}

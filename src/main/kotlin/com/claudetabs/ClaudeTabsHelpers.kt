@@ -38,10 +38,36 @@ internal object ClaudeTabsHelpers {
      */
     fun isGenericTabName(name: String): Boolean {
         val n = name.trim()
-        return n == "Local" || n.matches(Regex("Local \\(\\d+\\)")) ||
+        if (n == "Local" || n.matches(Regex("Local \\(\\d+\\)")) ||
             n == "bash" || n == "pwsh" || n == "PowerShell" || n == "cmd" ||
             n.matches(Regex("bash \\(\\d+\\)")) || n.matches(Regex("pwsh \\(\\d+\\)"))
+        ) return true
+
+        // The IDE's default terminal name is localised, and this list used to be English
+        // only. On a Korean IDE the default tab is called 로컬, which read as a name someone
+        // had deliberately chosen — so the plugin treated an untouched terminal as
+        // meaningful and left it alone everywhere this predicate is consulted. Caught by the
+        // spare-terminal sweep reporting `'로컬'(… generic=false …)` with every other guard
+        // passing.
+        return (localizedDefaultNames + BUNDLED_LOCALIZED_DEFAULTS).any { base ->
+            base.isNotBlank() && (n == base || n.matches(Regex("${Regex.escape(base)} \\(\\d+\\)")))
+        }
     }
+
+    /**
+     * The IDE's own localised default terminal name, resolved at runtime from the terminal
+     * plugin's message bundle (`local.terminal.default.name`) so it matches whatever
+     * language the IDE is actually running in. Set once at startup; empty until then.
+     */
+    @Volatile
+    var localizedDefaultNames: Set<String> = emptySet()
+
+    /**
+     * Values for the language packs JetBrains ships with the IDE, read out of those plugins'
+     * bundles. A fallback for when the runtime lookup fails — narrow and checked, rather
+     * than a guess at every language that might exist.
+     */
+    private val BUNDLED_LOCALIZED_DEFAULTS = setOf("로컬", "ローカル", "本地")
 
     /** Status/spinner glyph prefix the AI Assistant terminal overlay puts on tab names while
      *  a Claude session is active. Covers:
@@ -278,6 +304,36 @@ internal object ClaudeTabsHelpers {
             if (current == jvmPid) return true
         }
         return false
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // CLAUDE'S OWN SESSION NAME
+    // ══════════════════════════════════════════════════════════════
+
+    /**
+     * Claude's own name for a session, if it means anything.
+     *
+     * Claude Code keeps a `name` in `~/.claude/sessions/<pid>.json` and says where it came
+     * from in `nameSource`:
+     *
+     *  - `derived` — mechanically built from the working directory (`riderclaudetabs-29`,
+     *    `projects-68`). No better than the tab's default, so it is ignored.
+     *  - `auto` — Claude's own summary of what the conversation is about
+     *    (`설치 스크립트 초기 설정 프로세스 개선`). This is the good one.
+     *  - `user` — set deliberately.
+     *
+     * Reading this is free and needs no cooperation from the conversation. It is strictly
+     * better than the alternative the plugin shipped with, which asks Claude — via an
+     * instruction injected into `~/.claude/CLAUDE.md` — to spend a turn calling
+     * `rename-tab.sh` at the start of every conversation.
+     *
+     * Returns null when there is nothing worth showing, so callers can fall through.
+     */
+    fun meaningfulSessionName(name: String?, nameSource: String?): String? {
+        if (name.isNullOrBlank()) return null
+        if (nameSource != "auto" && nameSource != "user") return null
+        val trimmed = name.trim()
+        return trimmed.takeUnless { it.isEmpty() || isGenericTabName(it) }
     }
 
     // ══════════════════════════════════════════════════════════════
