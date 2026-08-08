@@ -344,9 +344,10 @@ class SessionsDirScanContractTest {
         assertEquals(2, r.skipOtherProject)
         assertEquals(1, r.skipAlreadyHave)
         assertEquals(0, r.skipNoTranscript)
+        assertEquals(0, r.skipNotInteractive)
         // Verify the status line format matches what production logs:
         assertEquals(
-            "scanned=8 added=5 skipDead=0 skipOtherProject=2 skipAlreadyHave=1 skipNoTranscript=0",
+            "scanned=8 added=5 skipDead=0 skipOtherProject=2 skipAlreadyHave=1 skipNoTranscript=0 skipNotInteractive=0",
             r.statusLine(),
         )
     }

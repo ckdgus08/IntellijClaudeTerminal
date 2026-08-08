@@ -281,6 +281,67 @@ internal object ClaudeTabsHelpers {
     }
 
     // ══════════════════════════════════════════════════════════════
+    // SESSION KIND — which sessions can be a terminal tab at all
+    // ══════════════════════════════════════════════════════════════
+
+    /**
+     * True if a session with Claude's `kind` field set to [kind] is one that can live in an
+     * IDE terminal tab.
+     *
+     * Claude Code 2.1.x tags every session in `~/.claude/sessions/<pid>.json` with a kind:
+     * `interactive` for a CLI session someone is typing into, and `bg`, `daemon`,
+     * `daemon-worker`, `desktop`, `rc`, `bridge` or `remote` for everything else. Only the
+     * first is ever a terminal tab.
+     *
+     * This matters because non-interactive sessions are not off in some other process tree —
+     * a background job launched from a terminal session is a *descendant of that session*,
+     * so it descends from the IDE's JVM and its cwd is under the project, which is all the
+     * ancestry walk and the sessions-dir scanner check. Without this filter a `bg` job gets
+     * saved as if it were a tab and comes back on the next IDE start as a terminal running
+     * `claude --resume` against a background job's transcript.
+     *
+     * A null/absent kind is allowed: CLI versions before the field existed wrote nothing,
+     * and every session they wrote was interactive.
+     */
+    fun isTerminalTabSessionKind(kind: String?): Boolean =
+        kind == null || kind.isBlank() || kind == "interactive"
+
+    // ══════════════════════════════════════════════════════════════
+    // STATUS TRACKING — which sessions this window should stop tracking
+    // ══════════════════════════════════════════════════════════════
+
+    /**
+     * Decide which sessions the status indicator should forget at the end of a poll.
+     *
+     * [tracked] maps sessionId → the project hash of the window that registered it. The map
+     * is shared by every open project window (the platform runs one instance of the startup
+     * activity across all of them), so two rules apply:
+     *
+     *  1. **Only ever untrack your own.** Without this, each window's poll would drop the
+     *     other windows' sessions on every cycle and the two would delete each other's
+     *     tracking in a loop — the glyphs would flicker off every few seconds for anyone
+     *     with more than one project open.
+     *  2. **Never untrack on an empty tab-walk.** `getAllTabs` legitimately returns nothing
+     *     on the reworked terminal when the platform withholds shell PIDs; treating that as
+     *     "every tab closed" would blank the indicator on those polls.
+     *
+     * [seenThisPoll] is every sid this window's tab-walk resolved, including ones not yet
+     * eligible for saving — the indicator has no reason to wait for a transcript flush.
+     */
+    fun sidsToUntrack(
+        tracked: Map<String, String>,
+        thisProjectHash: String,
+        seenThisPoll: Set<String>,
+        tabWalkFoundTabs: Boolean,
+    ): Set<String> {
+        if (!tabWalkFoundTabs) return emptySet()
+        return tracked.entries
+            .filter { it.value == thisProjectHash && it.key !in seenThisPoll }
+            .map { it.key }
+            .toSet()
+    }
+
+    // ══════════════════════════════════════════════════════════════
     // TRANSCRIPT LOOKUP
     // ══════════════════════════════════════════════════════════════
 
