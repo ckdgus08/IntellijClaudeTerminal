@@ -88,6 +88,42 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             "Bash(node ~/.claude/rider-plugin/current-project.js)",
         )
 
+        /** Reads the hook edges + Claude's own per-session `status` field. See [ClaudeStatusStore]. */
+        private val statusStore = ClaudeStatusStore(CLAUDE_HOME)
+
+        /** How often the status indicator re-reads the (tiny) status files.
+         *
+         *  The tab glyph has to feel immediate, and the 5s save poll is far too coarse for
+         *  that. A dedicated short tick is used instead of a [java.nio.file.WatchService]
+         *  because the JDK has no native watcher on macOS — `FileSystems.getDefault()`
+         *  returns the polling implementation there, which fires on a 10s sensitivity and
+         *  would be *slower* than this loop. Each tick stats a handful of small files. */
+        private const val STATUS_POLL_MS = 400L
+
+        /**
+         * Last status snapshot, shared by every open project window.
+         *
+         * One status loop runs per project, but the files it reads are global — with three
+         * windows open that would be three identical directory walks every 400ms. The
+         * memo collapses them to one. TTL is deliberately just under the poll interval so a
+         * window that ticks slightly out of phase still gets fresh data rather than reusing
+         * a snapshot that is about to be replaced anyway.
+         */
+        private val statusSnapshotLock = Any()
+        private var statusSnapshot: Map<String, ClaudeStatusStore.Reading> = emptyMap()
+        private var statusSnapshotAt = 0L
+        private const val STATUS_SNAPSHOT_TTL_MS = 300L
+
+        private fun sharedStatusSnapshot(): Map<String, ClaudeStatusStore.Reading> =
+            synchronized(statusSnapshotLock) {
+                val now = System.currentTimeMillis()
+                if (now - statusSnapshotAt >= STATUS_SNAPSHOT_TTL_MS) {
+                    statusSnapshot = statusStore.snapshot()
+                    statusSnapshotAt = now
+                }
+                statusSnapshot
+            }
+
         /** Long-term session history — one JSON entry per closed/backed-up session. */
         private val HISTORY_FILE = File(CLAUDE_HOME, "rider-plugin/history.json")
 
@@ -168,16 +204,17 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                 }
             }
 
-            // 2. Remove permission entries from settings.json
+            // 2. Remove our hooks and permission entries from settings.json.
+            //    Tree-based, like the install side: the old string-replace left dangling
+            //    commas behind whenever an entry wasn't in the exact position it assumed.
             val settings = File(CLAUDE_HOME, "settings.json")
             if (settings.exists()) {
-                var text = settings.readText()
-                for (entry in PERMISSION_ENTRIES) {
-                    text = text.replace("\"$entry\", ", "")
-                        .replace(", \"$entry\"", "")
-                        .replace("\"$entry\"", "")
+                try {
+                    ClaudeSettingsPatcher.unpatch(settings.readText(), PERMISSION_ENTRIES)
+                        ?.let { settings.writeText(it) }
+                } catch (e: Exception) {
+                    LOG.warn("[ClaudeTabs] settings.json cleanup skipped: ${e.message}")
                 }
-                settings.writeText(text)
             }
 
             // 3. Remove deployed scripts and data
@@ -248,6 +285,42 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
      * any cache lookup, and writes go under both keys so future operations work either way.
      */
     private val sessionAliases = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    /**
+     * Current status glyph state per canonical sessionId, as last **applied to a tab**.
+     *
+     * Distinct from what [statusStore] reads off disk: this records what the tab strip is
+     * actually showing, so the fast status loop can skip the (reflective, main-thread) title
+     * write when nothing changed. Without it, every 400ms tick would repaint every tab.
+     */
+    private val appliedStatus = java.util.concurrent.ConcurrentHashMap<String, ClaudeStatus>()
+
+    /** A tab handle plus the project window that owns it. See [tabForSession]. */
+    private data class TrackedTab(val tab: TabInfo, val projectHash: String)
+
+    /**
+     * Session id → the tab hosting it, refreshed by each [poll].
+     *
+     * The status loop needs to reach a tab far more often than the 5s poll runs, and
+     * [getAllTabs] is heavy (four reflective enumeration passes over the reworked terminal
+     * managers). Caching the resolved [TabInfo] lets the fast loop write a title directly.
+     * Entries go stale when a tab closes; the write is guarded and the next poll drops them.
+     *
+     * The owning project is recorded because this map — like [claimedByTabWalk] — is shared
+     * across every open project window (the platform creates one instance of this activity
+     * and runs it per project). Without the tag, each window's poll would prune the other
+     * windows' sessions on every cycle and the glyphs would flicker away.
+     */
+    private val tabForSession = java.util.concurrent.ConcurrentHashMap<String, TrackedTab>()
+
+    /**
+     * The bare (undecorated) name the plugin believes each session's tab should carry.
+     *
+     * The status glyph is a *view* concern: it is prefixed onto the live title only, and is
+     * stripped before any title is read back into names.json, the restore file, or history.
+     * Persisting a decorated name would resurrect tabs called `"● backend"` after a restart.
+     */
+    private val baseNameForSession = java.util.concurrent.ConcurrentHashMap<String, String>()
 
     /** Resolve [sid] to its canonical form. Two-tier:
      *
@@ -491,6 +564,14 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         deployClaudeIntegration()
         pruneStaleHistoryEntries()
         pruneStaleRestoreEntries(project)
+        // Hook files outlive their sessions (SessionEnd writes one last edge and then
+        // nothing ever removes it), so reap the stale ones once per IDE start. Sessions
+        // still tracked in names.json are kept regardless of age.
+        try {
+            statusStore.prune(liveSessionIds = storage.loadNames().keys)
+        } catch (e: Exception) {
+            LOG.debug("[ClaudeTabs] status file prune failed: ${e.message}")
+        }
 
         // Hydrate the in-memory userClosed set from disk so a tab the user X-ed in a previous
         // Rider session (and then crashed before the next save) doesn't get auto-restored.
@@ -669,7 +750,161 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                 ctx(project).pollCount++
             }
         }
+
+        // Status indicator loop — deliberately separate from the poll above.
+        //
+        // The save poll is expensive (four reflective tab enumerations, a process-ancestry
+        // walk, transcript existence checks) and runs on a 5s cadence tuned for persistence,
+        // not for UI latency. The status glyph has to land within a fraction of a second of
+        // Claude changing state, so it gets its own loop that does almost nothing: read a
+        // handful of small files, diff against what's already on screen, and touch only the
+        // tabs that actually changed.
+        scope.launch {
+            delay(4_000)
+            while (isActive) {
+                try {
+                    refreshStatuses(project)
+                } catch (_: ProcessCanceledException) { break }
+                catch (e: Exception) {
+                    if (e.message?.contains("disposed") == true) break
+                    LOG.debug("[ClaudeTabs][status] refresh failed: ${e.message}")
+                }
+                delay(STATUS_POLL_MS)
+            }
+        }
     }
+
+    // ══════════════════════════════════════════════════════════════
+    // STATUS INDICATOR
+    // ══════════════════════════════════════════════════════════════
+
+    /**
+     * Read the current status of every tracked session and repaint the tabs whose state
+     * changed.
+     *
+     * Runs off the EDT (file reads only); the actual title writes are marshalled to the UI
+     * thread, and only for tabs that changed — a steady state costs one directory listing
+     * plus a few small reads per tick and touches no Swing state at all.
+     *
+     * Sessions are matched to tabs through [tabForSession], which [poll] refreshes. A tab
+     * that has closed since the last poll leaves a stale entry behind; writing to it throws
+     * and is swallowed, and the next poll drops the entry.
+     */
+    private suspend fun refreshStatuses(project: Project) {
+        if (tabForSession.isEmpty()) return
+        val thisProjectHash = projectHash(project)
+
+        val readings = sharedStatusSnapshot()
+        if (readings.isEmpty()) return
+
+        // sid → (tab, newStatus) for the tabs that actually need repainting. Scoped to this
+        // window so two open projects don't both paint (and both log) the same tab.
+        val pending = mutableListOf<Triple<String, TabInfo, ClaudeStatus>>()
+        for ((sid, tracked) in tabForSession) {
+            if (tracked.projectHash != thisProjectHash) continue
+            // A resumed session's hook files are keyed by the rotated id Claude reported at
+            // hook time, while everything else here is keyed by the canonical one.
+            val reading = readings[sid] ?: readings[rawIdFor(sid)] ?: continue
+            if (appliedStatus[sid] == reading.status) continue
+            pending.add(Triple(sid, tracked.tab, reading.status))
+        }
+        if (pending.isEmpty()) return
+
+        withContext(Dispatchers.Main) {
+            for ((sid, tab, status) in pending) {
+                val previous = appliedStatus[sid]
+                appliedStatus[sid] = status
+                val base = baseNameForSession[sid]
+                    ?: lastAppliedName[sid]
+                    ?: storage.nameFor(sid)
+                    ?: tab.tabName
+                if (applyStatusToTab(tab, base, status)) {
+                    LOG.info("[ClaudeTabs][status] ${sid.take(8)} ${previous?.name ?: "-"} → ${status.name} ('$base')")
+                } else {
+                    // The tab is gone or its title surface is unreachable. Drop the cached
+                    // state so we don't keep retrying every tick; the next poll re-adds it
+                    // if the tab is still really there.
+                    appliedStatus.remove(sid)
+                    tabForSession.remove(sid)
+                }
+            }
+        }
+    }
+
+    /**
+     * Write `<glyph> <name>` onto [tab]'s live title and `<name> — <label>` onto its
+     * tooltip. Returns false if no title surface could be reached, which the caller treats
+     * as "this tab is gone".
+     *
+     * Only the frontend surfaces are touched. The backend tab name (the one that persists
+     * into `workspace.xml`) keeps the bare name written by [renameTab] — a glyph there would
+     * outlive the session it describes and reappear, stale, on the next IDE start.
+     */
+    private fun applyStatusToTab(tab: TabInfo, baseName: String, status: ClaudeStatus): Boolean {
+        val display = StatusDecoration.decorate(baseName, status)
+        var applied = false
+
+        val title = try { findTerminalTitle(tab) } catch (_: Exception) { null }
+        if (title != null) {
+            try {
+                title.change { userDefinedTitle = display }
+                applied = true
+            } catch (e: Exception) {
+                LOG.debug("[ClaudeTabs][status] TerminalTitle.change failed: ${e.message}")
+            }
+        }
+
+        try {
+            tab.content?.let {
+                it.displayName = display
+                it.description = StatusDecoration.tooltip(baseName, status)
+                applied = true
+            }
+        } catch (e: Exception) {
+            LOG.debug("[ClaudeTabs][status] Content update failed: ${e.message}")
+        }
+
+        return applied
+    }
+
+    /**
+     * Periodic one-liner describing why the status indicator is (or isn't) showing anything.
+     *
+     * Every transition already logs, but the most likely failure — no glyphs at all — is
+     * silent by construction: [refreshStatuses] returns immediately when no tab has been
+     * resolved to a session, so an empty tab-walk produces no evidence whatsoever. This
+     * prints the inputs at the same cadence as the STEP 6b/6d counters, so "the glyphs never
+     * appeared" can be diagnosed from a log excerpt instead of a debugger.
+     *
+     * Reading it: `tabs=0` means the platform didn't give us tabs (the reworked-terminal
+     * PID problem — compare `skipNoPid` on the getAllTabs line). `tracked=0` with `tabs>0`
+     * means tabs exist but none resolved to a Claude process. `readings=0` means neither the
+     * hooks nor Claude's own session files produced anything — check that the hooks are in
+     * `~/.claude/settings.json` and that the sessions predate nothing.
+     */
+    private fun logStatusHeartbeat(project: Project, tabCount: Int) {
+        try {
+            val thisProjectHash = projectHash(project)
+            val mine = tabForSession.filterValues { it.projectHash == thisProjectHash }
+            val readings = try { statusStore.snapshot() } catch (_: Exception) { emptyMap() }
+            val shown = mine.keys.joinToString(", ") { sid ->
+                val st = appliedStatus[sid]?.name ?: "-"
+                val hook = readings[sid]?.hookEvent ?: readings[rawIdFor(sid)]?.hookEvent ?: "-"
+                val claude = readings[sid]?.sessionStatus ?: readings[rawIdFor(sid)]?.sessionStatus ?: "-"
+                "${sid.take(8)}:$st(hook=$hook,claude=$claude)"
+            }.ifBlank { "none" }
+            LOG.info(
+                "[ClaudeTabs][status] tabs=$tabCount tracked=${mine.size} readings=${readings.size} " +
+                    "hookDir=${statusStore.statusDir.absolutePath} exists=${statusStore.statusDir.exists()} — $shown"
+            )
+        } catch (e: Exception) {
+            LOG.debug("[ClaudeTabs][status] heartbeat failed: ${e.message}")
+        }
+    }
+
+    /** The rotated (pre-canonicalisation) id aliased to [canonicalSid], if one is known. */
+    private fun rawIdFor(canonicalSid: String): String =
+        sessionAliases.entries.firstOrNull { it.value == canonicalSid }?.key ?: canonicalSid
 
     // ══════════════════════════════════════════════════════════════
     // TERMINAL TAB ACCESS — stable API, all panels
@@ -690,8 +925,20 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         val pid: Long,
         val reworkedSession: Any? = null,   // reworked session for PID/command access
         val reworkedTabId: Int? = null,     // for renameTerminalTab()
-        val tabName: String = ""            // current tab name
-    )
+        /** Title exactly as the platform reports it — including the status glyph this plugin
+         *  prefixes onto live tabs. Only the status code should read this; everything else
+         *  wants [tabName]. */
+        val rawTabName: String = ""
+    ) {
+        /**
+         * The tab's name with any status glyph stripped.
+         *
+         * Every comparison and every persistence path (names.json, restore files, history)
+         * goes through here, so the decoration can never round-trip into stored state — the
+         * failure mode that would otherwise restore tabs literally named `"● backend"`.
+         */
+        val tabName: String get() = StatusDecoration.strip(rawTabName)
+    }
 
     /**
      * Enumerate every terminal tab in the project's terminal tool window.
@@ -813,7 +1060,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                         pid = pid,
                         reworkedSession = view ?: session,
                         reworkedTabId = tabId,
-                        tabName = name
+                        rawTabName = name
                     ))
 
                     if (!hasFrontend) {
@@ -873,7 +1120,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                     pid = pid,
                     reworkedSession = null,
                     reworkedTabId = null,
-                    tabName = content.displayName ?: "Local",
+                    rawTabName = content.displayName ?: "Local",
                 ))
                 sweptAdded++
             }
@@ -906,7 +1153,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                     pid = pid,
                     reworkedSession = null,
                     reworkedTabId = null,
-                    tabName = title ?: "Local",
+                    rawTabName = title ?: "Local",
                 ))
                 spawnAdded++
             }
@@ -966,7 +1213,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                                 pid = pid,
                                 reworkedSession = null,
                                 reworkedTabId = null,
-                                tabName = content.displayName ?: "Local",
+                                rawTabName = content.displayName ?: "Local",
                             ))
                             dockAdded++
                         }
@@ -1174,13 +1421,20 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         // fall back to scanning the reworked-session view for a TerminalTitle field/getter.
         val title = findTerminalTitle(tab)
 
+        // The status glyph rides on the live title only. `name` stays bare through every
+        // persistence path; `display` is what the tab strip shows. Remembering the bare name
+        // here is what lets the status loop repaint later without re-deriving it.
+        if (sessionId != null) baseNameForSession[sessionId] = name
+        val status = sessionId?.let { appliedStatus[it] }
+        val display = StatusDecoration.decorate(name, status)
+
         // Redundancy short-circuit: skip the rename APIs only if both the backend name AND the
         // TerminalTitle's userDefinedTitle already match. The backend can be correct (restored
         // from prior session) while the FRONTEND `Content.displayName` is being overlaid by the
         // AI Assistant — in that case we still need to apply userDefinedTitle so the listener
         // chain repaints. Always install the listener regardless of the short-circuit.
         val backendMatches = isRenameRedundant(tab.tabName, name)
-        val titleMatches = title?.userDefinedTitle == name
+        val titleMatches = title?.userDefinedTitle == display
         if (backendMatches && titleMatches) {
             LOG.info("[ClaudeTabs] Skipping redundant rename '${tab.tabName}' → '$name' (userDefinedTitle already set)")
             if (sessionId != null && title != null) {
@@ -1194,7 +1448,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         }
         if (title != null) {
             try {
-                title.change { userDefinedTitle = name }
+                title.change { userDefinedTitle = display }
                 LOG.info("[ClaudeTabs] Renamed via TerminalTitle.change(): userDefinedTitle='${title.userDefinedTitle}', applicationTitle='${title.applicationTitle}', defaultTitle='${title.defaultTitle}'")
             } catch (e: Exception) {
                 LOG.warn("[ClaudeTabs] TerminalTitle.change() failed: ${e.message}")
@@ -1206,7 +1460,8 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         // Belt-and-suspenders: also write Content.displayName directly. If the title-listener
         // chain propagates correctly this is redundant, but if not it makes the rename visible
         // until the listener settles.
-        tab.content?.displayName = name
+        tab.content?.displayName = display
+        tab.content?.description = StatusDecoration.tooltip(name, status)
 
         // Backend persistence: ensures the rename survives IDE restart.
         if (tab.reworkedTabId != null) {
@@ -1302,7 +1557,10 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             val listener = object : com.intellij.terminal.TerminalTitleListener {
                 override fun onTitleChanged(t: com.intellij.terminal.TerminalTitle) {
                     val desired = lastAppliedName[sessionId] ?: return
-                    val current = t.userDefinedTitle
+                    // Compare on the bare name: our own status glyph is not a title change
+                    // worth reacting to, and treating it as one would make this listener
+                    // fight the status loop on every state transition.
+                    val current = StatusDecoration.strip(t.userDefinedTitle).ifBlank { null }
                     if (current == desired) return
                     val looksLikeOverlay = current == null ||
                         current.isBlank() ||
@@ -1324,7 +1582,9 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                             rateLimitedLogAt[sessionId] = now
                         }
                         try {
-                            t.change { userDefinedTitle = desired }
+                            // Re-apply with the status glyph so an overlay overwrite doesn't
+                            // silently drop the indicator until the next status transition.
+                            t.change { userDefinedTitle = StatusDecoration.decorate(desired, appliedStatus[sessionId]) }
                         } catch (e: Exception) {
                             LOG.debug("[ClaudeTabs] re-apply via change() failed: ${e.message}")
                         }
@@ -1795,7 +2055,13 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         // where the Claude process's cwd points — worktrees, sibling dirs, manual cd, etc.).
         // Also added to the global claimedByTabWalk set so other projects' scanner passes skip
         // them — only one project can own a sid at a time, and tab-walk wins over cwd matching.
+        val thisProjectHash = projectHash(project)
         val tabWalkOwnedSids = mutableSetOf<String>()
+        // Every sid the tab-walk resolved this poll, including ones not yet eligible for
+        // saving (no transcript flushed yet). The status indicator tracks these — it has no
+        // reason to wait for a transcript — so pruning is keyed off this set, not the
+        // save-eligible one.
+        val tabWalkSeenSids = mutableSetOf<String>()
 
         for (tab in tabs) {
             val claudeProcess = findClaudeChild(tab.pid) ?: continue
@@ -1806,6 +2072,9 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             val st = try { sf.readText() } catch (_: Exception) { continue }
             val rawSessionId = extractJsonString(st, "sessionId") ?: continue
             val cwd = extractJsonString(st, "cwd") ?: continue
+            // Defence in depth against resolving a tab to a background job that the tab's
+            // own session spawned (they share the shell's descendant tree).
+            if (!ClaudeTabsHelpers.isTerminalTabSessionKind(extractJsonString(st, "kind"))) continue
             val startedAt = Regex(""""startedAt":(\d+)""").find(st)?.groupValues?.get(1)?.toLongOrNull() ?: System.currentTimeMillis()
 
             // Resolve rotated session IDs (Claude --resume rotates in-memory id but keeps
@@ -1826,6 +2095,13 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             // Record Content → sessionId so the ContentManagerListener can identify which
             // session is in a tab that the user just closed via the X / right-click menu.
             tab.content?.let { c.contentToSid[it] = sessionId }
+
+            // Hand the status loop a live handle to this tab. Refreshed every poll so the
+            // handle tracks split/pop-out moves; registered before the transcript check
+            // below so a brand-new session shows its glyph without waiting for the first
+            // transcript flush.
+            tabForSession[sessionId] = TrackedTab(tab, thisProjectHash)
+            tabWalkSeenSids.add(sessionId)
 
             claudeSessions.add("'${tab.tabName}'→session:${sessionId.take(8)}")
 
@@ -1934,12 +2210,50 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                 ?: c.previousActive[sessionId]?.tabName
                 ?: "Claude"
 
+            // Same resolution the status loop needs when it repaints between polls. Kept
+            // bare — the glyph is added at write time, never stored.
+            baseNameForSession[sessionId] = title
+
             // Skip sessions whose transcript hasn't been flushed yet — they get picked up next poll.
             if (!hasTranscript(cwd, sessionId)) continue
             val bypass = readPermissionMode(cwd, sessionId)
             activeSessions.add(SavedSession(sessionId, cwd, title, bypass))
             tabWalkOwnedSids.add(sessionId)
             claimedByTabWalk[sessionId] = projectHash(project)
+        }
+
+        // Drop status bookkeeping for tabs this window no longer has, so the fast loop
+        // doesn't keep poking disposed widgets and the maps don't grow without bound.
+        //
+        // Guarded on a non-empty walk: `getAllTabs` legitimately returns nothing on Rider
+        // 2026.1 when the reworked managers withhold shell PIDs (that's exactly why STEP 6d
+        // exists). Pruning on an empty result would blank every glyph on those polls.
+        run {
+            val gone = ClaudeTabsHelpers.sidsToUntrack(
+                tracked = tabForSession.mapValues { it.value.projectHash },
+                thisProjectHash = thisProjectHash,
+                seenThisPoll = tabWalkSeenSids,
+                tabWalkFoundTabs = tabs.isNotEmpty(),
+            )
+            for (sid in gone) {
+                val staleTab = tabForSession.remove(sid)?.tab
+                val hadStatus = appliedStatus.remove(sid)
+                val base = baseNameForSession.remove(sid)
+                // A tab whose Claude process ended but whose shell is still open keeps
+                // existing as a plain terminal. Take the glyph back off it — otherwise it
+                // sits there advertising a state that stopped being true, with nothing left
+                // to ever update it. (The `✕` the user sees before this happens comes from
+                // the SessionEnd hook, ~5s earlier.)
+                if (staleTab != null && hadStatus != null && base != null) {
+                    try {
+                        findTerminalTitle(staleTab)?.change { userDefinedTitle = base }
+                        staleTab.content?.let { it.displayName = base; it.description = base }
+                        LOG.info("[ClaudeTabs][status] ${sid.take(8)} untracked — cleared glyph from '$base'")
+                    } catch (e: Exception) {
+                        LOG.debug("[ClaudeTabs][status] glyph cleanup failed for ${sid.take(8)}: ${e.message}")
+                    }
+                }
+            }
         }
 
         // ──────────────────────────────────────────────────────────────
@@ -1967,6 +2281,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         var ancestrySkipNotOurs = 0
         var ancestrySkipAlreadyHave = 0
         var ancestrySkipNoTranscript = 0
+        var ancestrySkipNotInteractive = 0
         try {
             val sessionFiles = SESSIONS_DIR.listFiles { f -> f.name.endsWith(".json") } ?: emptyArray()
             for (sf in sessionFiles) {
@@ -1987,6 +2302,12 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                 val text = try { sf.readText() } catch (_: Exception) { continue }
                 val rawSid = extractJsonString(text, "sessionId") ?: continue
                 val cwd = extractJsonString(text, "cwd") ?: continue
+                // A background job launched from a terminal session is a descendant of that
+                // session, so it descends from this JVM too and the ancestry test above
+                // cannot tell them apart. Only the kind field can.
+                if (!ClaudeTabsHelpers.isTerminalTabSessionKind(extractJsonString(text, "kind"))) {
+                    ancestrySkipNotInteractive++; continue
+                }
                 val startedAt = Regex(""""startedAt":(\d+)""").find(text)?.groupValues?.get(1)
                     ?.toLongOrNull() ?: System.currentTimeMillis()
                 val sid = canonicalSessionIdFor(claudePid, cwd, rawSid, startedAt)
@@ -2010,8 +2331,9 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         }
         if (c.pollCount % 12 == 0) {
             LOG.info(
-                "[ClaudeTabs] STEP 6d: ancestry walk — jvm=$ownJvmPid scanned=$ancestryScanned added=$ancestryAdded skipDead=$ancestrySkipDead skipNotOurs=$ancestrySkipNotOurs skipAlreadyHave=$ancestrySkipAlreadyHave skipNoTranscript=$ancestrySkipNoTranscript"
+                "[ClaudeTabs] STEP 6d: ancestry walk — jvm=$ownJvmPid scanned=$ancestryScanned added=$ancestryAdded skipDead=$ancestrySkipDead skipNotOurs=$ancestrySkipNotOurs skipAlreadyHave=$ancestrySkipAlreadyHave skipNoTranscript=$ancestrySkipNoTranscript skipNotInteractive=$ancestrySkipNotInteractive"
             )
+            logStatusHeartbeat(project, tabs.size)
         }
 
         // ──────────────────────────────────────────────────────────────
@@ -2023,7 +2345,6 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         // or ancestry walk (no double-counting), and sids claimed by ANY OTHER
         // project's tab-walk this run (cross-project arbitration — tab-walk's
         // "this is in my window" beats scanner's "cwd matches my basePath").
-        val thisProjectHash = projectHash(project)
         val skipForScanner = tabWalkOwnedSids + claimedByTabWalk.entries
             .filter { it.value != thisProjectHash }
             .map { it.key }
@@ -3017,15 +3338,28 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         return findClaudeRec(h)
     }
 
-    /** Recursive worker for [findClaudeChild]. Matches `claude[.exe|.cmd]` or `node` + `claude` args. */
+    /**
+     * Worker for [findClaudeChild]. Matches `claude[.exe|.cmd]` or `node` + `claude` args.
+     *
+     * Breadth-first, so the **shallowest** Claude under the shell wins. That is always the
+     * one the user is typing into: anything a session spawns for itself (a background job,
+     * its daemon supervisor, a nested `claude -p`) hangs *below* it in the tree. The
+     * previous depth-first walk would descend into a child's whole subtree before checking
+     * the shell's remaining direct children, so it could return a background job's process
+     * and attribute that job's session — and its status — to the tab.
+     */
     private fun findClaudeRec(h: ProcessHandle): ProcessHandle? {
-        for (c in h.children().toList()) {
+        val queue = ArrayDeque(h.children().toList())
+        var visited = 0
+        while (queue.isNotEmpty() && visited < 512) {
+            val c = queue.removeFirst()
+            visited++
             val cmd = c.info().command().orElse(""); val line = c.info().commandLine().orElse("")
             if ((cmd.contains("claude", true) || line.contains("claude", true)) &&
                 (cmd.endsWith("claude") || cmd.endsWith("claude.exe") || cmd.endsWith("claude.cmd") ||
                         line.contains("@anthropic", true) || line.contains("claude-code", true) ||
                         (cmd.contains("node", true) && line.contains("claude", true)))) return c
-            findClaudeRec(c)?.let { return it }
+            queue.addAll(c.children().toList())
         }
         return null
     }
@@ -3051,6 +3385,8 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             deployResource("claude-integration/rename-tab.sh", File(CLAUDE_HOME, "rider-plugin/rename-tab.sh"))
             deployResource("claude-integration/tab.sh", File(CLAUDE_HOME, "rider-plugin/tab.sh"))
             deployResource("claude-integration/session-start-hook.sh", File(CLAUDE_HOME, "rider-plugin/session-start-hook.sh"))
+            deployResource("claude-integration/status-hook.sh", File(CLAUDE_HOME, "rider-plugin/status-hook.sh"))
+            statusStore.statusDir.mkdirs()
             // Bundled Node helpers — slash commands invoke these as one-liners so the script body
             // doesn't dump into the user's terminal on every /tab or /tabs-backup.
             deployResource("claude-integration/tab-backup.js", File(CLAUDE_HOME, "rider-plugin/tab-backup.js"))
@@ -3086,6 +3422,8 @@ bash ~/.claude/rider-plugin/rename-tab.sh "Short Topic Name"
 
 This applies to **new chats, resumed chats** (`--resume`), **and `/resume`**. On resume, re-use the previous tab name if the topic hasn't changed.
 
+**Tab status:** the plugin also prefixes each terminal tab with a live status glyph — `●` working, `⚠` waiting for input or a permission prompt, `✓` finished, `○` idle, `✕` exited. That prefix is applied to the tab title only and is **not** part of the tab's name: never include it when you pass a name to `rename-tab.sh`, and ignore it when reading a tab name back.
+
 **Scope note:** This plugin manages **terminal-launched Claude CLI sessions only**. Sessions started in the JetBrains AI Assistant chat tool window (the "AI Agents" panel: Junie / Claude Agent / Codex) are managed by JetBrains and are not auto-restored across Rider restarts by this plugin.
 $CLAUDE_MD_MARKER
 """.trimStart()
@@ -3103,69 +3441,48 @@ $CLAUDE_MD_MARKER
                 LOG.info("[ClaudeTabs] Added CLAUDE.md section")
             }
 
-            addPermission()
-            addSessionStartHook()
+            patchClaudeSettings()
         } catch (e: Exception) { LOG.warn("[ClaudeTabs] Deploy failed: ${e.message}") }
     }
 
-    private val HOOK_MARKER = "session-start-hook.sh"
-    private val HOOK_MARKER_LEGACY = "active-sessions"
-
-    private fun addSessionStartHook() {
+    /**
+     * Register the plugin's hooks and Bash permissions in `~/.claude/settings.json`.
+     *
+     * Goes through [ClaudeSettingsPatcher], which parses the file and edits the tree. The
+     * pre-1.0.19 approach was regex string surgery, which was already brittle for the single
+     * `SessionStart` entry and could not survive adding five events: it assumed a specific
+     * shape and silently produced invalid JSON when the user's file differed — and a
+     * settings.json Claude Code can't parse takes Claude down with it.
+     *
+     * A missing file is created; an unparseable one is left strictly alone.
+     */
+    private fun patchClaudeSettings() {
         val sf = File(CLAUDE_HOME, "settings.json")
-        if (!sf.exists()) return
         try {
-            val text = sf.readText()
-            if (text.contains(HOOK_MARKER) || text.contains(HOOK_MARKER_LEGACY)) return
-
-            val hookEntry = """
-                      {
-                        "hooks": [
-                          {
-                            "type": "command",
-                            "command": "bash ~/.claude/rider-plugin/session-start-hook.sh",
-                            "timeout": 5
-                          }
-                        ]
-                      }
-            """.trimIndent()
-
-            if (!text.contains("\"hooks\"")) {
-                // No hooks section at all — add the entire block
-                val hookJson = "\"hooks\": {\n    \"SessionStart\": [\n      $hookEntry\n    ]\n  }"
-                sf.writeText(text.trimEnd().removeSuffix("}") + ",\n  $hookJson\n}")
-                LOG.info("[ClaudeTabs] Added hooks section with SessionStart hook")
-            } else if (!text.contains("\"SessionStart\"")) {
-                // Has hooks but no SessionStart — add SessionStart array
-                sf.writeText(text.replace(Regex(""""hooks"\s*:\s*\{"""), "\"hooks\": {\n    \"SessionStart\": [\n      $hookEntry\n    ],"))
-                LOG.info("[ClaudeTabs] Added SessionStart hook to existing hooks")
-            } else {
-                // Has SessionStart but our hook isn't in it — append to the array
-                sf.writeText(text.replace(Regex(""""SessionStart"\s*:\s*\["""), "\"SessionStart\": [\n      $hookEntry,"))
-                LOG.info("[ClaudeTabs] Appended hook to existing SessionStart array")
-            }
-        } catch (e: Exception) {
-            LOG.debug("[ClaudeTabs] Hook install failed: ${e.message}")
-        }
-    }
-
-    private fun addPermission() {
-        val sf = File(CLAUDE_HOME, "settings.json")
-        if (!sf.exists()) return
-        try {
-            for (entry in PERMISSION_ENTRIES) {
-                val text = sf.readText()
-                if (text.contains(entry)) continue
-                when {
-                    text.contains("\"allow\"") ->
-                        sf.writeText(text.replace(Regex(""""allow"\s*:\s*\["""), "\"allow\": [\"$entry\", "))
-                    text.contains("\"permissions\"") ->
-                        sf.writeText(text.replace(Regex(""""permissions"\s*:\s*\{"""), "\"permissions\": {\n    \"allow\": [\"$entry\"],"))
-                    else ->
-                        sf.writeText(text.trimEnd().removeSuffix("}") + ",\n  \"permissions\": {\n    \"allow\": [\"$entry\"]\n  }\n}")
+            val before = if (sf.exists()) sf.readText() else null
+            val after = ClaudeSettingsPatcher.patch(before, PERMISSION_ENTRIES)
+            if (after == null) {
+                if (before != null && !before.isBlank()) {
+                    try {
+                        MiniJson.parse(before)
+                        LOG.debug("[ClaudeTabs] settings.json already up to date")
+                    } catch (_: MiniJson.ParseException) {
+                        LOG.warn("[ClaudeTabs] settings.json is not valid JSON — leaving it untouched. Hooks and permissions were NOT installed; fix the file and restart the IDE.")
+                    }
                 }
+                return
             }
-        } catch (e: Exception) { LOG.debug("[ClaudeTabs] Permission install failed: ${e.message}") }
+            // Keep a one-shot copy of whatever was there before the first rewrite, so a bad
+            // patch is recoverable by hand.
+            val backup = File(CLAUDE_HOME, "rider-plugin/settings.json.bak")
+            if (before != null && !backup.exists()) {
+                try { backup.parentFile?.mkdirs(); backup.writeText(before) } catch (_: Exception) { }
+            }
+            writeAtomic(sf, after)
+            LOG.info("[ClaudeTabs] settings.json updated — status hooks (${ClaudeSettingsPatcher.STATUS_EVENTS.joinToString(", ")}) and ${PERMISSION_ENTRIES.size} permissions ensured")
+        } catch (e: Exception) {
+            LOG.warn("[ClaudeTabs] settings.json patch failed: ${e.message}")
+        }
     }
 
     /**

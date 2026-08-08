@@ -38,11 +38,12 @@ internal object SessionsDirScanner {
         val skipOtherProject: Int,
         val skipAlreadyHave: Int,
         val skipNoTranscript: Int,
+        val skipNotInteractive: Int = 0,
     ) {
         /** One-line summary suitable for the periodic log entry. */
         fun statusLine(): String =
             "scanned=$scanned added=${added.size} skipDead=$skipDead skipOtherProject=$skipOtherProject " +
-                "skipAlreadyHave=$skipAlreadyHave skipNoTranscript=$skipNoTranscript"
+                "skipAlreadyHave=$skipAlreadyHave skipNoTranscript=$skipNoTranscript skipNotInteractive=$skipNotInteractive"
     }
 
     /** Result of the alive + recycling check. Returned by [aliveProcessInfo] so the
@@ -92,6 +93,7 @@ internal object SessionsDirScanner {
         var skipOtherProject = 0
         var skipAlreadyHave = 0
         var skipNoTranscript = 0
+        var skipNotInteractive = 0
 
         // Defensive try/catch wraps the whole loop so a single bad file (or an
         // ENOENT on the sessions dir itself) doesn't abort the rest of the scan.
@@ -117,6 +119,16 @@ internal object SessionsDirScanner {
                 val rawSessionId = ClaudeTabsHelpers.extractJsonString(text, "sessionId") ?: return@forEach
                 val cwd = ClaudeTabsHelpers.extractJsonString(text, "cwd") ?: return@forEach
 
+                // Background jobs, daemon workers, Claude Desktop and remote-control
+                // sessions are never terminal tabs. They pass every other predicate here —
+                // a bg job is a descendant of the terminal session that launched it, so it
+                // is alive, looks like Claude, and shares the cwd — and would otherwise be
+                // restored as a tab running `claude --resume` against a job transcript.
+                if (!ClaudeTabsHelpers.isTerminalTabSessionKind(ClaudeTabsHelpers.extractJsonString(text, "kind"))) {
+                    skipNotInteractive++
+                    return@forEach
+                }
+
                 if (!ClaudeTabsHelpers.isCwdUnderProject(cwd, projectBasePath)) {
                     skipOtherProject++
                     return@forEach
@@ -141,6 +153,6 @@ internal object SessionsDirScanner {
             // already added are still saved correctly.
         }
 
-        return ScanResult(added, scanned, skipDead, skipOtherProject, skipAlreadyHave, skipNoTranscript)
+        return ScanResult(added, scanned, skipDead, skipOtherProject, skipAlreadyHave, skipNoTranscript, skipNotInteractive)
     }
 }
