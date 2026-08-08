@@ -185,3 +185,59 @@ class ClaudeStatusTest {
         )
     }
 }
+
+/**
+ * `SessionStart` has to be read together with its source.
+ *
+ * Restarting the IDE resumes every saved conversation, which fires `SessionStart` again.
+ * Mapping that to Idle wholesale meant a chat left at ✓ came back marked ○ — as if it had
+ * never run a turn. The restart is the IDE's business, not the conversation's.
+ */
+class SessionStartSourceTest {
+
+    private fun hook(source: String?, ts: Long = 100) = StatusResolver.HookSignal("SessionStart", ts, source)
+
+    @Test fun resumeKeepsTheConversationLookingFinished() {
+        assertEquals(ClaudeStatus.FINISHED, StatusResolver.fromHookEvent("SessionStart", "resume"))
+        assertEquals(ClaudeStatus.FINISHED, StatusResolver.resolve(hook("resume"), null))
+    }
+
+    @Test fun aGenuinelyNewSessionIsIdle() {
+        assertEquals(ClaudeStatus.IDLE, StatusResolver.fromHookEvent("SessionStart", "startup"))
+        assertEquals(ClaudeStatus.IDLE, StatusResolver.fromHookEvent("SessionStart", "clear"))
+    }
+
+    @Test fun compactEstablishesNothing() {
+        // Fires mid-conversation, often mid-turn: it says nothing about whether Claude is
+        // working, so it must not overwrite the state that is already showing.
+        assertNull(StatusResolver.fromHookEvent("SessionStart", "compact"))
+        assertEquals(
+            ClaudeStatus.WORKING,
+            StatusResolver.resolve(hook("compact", ts = 500), StatusResolver.SessionSignal("busy", 100, true)),
+        )
+    }
+
+    @Test fun anAbsentSourceKeepsTheOldBehaviour() {
+        // Hook files written before the source was recorded, and older deployed scripts.
+        assertEquals(ClaudeStatus.IDLE, StatusResolver.fromHookEvent("SessionStart"))
+        assertEquals(ClaudeStatus.IDLE, StatusResolver.fromHookEvent("SessionStart", null))
+        assertEquals(ClaudeStatus.IDLE, StatusResolver.fromHookEvent("SessionStart", ""))
+    }
+
+    @Test fun sourceOnlyMattersForSessionStart() {
+        // Nothing else carries one, and a stray value must not change their meaning.
+        assertEquals(ClaudeStatus.WORKING, StatusResolver.fromHookEvent("UserPromptSubmit", "resume"))
+        assertEquals(ClaudeStatus.EXITED, StatusResolver.fromHookEvent("SessionEnd", "resume"))
+        assertEquals(ClaudeStatus.FINISHED, StatusResolver.fromHookEvent("Stop", "startup"))
+    }
+
+    @Test fun theRestartScenarioEndToEnd() {
+        // Left finished; IDE restarts; the tab is respawned with `claude --resume`, which
+        // fires SessionStart(resume) and Claude reports the session as idle.
+        val afterRestart = StatusResolver.resolve(
+            hook("resume", ts = 2_000),
+            StatusResolver.SessionSignal("idle", 2_100, alive = true),
+        )
+        assertEquals("a finished chat must not come back as never-run", ClaudeStatus.FINISHED, afterRestart)
+    }
+}
