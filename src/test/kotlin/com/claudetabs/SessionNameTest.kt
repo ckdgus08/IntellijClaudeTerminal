@@ -12,7 +12,7 @@ import org.junit.Test
  *
  *   nameSource=derived  name=riderclaudetabs-29                      (built from the cwd)
  *   nameSource=derived  name=projects-68                             (built from the cwd)
- *   nameSource=auto     name=설치 스크립트 초기 설정 프로세스 개선      (Claude's summary)
+ *   nameSource=auto     name=install script setup rework      (Claude's summary)
  *
  * Only the last kind is worth putting on a tab. The first two are no better than the tab's
  * own default and would just look like noise that changes for no reason.
@@ -21,8 +21,8 @@ class SessionNameTest {
 
     @Test fun usesTheSummaryClaudeWrote() {
         assertEquals(
-            "설치 스크립트 초기 설정 프로세스 개선",
-            ClaudeTabsHelpers.meaningfulSessionName("설치 스크립트 초기 설정 프로세스 개선", "auto"),
+            "install script setup rework",
+            ClaudeTabsHelpers.meaningfulSessionName("install script setup rework", "auto"),
         )
     }
 

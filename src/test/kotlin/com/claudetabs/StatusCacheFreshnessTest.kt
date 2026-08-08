@@ -24,7 +24,7 @@ class StatusCacheFreshnessTest {
 
     private val sid = "aaaaaaaa-1111-2222-3333-444444444444"
 
-    private fun statusDir() = File(tmp.root, "rider-plugin/status").apply { mkdirs() }
+    private fun statusDir() = File(tmp.root, "intellij-claude-terminal/status").apply { mkdirs() }
     private fun sessionsDir() = File(tmp.root, "sessions").apply { mkdirs() }
 
     private fun writeHook(event: String, ts: Long, mtime: Long) {

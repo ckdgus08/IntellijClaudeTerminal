@@ -6,8 +6,8 @@ plugins {
     kotlin("jvm") version "2.3.21"
 }
 
-group = "com.claudetabs"
-version = "1.0.47"
+group = "io.github.ckdgus08"
+version = "1.1.0"
 
 repositories {
     mavenCentral()

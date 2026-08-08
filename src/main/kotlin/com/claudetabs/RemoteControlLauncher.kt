@@ -14,7 +14,7 @@ package com.claudetabs
  */
 internal object RemoteControlLauncher {
 
-    /** `~/.claude/rider-plugin/config.json` → `remoteControl` block. */
+    /** `~/.claude/intellij-claude-terminal/config.json` → `remoteControl` block. */
     data class Config(
         /**
          * Whether to start a server on IDE start.
