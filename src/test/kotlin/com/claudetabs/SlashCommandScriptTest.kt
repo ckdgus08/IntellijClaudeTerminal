@@ -481,10 +481,13 @@ class SlashCommandScriptTest {
 
         val parsed = parseCurrentProjectJson(r.stdout)
         val jsHash = parsed["hash"]!!
-        val kotlinHash = ClaudeTabsHelpers.projectHashForPath(proj.absolutePath)
+        // canonicalPath, not absolutePath: Node resolves symlinks in process.cwd() (on macOS
+        // the JUnit temp dir lives under /var -> /private/var), so feeding the raw absolute
+        // path to the Kotlin side would compare two different directories.
+        val kotlinHash = ClaudeTabsHelpers.projectHashForPath(proj.canonicalPath)
         assertEquals(
             "JS hash should match Kotlin projectHashForPath for the same path " +
-                "(JS=$jsHash, Kotlin=$kotlinHash, path=${proj.absolutePath})",
+                "(JS=$jsHash, Kotlin=$kotlinHash, path=${proj.canonicalPath})",
             kotlinHash, jsHash,
         )
     }

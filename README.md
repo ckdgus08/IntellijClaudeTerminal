@@ -40,7 +40,7 @@ Restart Rider after editing.
 
 ## Compatibility
 
-- Rider / IntelliJ 2024.3+
+- Rider / IntelliJ 2026.1+ (build 261; verified against IntelliJ IDEA 2026.1.3)
 - Windows primary. macOS / Linux should work but less tested.
 - Requires Claude Code CLI (provides the `node` runtime the plugin's scripts use).
 
