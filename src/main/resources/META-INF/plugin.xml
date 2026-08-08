@@ -1,7 +1,7 @@
 <idea-plugin>
     <id>com.claudetabs.rider-claude-tabs</id>
     <name>Claude Terminal Tab Persistence</name>
-    <version>1.0.18</version>
+    <version>1.0.19</version>
     <vendor email="ragnaraven.dev@gmail.com" url="https://github.com/Ragnaraven/RiderClaudeTabs">Ragnaraven</vendor>
 
     <description><![CDATA[
@@ -13,6 +13,9 @@
 
     <h3>Features</h3>
     <ul>
+      <li><b>Live status glyph on every tab</b> &mdash; <code>&#x25CF;</code> working, <code>&#x26A0;</code> waiting for
+      input or a permission prompt, <code>&#x2713;</code> finished, <code>&#x25CB;</code> idle, <code>&#x2715;</code>
+      exited. Driven by Claude Code hooks, so it lands within a fraction of a second. Hover the tab for the wording.</li>
       <li><b>Auto-rename terminal tabs</b> based on the Claude conversation topic (or a name you give it)</li>
       <li><b>Race-condition-free</b> identification of each tab via <code>TERM_SESSION_ID</code> mapping</li>
       <li><b>Session save/restore</b> across IDE restarts — your named tabs come back</li>
@@ -31,8 +34,9 @@
     </ul>
 
     <p><b>Requirements:</b> Rider / IntelliJ 2026.1+ with the bundled Terminal plugin, and
-    <a href="https://docs.claude.com/s/claude-code">Claude Code CLI</a> installed. Currently Windows-focused
-    (the session-detection logic uses <code>tasklist</code>); macOS / Linux compatibility is in progress.</p>
+    <a href="https://docs.claude.com/s/claude-code">Claude Code CLI</a> installed. Session detection is
+    cross-platform (<code>ProcessHandle</code>); the bundled shell scripts branch on <code>tasklist</code> for
+    Windows and <code>ps</code> elsewhere. Windows and macOS are exercised; Linux should work but is less tested.</p>
 
     <p><b>Compatibility:</b> Rider / IntelliJ 2026.1 and newer. On Rider 2026.1 the plugin coexists
     with the JetBrains AI Assistant chat tool window (the "AI Agents" panel: Junie / Claude Agent / Codex)
@@ -43,6 +47,41 @@
     ]]></description>
 
     <change-notes><![CDATA[
+    <h3>1.0.19</h3>
+    <ul>
+      <li><b>Claude Code status on the terminal tab.</b> Each tab is prefixed with a glyph for the state of the Claude
+      session running in it: <code>&#x25CF;</code> Working, <code>&#x26A0;</code> Waiting for input, <code>&#x2713;</code>
+      Finished, <code>&#x25CB;</code> Idle, <code>&#x2715;</code> Exited. The tab tooltip spells the state out. Nothing
+      else about the terminal changes &mdash; no new tool window, no new panel, no change to how you launch
+      <code>claude</code>.</li>
+      <li><b>Hook-driven, with a reconciliation pass.</b> Hooks on <code>SessionStart</code>,
+      <code>UserPromptSubmit</code>, <code>Notification</code>, <code>Stop</code> and <code>SessionEnd</code> record each
+      transition the moment it happens. Claude Code's own per-session <code>status</code> field
+      (<code>~/.claude/sessions/&lt;pid&gt;.json</code>: <code>busy</code>/<code>shell</code>/<code>idle</code>/<code>waiting</code>)
+      is read alongside it, which covers sessions that started before the hooks were installed, permission prompts that
+      emit no <code>Notification</code>, and a Claude that was killed rather than exiting. Newer signal wins, except that
+      a stale <code>idle</code> can't downgrade a hook-established <i>Finished</i>. <code>SubagentStop</code> is
+      deliberately not subscribed &mdash; a subagent finishing is not the turn finishing.</li>
+      <li><b>The glyph never reaches disk.</b> Decoration is applied to the live tab title only and stripped at every
+      point a title is read back, so <code>names.json</code>, the restore files and history keep bare names. Without
+      this, a restored tab would come back literally called <code>&#x25CF; backend</code>.</li>
+      <li><b><code>settings.json</code> is now edited as JSON, not as text.</b> Hook and permission installation parses
+      the file, edits the tree and re-serialises. The previous regex string-surgery assumed one particular file shape
+      and produced invalid JSON on any other &mdash; which takes Claude Code down with it. Unrelated settings, the
+      user's own hooks, and their matchers are preserved verbatim; a file that can't be parsed is left strictly alone
+      and the failure is logged. The pre-edit file is copied once to
+      <code>~/.claude/rider-plugin/settings.json.bak</code>. Uninstall removes our entries the same way instead of
+      leaving dangling commas behind.</li>
+      <li><b>Status runs on its own loop</b>, separate from the 5s save poll, at a 400ms cadence over a handful of small
+      files, touching only the tabs whose state actually changed. It does not use a <code>WatchService</code>: the JDK
+      has no native file watcher on macOS and falls back to a polling implementation with a 10s sensitivity, which would
+      be slower than this.</li>
+      <li>Built and verified against IntelliJ IDEA 2026.1.3 (IU-261.25134.95) on Gradle 9.7 / JDK 21.</li>
+      <li>323 unit tests &mdash; new coverage for the decorate/strip round-trip invariant across every state, the
+      hook-vs-session-file precedence table, status reading against real Claude Code file shapes, and the
+      <code>settings.json</code> patcher (idempotency, preservation of foreign hooks, refusal to touch malformed JSON).</li>
+    </ul>
+
     <h3>1.0.18</h3>
     <ul>
       <li><b>Window-state serialization: tabs are tracked by which Rider window they live in, not by their working directory.</b> A Claude session opened from a sibling folder (e.g. a git worktree at <code>D:\Dev\MyApp-feature-branch</code>) whose terminal tab is hosted in the main project's Rider window is now correctly tracked in that project's restore file. Pre-1.0.18 the cwd-prefix filter dropped these sessions as "cross-project leaks" and they never auto-restored.</li>
