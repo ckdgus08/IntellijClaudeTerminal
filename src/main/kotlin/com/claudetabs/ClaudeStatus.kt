@@ -91,8 +91,12 @@ internal object StatusResolver {
     /**
      * The last hook that fired for a session. [event] is the Claude Code hook event name
      * exactly as it appears in `settings.json`; [ts] is when the hook script ran (epoch ms).
+     *
+     * [source] is only carried by `SessionStart`, where it says how the session began:
+     * `startup` | `resume` | `clear` | `compact`. Null for every other event, and for hook
+     * files written before the plugin started recording it.
      */
-    data class HookSignal(val event: String, val ts: Long)
+    data class HookSignal(val event: String, val ts: Long, val source: String? = null)
 
     /**
      * A reading of `~/.claude/sessions/<pid>.json`. [status] is Claude's own field
@@ -101,12 +105,32 @@ internal object StatusResolver {
      */
     data class SessionSignal(val status: String?, val statusUpdatedAt: Long, val alive: Boolean)
 
-    /** Hook event → the state it establishes. Unknown events contribute nothing. */
-    fun fromHookEvent(event: String): ClaudeStatus? = when (event) {
+    /**
+     * Hook event → the state it establishes. Unknown events contribute nothing.
+     *
+     * `SessionStart` needs its [source] to be read correctly. Restarting the IDE resumes
+     * each saved conversation, which fires `SessionStart` again — and mapping that to
+     * [ClaudeStatus.IDLE] wholesale meant a chat you had left finished came back marked as
+     * never having run a turn. The restart is the IDE's business, not the conversation's:
+     *
+     *  - `startup` / `clear` — genuinely nothing has run yet → [ClaudeStatus.IDLE]
+     *  - `resume` — an existing conversation picked back up, sitting at the prompt with its
+     *    last turn behind it → [ClaudeStatus.FINISHED]
+     *  - `compact` — fires mid-conversation, often mid-turn. It says nothing about whether
+     *    Claude is working, so it establishes nothing and leaves the current state alone.
+     *
+     * A null [source] (an older hook script, or a file written before this was recorded)
+     * falls back to [ClaudeStatus.IDLE], which is the previous behaviour.
+     */
+    fun fromHookEvent(event: String, source: String? = null): ClaudeStatus? = when (event) {
         "UserPromptSubmit" -> ClaudeStatus.WORKING
         "Notification" -> ClaudeStatus.WAITING
         "Stop" -> ClaudeStatus.FINISHED
-        "SessionStart" -> ClaudeStatus.IDLE
+        "SessionStart" -> when (source) {
+            "resume" -> ClaudeStatus.FINISHED
+            "compact" -> null
+            else -> ClaudeStatus.IDLE
+        }
         "SessionEnd" -> ClaudeStatus.EXITED
         else -> null
     }
@@ -138,7 +162,7 @@ internal object StatusResolver {
      *     the hook's is strictly more informative.
      */
     fun resolve(hook: HookSignal?, session: SessionSignal?, now: Long = 0L): ClaudeStatus? {
-        val hookState = hook?.let { fromHookEvent(it.event) }
+        val hookState = hook?.let { fromHookEvent(it.event, it.source) }
         val sessionState = session?.let { fromSessionStatus(it.status) }
 
         // Rule 1 — terminal states.

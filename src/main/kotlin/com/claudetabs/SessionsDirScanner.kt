@@ -67,7 +67,28 @@ internal object SessionsDirScanner {
             info.command.endsWith("claude.cmd") ||
             info.commandLine.contains("@anthropic", true) ||
             info.commandLine.contains("claude-code", true) ||
-            (info.command.contains("node", true) && info.commandLine.contains("claude", true))
+            (info.command.contains("node", true) && info.commandLine.contains("claude", true)) ||
+            // The installed CLI is a versioned binary whose filename is the version, not
+            // "claude": `~/.local/share/claude/versions/2.1.226`. Sessions the daemon
+            // launches (background agents) run it directly rather than through the
+            // `~/.local/bin/claude` shim, so the name checks above all miss them.
+            //
+            // This mattered: a live background agent read as "dead", which made the restore
+            // path treat its session as restorable and try `claude --resume` on a session
+            // that was still running — which Claude refuses with "currently running as a
+            // background agent".
+            CLAUDE_INSTALL_PATH.containsMatchIn(info.command) ||
+            CLAUDE_INSTALL_PATH.containsMatchIn(info.commandLine)
+
+    /**
+     * Paths the Claude Code CLI is installed at, for processes whose executable name alone
+     * doesn't identify them. Covers the versioned binary and the bundled app wrapper on
+     * macOS, on both the per-user and shared install roots.
+     */
+    private val CLAUDE_INSTALL_PATH = Regex(
+        """[/\\](?:\.local[/\\]share[/\\]claude|ClaudeCode\.app)[/\\]""",
+        RegexOption.IGNORE_CASE,
+    )
 
     /**
      * Run the scan over [sessionsDir].
