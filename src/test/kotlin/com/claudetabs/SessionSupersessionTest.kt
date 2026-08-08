@@ -48,20 +48,20 @@ class SessionSupersessionTest {
     @Test fun linksTheReplacedSessionToItsReplacementByPid() {
         hook(old, "SessionEnd", 12001)
         session(12001, new)
-        assertEquals(mapOf(old to new), store().supersededSessions { true })
+        assertEquals(mapOf(old to new), store().supersededSessions(setOf(old)) { true })
     }
 
     /** A process that really did exit is a real death, and must stay one. */
     @Test fun aDeadProcessIsNotASupersession() {
         hook(old, "SessionEnd", 12001)
         session(12001, new)
-        assertTrue(store().supersededSessions { false }.isEmpty())
+        assertTrue(store().supersededSessions(setOf(old)) { false }.isEmpty())
     }
 
     /** No session file for the pid means nothing took over — the session genuinely ended. */
     @Test fun anEndedSessionWithNoSuccessorIsNotASupersession() {
         hook(old, "SessionEnd", 12001)
-        assertTrue(store().supersededSessions { true }.isEmpty())
+        assertTrue(store().supersededSessions(setOf(old)) { true }.isEmpty())
     }
 
     /**
@@ -71,7 +71,7 @@ class SessionSupersessionTest {
     @Test fun theSameIdIsNotASupersession() {
         hook(old, "SessionEnd", 12001)
         session(12001, old)
-        assertTrue(store().supersededSessions { true }.isEmpty())
+        assertTrue(store().supersededSessions(setOf(old)) { true }.isEmpty())
     }
 
     /** Only an ended session can have been replaced; a running one is just running. */
@@ -80,7 +80,7 @@ class SessionSupersessionTest {
             statusDir().listFiles()?.forEach { it.delete() }
             hook(old, event, 12001)
             session(12001, new)
-            assertTrue("$event should not count", store().supersededSessions { true }.isEmpty())
+            assertTrue("$event should not count", store().supersededSessions(setOf(old)) { true }.isEmpty())
         }
     }
 
@@ -89,13 +89,26 @@ class SessionSupersessionTest {
         File(statusDir(), "termsess-abc.json")
             .writeText("""{"event":"SessionEnd","sessionId":"$old","ts":1,"pid":12001}""")
         session(12001, new)
-        assertTrue(store().supersededSessions { true }.isEmpty())
+        assertTrue(store().supersededSessions(setOf(old)) { true }.isEmpty())
+    }
+
+    /**
+     * Scoping is not just an optimisation — it is what keeps the cost tied to the tabs
+     * that exist rather than to every session the machine has ever run. A supersession
+     * nobody holds a tab for has nothing to hand over.
+     */
+    @Test fun ignoresSessionsTheCallerIsNotHolding() {
+        hook(old, "SessionEnd", 12001)
+        session(12001, new)
+        assertTrue(store().supersededSessions(emptySet()) { true }.isEmpty())
+        assertTrue(store().supersededSessions(setOf("some-other-session")) { true }.isEmpty())
+        assertEquals(mapOf(old to new), store().supersededSessions(setOf(old)) { true })
     }
 
     @Test fun survivesMissingAndMalformedFiles() {
         File(statusDir(), "$old.json").writeText("not json")
         File(sessionsDir(), "12001.json").writeText("{")
-        assertTrue(store().supersededSessions { true }.isEmpty())
+        assertTrue(store().supersededSessions(setOf(old)) { true }.isEmpty())
     }
 
     /**
