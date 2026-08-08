@@ -319,13 +319,17 @@ internal object ClaudeTabsHelpers {
      *  - `derived` — mechanically built from the working directory (`riderclaudetabs-29`,
      *    `projects-68`). No better than the tab's default, so it is ignored.
      *  - `auto` — Claude's own summary of what the conversation is about
-     *    (`설치 스크립트 초기 설정 프로세스 개선`). This is the good one.
+     *    (`설치 스크립트 초기 설정 프로세스 개선`).
      *  - `user` — set deliberately.
      *
-     * Reading this is free and needs no cooperation from the conversation. It is strictly
-     * better than the alternative the plugin shipped with, which asks Claude — via an
-     * instruction injected into `~/.claude/CLAUDE.md` — to spend a turn calling
-     * `rename-tab.sh` at the start of every conversation.
+     * **`auto` never arrives for a terminal session.** In Claude Code 2.1.226 the whole
+     * auto-naming path is gated on `Fs()`, which is `sessionKind === "bg"` — it names
+     * *background agents*, so an interactive session started in a tab stays `derived` for
+     * its whole life. Waiting for Claude to promote the name is waiting for something that
+     * does not happen, which is why [firstPromptName] exists as the second source.
+     *
+     * Kept as the first source anyway: it costs one field read, and it is the right answer
+     * the moment Claude does start naming interactive sessions.
      *
      * Returns null when there is nothing worth showing, so callers can fall through.
      */
@@ -334,6 +338,155 @@ internal object ClaudeTabsHelpers {
         if (nameSource != "auto" && nameSource != "user") return null
         val trimmed = name.trim()
         return trimmed.takeUnless { it.isEmpty() || isGenericTabName(it) }
+    }
+
+    /**
+     * Longest tab label [firstPromptName] will produce, before the ellipsis.
+     *
+     * Tuned against real names on a Korean IDE: 32 filled the tab strip with sentences that
+     * were still cut off mid-thought, which is the worst of both. 20 reads as a label.
+     */
+    const val PROMPT_NAME_MAX_CHARS = 20
+
+    /**
+     * A tab label built from the conversation's opening question.
+     *
+     * This is the fallback for what [meaningfulSessionName] can't deliver: a name that says
+     * what the tab is *about*. The transcript's first real user turn is the same text
+     * Claude's own `--resume` picker shows for a session, so it reads as a summary even
+     * though nothing summarised it — and it costs the conversation nothing, since the
+     * transcript is already on disk.
+     *
+     * Only the turns a person actually typed count. A transcript opens with machinery that
+     * would otherwise become the name:
+     *
+     *  - `<system-reminder>` blocks — injected context, present on the first turn of every
+     *    session. Claude's own reader slices past the last `</system-reminder>`, so this
+     *    does the same rather than skipping the line.
+     *  - `<command-name>…` / `<local-command-stdout>` — the echo of a slash command such as
+     *    `/cd`, which names every tab that opened with one identically.
+     *  - `isMeta` turns and the local-command caveat banner.
+     *
+     * [lines] is a sequence so the caller can hand over the head of the file rather than
+     * reading a transcript that runs to megabytes.
+     */
+    fun firstPromptName(lines: Sequence<String>, maxChars: Int = PROMPT_NAME_MAX_CHARS): String? {
+        for (line in lines) {
+            val text = userTurnText(line) ?: continue
+            val cleaned = cleanPromptText(text) ?: continue
+            return condense(cleaned, maxChars)
+        }
+        return null
+    }
+
+    /** The plain-string content of one transcript line, if it is a user turn a person typed. */
+    private fun userTurnText(line: String): String? {
+        // Cheap reject before parsing: a transcript is mostly assistant turns and tool
+        // results, and parsing every one of those to discard it is the expensive way to
+        // find the handful of user lines.
+        if (!line.contains("\"user\"")) return null
+        @Suppress("UNCHECKED_CAST")
+        val root = try { MiniJson.parse(line) as? Map<String, Any?> } catch (_: Exception) { null } ?: return null
+        if (root["type"] != "user") return null
+        if (root["isMeta"] == true) return null
+        @Suppress("UNCHECKED_CAST")
+        val message = root["message"] as? Map<String, Any?> ?: return null
+        // Content is a bare string only for a typed turn; a tool result arrives as an array
+        // of blocks, and that is never a name.
+        return message["content"] as? String
+    }
+
+    /** Strip the injected wrappers; null when nothing a person typed is left. */
+    private fun cleanPromptText(raw: String): String? {
+        val afterReminder = raw.lastIndexOf("</system-reminder>")
+            .let { if (it >= 0) raw.substring(it + "</system-reminder>".length) else raw }
+            .trim()
+        if (afterReminder.isEmpty()) return null
+        if (afterReminder.contains("<command-name>")) return null
+        if (afterReminder.contains("<local-command-stdout>")) return null
+        if (afterReminder.startsWith("Caveat:")) return null
+        if (looksLikeSecret(afterReminder)) return null
+        return afterReminder
+    }
+
+    /**
+     * Whether text opens with something that must not be shown or stored.
+     *
+     * People paste credentials into a fresh session as the very first thing they say — one
+     * of the transcripts this was tested against opens with a GitHub personal access token.
+     * A tab name is not a private place: it goes on the tab strip, into `names.json`, and
+     * into the restore file, all of which outlive the conversation.
+     *
+     * A hit skips the turn rather than redacting it, so the next thing the person typed
+     * becomes the name instead.
+     */
+    fun looksLikeSecret(text: String): Boolean {
+        val head = text.take(200)
+        if (SECRET_PREFIXES.containsMatchIn(head)) return true
+        // A single opaque blob with no whitespace at all: too long to be a sentence, mixed
+        // letters and digits, and not a path or URL (those are legitimately long).
+        val firstWord = text.trimStart().substringBefore(' ').substringBefore('\n')
+        return firstWord.length >= 40 &&
+            firstWord.any { it.isDigit() } && firstWord.any { it.isLetter() } &&
+            !firstWord.contains("://") && !firstWord.contains('/') && !firstWord.contains('\\')
+    }
+
+    /** Token shapes common enough to be worth naming. Not exhaustive, and doesn't need to be. */
+    private val SECRET_PREFIXES = Regex(
+        """(gh[pousr]_|github_pat_|glpat-|sk-ant-|sk-[A-Za-z0-9]|sk_live_|pk_live_|xox[baprs]-|AKIA[A-Z0-9]{16}|AIza[A-Za-z0-9_-]{10}|npm_[A-Za-z0-9]{10}|-----BEGIN )"""
+    )
+
+    /** Collapse to one line and cut at a word boundary so the tab strip stays readable. */
+    private fun condense(text: String, maxChars: Int): String? {
+        val flat = text.replace(Regex("\\s+"), " ").trim()
+        if (flat.isEmpty()) return null
+        if (flat.length <= maxChars) return flat
+        val cut = flat.take(maxChars)
+        val lastSpace = cut.lastIndexOf(' ')
+        // Korean and Japanese run without spaces, so a word boundary often isn't there;
+        // requiring one would truncate to nothing. Only honour it when it keeps most of
+        // the budget.
+        val body = if (lastSpace >= maxChars / 2) cut.take(lastSpace) else cut
+        return body.trimEnd() + "…"
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // "EXITED" WHILE A RESTORED TAB IS STILL COMING UP
+    // ══════════════════════════════════════════════════════════════
+
+    /**
+     * How long after spawning a tab an [ClaudeStatus.EXITED] reading is treated as "not
+     * started yet" rather than "dead". Generous: `claude --resume` on a long transcript can
+     * take several seconds before it writes its first session file.
+     */
+    const val EXITED_GRACE_MS = 20_000L
+
+    /**
+     * Whether an [ClaudeStatus.EXITED] reading should be painted yet.
+     *
+     * A tab restored on IDE start exists before the `claude --resume` inside it does. For
+     * those few seconds the only session file on disk for that id is the dead one from
+     * before the restart, so the status resolves to EXITED and every restored tab shows `✕`
+     * — observed as a 4-second flash across the whole tab strip on every start.
+     *
+     * So EXITED is held back while all three hold: the tab was spawned by the restore,
+     * within [graceMs], and the session has never once been seen running. A session that
+     * really did die still lands on `✕` — either immediately (it was running earlier this
+     * IDE run, so [everSeenRunning] is true) or once the grace expires. Nothing is
+     * suppressed permanently.
+     *
+     * [spawnedAtMs] is null for tabs the plugin didn't spawn; those are believed at once,
+     * since there was no restore to be mid-flight.
+     */
+    fun shouldPaintExited(
+        spawnedAtMs: Long?,
+        everSeenRunning: Boolean,
+        now: Long,
+        graceMs: Long = EXITED_GRACE_MS,
+    ): Boolean {
+        if (everSeenRunning) return true
+        if (spawnedAtMs == null) return true
+        return now - spawnedAtMs >= graceMs
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -513,7 +666,7 @@ internal object ClaudeTabsHelpers {
      * `--`, then `/` → `-`.
      */
     fun hasTranscriptAnywhere(projectsDir: java.io.File, sessionId: String, cwd: String?): Boolean {
-        if (sessionId.isBlank()) return false
+        if (!isSafeSessionId(sessionId)) return false
         if (!cwd.isNullOrBlank()) {
             val h = cwd.replace("\\", "/").replace(":/", "--").replace("/", "-")
             if (java.io.File(java.io.File(projectsDir, h), "$sessionId.jsonl").exists()) return true
@@ -523,6 +676,78 @@ internal object ClaudeTabsHelpers {
             if (java.io.File(d, "$sessionId.jsonl").exists()) return true
         }
         return false
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // SESSION ID VALIDATION
+    // ══════════════════════════════════════════════════════════════
+
+    /**
+     * Whether [sessionId] is safe to put in a shell command or a file path.
+     *
+     * A session id is the one piece of on-disk data this plugin turns into *code*: restore
+     * types `claude --resume <id>` into a live terminal, and the id also names files under
+     * `~/.claude`. Unvalidated, both are exploitable by anything that can write a session
+     * file or the restore file —
+     *
+     *     claude --resume abc$(id > /tmp/pwned); echo      ← runs in your terminal
+     *     File(dir, "../../etc/x.json")                    ← escapes the directory
+     *
+     * — and the `--dangerously-skip-permissions` flag the same command may carry makes the
+     * blast radius worse. That requires write access to the home directory, so it is
+     * defence in depth rather than a hole anyone can reach remotely; it is also one cheap
+     * check on the single field that becomes executable.
+     *
+     * Deliberately an allowlist, and deliberately wider than "must be a UUID": real ids are
+     * UUIDs today, but pinning to that would break the moment Claude changes the format,
+     * and the property that actually matters is "contains nothing a shell or a path parser
+     * treats specially".
+     */
+    fun isSafeSessionId(sessionId: String?): Boolean {
+        if (sessionId.isNullOrBlank()) return false
+        if (sessionId.length > 128) return false
+        if (sessionId.contains("..")) return false
+        return sessionId.all { it.isLetterOrDigit() || it == '-' || it == '_' || it == '.' }
+    }
+
+    /** The transcript file for [sessionId], searched by [cwd] first and then everywhere. */
+    fun findTranscript(projectsDir: java.io.File, sessionId: String, cwd: String?): java.io.File? {
+        if (!isSafeSessionId(sessionId)) return null
+        if (!cwd.isNullOrBlank()) {
+            val h = cwd.replace("\\", "/").replace(":/", "--").replace("/", "-")
+            java.io.File(java.io.File(projectsDir, h), "$sessionId.jsonl").let { if (it.exists()) return it }
+        }
+        val dirs = projectsDir.listFiles { f -> f.isDirectory } ?: return null
+        for (d in dirs) {
+            java.io.File(d, "$sessionId.jsonl").let { if (it.exists()) return it }
+        }
+        return null
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // PERMISSION MODE
+    // ══════════════════════════════════════════════════════════════
+
+    /**
+     * The permission mode a transcript records for its session, or null if it records none.
+     *
+     * The distinction matters and is not cosmetic. A restored tab re-runs `claude --resume`,
+     * and whether that command carries `--dangerously-skip-permissions` is decided from this
+     * — so "recorded as default" and "not recorded at all" have to be told apart rather than
+     * both collapsing to false.
+     *
+     * Every transcript on a real install carries the record — checked across 14 of them —
+     * with exactly one exception: the one `/clear` creates. `/clear` keeps the same process
+     * and the same permission mode, but writes no `permission-mode` line into the new
+     * transcript, so a session that had bypass on silently came back without it after a
+     * restart. See the inheritance in `ClaudeTabWatcherStartup.readPermissionMode`.
+     */
+    fun permissionModeFrom(lines: Sequence<String>): String? {
+        for (line in lines) {
+            if (!line.contains("\"permission-mode\"")) continue
+            return extractJsonString(line, "permissionMode") ?: continue
+        }
+        return null
     }
 
     // ══════════════════════════════════════════════════════════════

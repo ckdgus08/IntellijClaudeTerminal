@@ -96,7 +96,22 @@ internal object StatusResolver {
      * `startup` | `resume` | `clear` | `compact`. Null for every other event, and for hook
      * files written before the plugin started recording it.
      */
-    data class HookSignal(val event: String, val ts: Long, val source: String? = null)
+    data class HookSignal(
+        val event: String,
+        val ts: Long,
+        val source: String? = null,
+        /** `Notification` only: Claude's `notification_type`. See [IDLE_NOTIFICATION]. */
+        val notificationType: String? = null,
+    )
+
+    /**
+     * The `notification_type` Claude uses for its "Claude is waiting for your input" nudge,
+     * fired once the session has been idle for `messageIdleNotifThresholdMs` (60s).
+     *
+     * Not a permission prompt and not a state change — which is why a finished session used
+     * to show ✓ and then flip to ⚠ a minute later with nothing having happened.
+     */
+    const val IDLE_NOTIFICATION = "idle_prompt"
 
     /**
      * A reading of `~/.claude/sessions/<pid>.json`. [status] is Claude's own field
@@ -122,9 +137,14 @@ internal object StatusResolver {
      * A null [source] (an older hook script, or a file written before this was recorded)
      * falls back to [ClaudeStatus.IDLE], which is the previous behaviour.
      */
-    fun fromHookEvent(event: String, source: String? = null): ClaudeStatus? = when (event) {
+    fun fromHookEvent(event: String, source: String? = null, notificationType: String? = null): ClaudeStatus? = when (event) {
         "UserPromptSubmit" -> ClaudeStatus.WORKING
-        "Notification" -> ClaudeStatus.WAITING
+        // Not every notification means someone is blocked. `idle_prompt` is Claude nudging
+        // you 60s after it went idle — nothing about the turn changed, so it establishes
+        // nothing. status-hook.sh already declines to record it (writing it would destroy
+        // the `Stop` edge underneath); this covers files written before that, and any other
+        // route the event might arrive by.
+        "Notification" -> if (notificationType == IDLE_NOTIFICATION) null else ClaudeStatus.WAITING
         "Stop" -> ClaudeStatus.FINISHED
         "SessionStart" -> when (source) {
             "resume" -> ClaudeStatus.FINISHED
@@ -162,7 +182,7 @@ internal object StatusResolver {
      *     the hook's is strictly more informative.
      */
     fun resolve(hook: HookSignal?, session: SessionSignal?, now: Long = 0L): ClaudeStatus? {
-        val hookState = hook?.let { fromHookEvent(it.event, it.source) }
+        val hookState = hook?.let { fromHookEvent(it.event, it.source, it.notificationType) }
         val sessionState = session?.let { fromSessionStatus(it.status) }
 
         // Rule 1 — terminal states.
