@@ -3,14 +3,14 @@
 # status-hook.sh — Claude Code status hook
 # ─────────────────────────────────────────────────────────────────────
 # Usage (from ~/.claude/settings.json):
-#   bash ~/.claude/rider-plugin/status-hook.sh <EventName>
+#   bash ~/.claude/intellij-claude-terminal/status-hook.sh <EventName>
 #
 # Registered for SessionStart, UserPromptSubmit, Notification, Stop and
 # SessionEnd. Claude passes the hook payload as JSON on stdin; we only
 # need session_id out of it.
 #
 # Each invocation records one edge:
-#   ~/.claude/rider-plugin/status/{session_id}.json
+#   ~/.claude/intellij-claude-terminal/status/{session_id}.json
 #     {"event":"Stop","sessionId":"...","ts":1786179029939,"pid":12345}
 #
 # The plugin maps that session id to a terminal tab and prefixes the tab
@@ -47,7 +47,7 @@ SOURCE=$(echo "$INPUT" | sed -n 's/.*"source":"\([^"]*\)".*/\1/p')
 #   case "SessionStart": a = n.source
 NOTIF_TYPE=$(echo "$INPUT" | sed -n 's/.*"notification_type":"\([^"]*\)".*/\1/p')
 
-STATUS_DIR="$HOME/.claude/rider-plugin/status"
+STATUS_DIR="$HOME/.claude/intellij-claude-terminal/status"
 mkdir -p "$STATUS_DIR" 2>/dev/null || exit 0
 
 # Milliseconds since epoch. `date +%s%N` is GNU-only; on macOS (BSD date)

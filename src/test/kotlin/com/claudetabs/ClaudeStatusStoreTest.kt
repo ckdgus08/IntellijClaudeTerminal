@@ -23,7 +23,7 @@ class ClaudeStatusStoreTest {
     private fun setUpHome(): ClaudeStatusStore {
         home = tmp.newFolder("claude-home")
         File(home, "sessions").mkdirs()
-        File(home, "rider-plugin/status").mkdirs()
+        File(home, "intellij-claude-terminal/status").mkdirs()
         store = ClaudeStatusStore(home)
         return store
     }
@@ -36,7 +36,7 @@ class ClaudeStatusStoreTest {
     }
 
     private fun writeHook(sid: String, event: String, ts: Long, fileName: String = "$sid.json") {
-        File(home, "rider-plugin/status/$fileName").writeText(
+        File(home, "intellij-claude-terminal/status/$fileName").writeText(
             """{"event":"$event","sessionId":"$sid","ts":$ts,"pid":999}"""
         )
     }
@@ -108,7 +108,7 @@ class ClaudeStatusStoreTest {
         setUpHome()
         File(home, "sessions/bad.json").writeText("{not json")
         File(home, "sessions/300.json").writeText("{\"no\":\"sessionId\"}")
-        File(home, "rider-plugin/status/junk.json").writeText("nonsense")
+        File(home, "intellij-claude-terminal/status/junk.json").writeText("nonsense")
         writeSession(100, "sid-a", "busy", 1000)
 
         val snap = store.snapshot(allAlive)
@@ -140,14 +140,14 @@ class ClaudeStatusStoreTest {
 
         val dayMs = 24L * 60 * 60 * 1000
         val now = 10 * dayMs
-        File(home, "rider-plugin/status/sid-live.json").setLastModified(now - 5 * dayMs)
-        File(home, "rider-plugin/status/sid-old.json").setLastModified(now - 5 * dayMs)
-        File(home, "rider-plugin/status/sid-recent.json").setLastModified(now - 1000)
+        File(home, "intellij-claude-terminal/status/sid-live.json").setLastModified(now - 5 * dayMs)
+        File(home, "intellij-claude-terminal/status/sid-old.json").setLastModified(now - 5 * dayMs)
+        File(home, "intellij-claude-terminal/status/sid-recent.json").setLastModified(now - 1000)
 
         store.prune(liveSessionIds = setOf("sid-live"), maxAgeMs = dayMs, now = now)
 
-        assertTrue(File(home, "rider-plugin/status/sid-live.json").exists())
-        assertTrue(File(home, "rider-plugin/status/sid-recent.json").exists())
-        assertFalse(File(home, "rider-plugin/status/sid-old.json").exists())
+        assertTrue(File(home, "intellij-claude-terminal/status/sid-live.json").exists())
+        assertTrue(File(home, "intellij-claude-terminal/status/sid-recent.json").exists())
+        assertFalse(File(home, "intellij-claude-terminal/status/sid-old.json").exists())
     }
 }

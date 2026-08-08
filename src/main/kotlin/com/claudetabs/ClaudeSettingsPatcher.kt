@@ -29,8 +29,8 @@ internal object ClaudeSettingsPatcher {
         "SessionEnd",
     )
 
-    const val STATUS_HOOK_SCRIPT = "~/.claude/rider-plugin/status-hook.sh"
-    const val SESSION_START_SCRIPT = "~/.claude/rider-plugin/session-start-hook.sh"
+    const val STATUS_HOOK_SCRIPT = "~/.claude/intellij-claude-terminal/status-hook.sh"
+    const val SESSION_START_SCRIPT = "~/.claude/intellij-claude-terminal/session-start-hook.sh"
 
     fun statusHookCommand(event: String) = "bash $STATUS_HOOK_SCRIPT $event"
 
@@ -57,6 +57,7 @@ internal object ClaudeSettingsPatcher {
         }
 
         var changed = false
+        if (dropStaleHooks(root)) changed = true
         if (ensureHooks(root)) changed = true
         if (ensurePermissions(root, permissions)) changed = true
         // Permissions earlier versions granted for features that no longer exist. Leaving
@@ -157,6 +158,43 @@ internal object ClaudeSettingsPatcher {
     }
 
     /**
+     * Remove hooks this plugin installed under a directory it no longer uses.
+     *
+     * [ensureHooks] only ever adds, which is right for its job but leaves nothing to undo a
+     * path change. When the plugin's state directory was renamed, the entries pointing at
+     * the old one stayed in `settings.json` — and a hook whose script has moved doesn't fail
+     * quietly: Claude runs `bash <missing path>` on every single event, for every session on
+     * the machine.
+     *
+     * Matched on the old directory name, which only this plugin ever wrote.
+     */
+    private fun dropStaleHooks(root: MutableMap<String, Any?>): Boolean {
+        @Suppress("UNCHECKED_CAST")
+        val hooks = root["hooks"] as? MutableMap<String, Any?> ?: return false
+        var changed = false
+        for (event in hooks.keys.toList()) {
+            @Suppress("UNCHECKED_CAST")
+            val groups = hooks[event] as? MutableList<Any?> ?: continue
+            val kept = groups.filterNot { group ->
+                val entries = (group as? Map<*, *>)?.get("hooks") as? List<*> ?: return@filterNot false
+                entries.any { entry ->
+                    val cmd = (entry as? Map<*, *>)?.get("command") as? String ?: return@any false
+                    STALE_SCRIPT_DIRS.any { cmd.contains(it) }
+                }
+            }
+            if (kept.size != groups.size) {
+                changed = true
+                if (kept.isEmpty()) hooks.remove(event) else hooks[event] = kept.toMutableList()
+            }
+        }
+        if (hooks.isEmpty()) root.remove("hooks")
+        return changed
+    }
+
+    /** Directories this plugin used to deploy its scripts into. See [dropStaleHooks]. */
+    private val STALE_SCRIPT_DIRS = listOf("/.claude/rider-plugin/")
+
+    /**
      * Remove every plugin-installed hook and permission from [settingsText]. Returns null
      * if nothing changed or the file couldn't be parsed. Used by the uninstall path.
      */
@@ -181,7 +219,7 @@ internal object ClaudeSettingsPatcher {
                     val entries = (group as? Map<*, *>)?.get("hooks") as? List<*> ?: return@filterNot false
                     entries.any { entry ->
                         val cmd = (entry as? Map<*, *>)?.get("command") as? String ?: return@any false
-                        cmd.contains("rider-plugin/status-hook.sh") || cmd.contains("rider-plugin/session-start-hook.sh")
+                        cmd.contains("intellij-claude-terminal/status-hook.sh") || cmd.contains("intellij-claude-terminal/session-start-hook.sh")
                     }
                 }
                 if (kept.size != groups.size) {

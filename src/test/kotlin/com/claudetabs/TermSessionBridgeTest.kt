@@ -28,13 +28,13 @@ class TermSessionBridgeTest {
     private fun setUp(): ClaudeStatusStore {
         home = tmp.newFolder("claude-home")
         File(home, "sessions").mkdirs()
-        File(home, "rider-plugin/status").mkdirs()
+        File(home, "intellij-claude-terminal/status").mkdirs()
         store = ClaudeStatusStore(home)
         return store
     }
 
     private fun writeTermHook(termSessionId: String, sid: String, event: String = "SessionStart", ts: Long = 1000) {
-        File(home, "rider-plugin/status/termsess-$termSessionId.json").writeText(
+        File(home, "intellij-claude-terminal/status/termsess-$termSessionId.json").writeText(
             """{"event":"$event","sessionId":"$sid","ts":$ts,"pid":1}"""
         )
     }
@@ -64,7 +64,7 @@ class TermSessionBridgeTest {
     @Test fun outOfOrderWritesStillResolveToTheNewest() {
         setUp()
         // Directory listing order is not timestamp order; the ts field decides.
-        File(home, "rider-plugin/status/termsess-term-1.json").writeText(
+        File(home, "intellij-claude-terminal/status/termsess-term-1.json").writeText(
             """{"event":"SessionStart","sessionId":"newer","ts":5000,"pid":1}"""
         )
         assertEquals("newer", store.termSessionMap()["term-1"])
@@ -73,7 +73,7 @@ class TermSessionBridgeTest {
     @Test fun ignoresTheSessionKeyedFiles() {
         // status/<sessionId>.json drives the state; only termsess-* carries the terminal id.
         setUp()
-        File(home, "rider-plugin/status/some-session-id.json").writeText(
+        File(home, "intellij-claude-terminal/status/some-session-id.json").writeText(
             """{"event":"Stop","sessionId":"some-session-id","ts":1,"pid":1}"""
         )
         assertTrue(store.termSessionMap().isEmpty())
@@ -81,8 +81,8 @@ class TermSessionBridgeTest {
 
     @Test fun malformedOrEmptyEntriesAreSkipped() {
         setUp()
-        File(home, "rider-plugin/status/termsess-bad.json").writeText("not json")
-        File(home, "rider-plugin/status/termsess-blank.json").writeText("""{"event":"Stop","sessionId":"","ts":1}""")
+        File(home, "intellij-claude-terminal/status/termsess-bad.json").writeText("not json")
+        File(home, "intellij-claude-terminal/status/termsess-blank.json").writeText("""{"event":"Stop","sessionId":"","ts":1}""")
         writeTermHook("term-ok", "sid-ok")
 
         assertEquals(mapOf("term-ok" to "sid-ok"), store.termSessionMap())
@@ -97,7 +97,7 @@ class TermSessionBridgeTest {
         // has a state to show.
         setUp()
         writeTermHook("term-1", "sid-1", event = "UserPromptSubmit", ts = 2000)
-        File(home, "rider-plugin/status/sid-1.json").writeText(
+        File(home, "intellij-claude-terminal/status/sid-1.json").writeText(
             """{"event":"UserPromptSubmit","sessionId":"sid-1","ts":2000,"pid":1}"""
         )
 

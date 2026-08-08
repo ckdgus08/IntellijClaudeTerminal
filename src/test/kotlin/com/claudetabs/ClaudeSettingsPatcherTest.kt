@@ -13,7 +13,7 @@ import org.junit.Test
  */
 class ClaudeSettingsPatcherTest {
 
-    private val perms = listOf("Bash(bash ~/.claude/rider-plugin/rename-tab.sh *)")
+    private val perms = listOf("Bash(bash ~/.claude/intellij-claude-terminal/rename-tab.sh *)")
 
     @Suppress("UNCHECKED_CAST")
     private fun reparse(text: String) = MiniJson.parse(text) as Map<String, Any?>
@@ -102,7 +102,7 @@ class ClaudeSettingsPatcherTest {
             {
               "hooks": {
                 "Stop": [
-                  { "hooks": [ { "type": "command", "command": "/bin/bash ~/.claude/rider-plugin/status-hook.sh Stop", "timeout": 30 } ] }
+                  { "hooks": [ { "type": "command", "command": "/bin/bash ~/.claude/intellij-claude-terminal/status-hook.sh Stop", "timeout": 30 } ] }
                 ]
               }
             }
@@ -171,10 +171,10 @@ class ClaudeSettingsPatcherTest {
  */
 class RetiredPermissionTest {
 
-    private val kept = listOf("Bash(bash ~/.claude/rider-plugin/rename-tab.sh *)")
+    private val kept = listOf("Bash(bash ~/.claude/intellij-claude-terminal/rename-tab.sh *)")
     private val retired = listOf(
-        "Bash(bash ~/.claude/rider-plugin/tab.sh *)",
-        "Bash(node ~/.claude/rider-plugin/current-project.js)",
+        "Bash(bash ~/.claude/intellij-claude-terminal/tab.sh *)",
+        "Bash(node ~/.claude/intellij-claude-terminal/current-project.js)",
     )
 
     @Suppress("UNCHECKED_CAST")
@@ -185,20 +185,20 @@ class RetiredPermissionTest {
 
     @Test fun takesBackPermissionsForRemovedCommands() {
         val before = """{"permissions":{"allow":[
-            "Bash(bash ~/.claude/rider-plugin/rename-tab.sh *)",
-            "Bash(bash ~/.claude/rider-plugin/tab.sh *)",
-            "Bash(node ~/.claude/rider-plugin/current-project.js)"
+            "Bash(bash ~/.claude/intellij-claude-terminal/rename-tab.sh *)",
+            "Bash(bash ~/.claude/intellij-claude-terminal/tab.sh *)",
+            "Bash(node ~/.claude/intellij-claude-terminal/current-project.js)"
         ]}}"""
         val allow = allowList(ClaudeSettingsPatcher.patch(before, kept, retired)!!)
-        assertEquals(listOf<Any?>("Bash(bash ~/.claude/rider-plugin/rename-tab.sh *)"), allow)
+        assertEquals(listOf<Any?>("Bash(bash ~/.claude/intellij-claude-terminal/rename-tab.sh *)"), allow)
     }
 
     @Test fun leavesThePermissionsSomeoneElseGranted() {
-        val before = """{"permissions":{"allow":["Bash(ls)","Bash(bash ~/.claude/rider-plugin/tab.sh *)","Bash(git *)"]}}"""
+        val before = """{"permissions":{"allow":["Bash(ls)","Bash(bash ~/.claude/intellij-claude-terminal/tab.sh *)","Bash(git *)"]}}"""
         val allow = allowList(ClaudeSettingsPatcher.patch(before, kept, retired)!!)
         assertTrue(allow.contains("Bash(ls)"))
         assertTrue(allow.contains("Bash(git *)"))
-        assertFalse(allow.contains("Bash(bash ~/.claude/rider-plugin/tab.sh *)"))
+        assertFalse(allow.contains("Bash(bash ~/.claude/intellij-claude-terminal/tab.sh *)"))
     }
 
     @Test fun aFileWithNothingRetiredIsNotRewrittenForThisReason() {

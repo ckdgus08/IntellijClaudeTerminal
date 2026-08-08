@@ -30,7 +30,7 @@ class SessionSupersessionTest {
     private val new = "10000002-0000-4000-8000-000000000002"
 
     private fun home(): File = tmp.root
-    private fun statusDir() = File(home(), "rider-plugin/status").apply { mkdirs() }
+    private fun statusDir() = File(home(), "intellij-claude-terminal/status").apply { mkdirs() }
     private fun sessionsDir() = File(home(), "sessions").apply { mkdirs() }
 
     private fun hook(sid: String, event: String, pid: Long) {

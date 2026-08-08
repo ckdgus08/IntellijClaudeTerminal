@@ -1,8 +1,7 @@
 <idea-plugin>
-    <id>com.claudetabs.rider-claude-tabs</id>
-    <name>Claude Terminal Tab Persistence</name>
-    <version>1.0.36</version>
-    <vendor email="ragnaraven.dev@gmail.com" url="https://github.com/Ragnaraven/RiderClaudeTabs">Ragnaraven</vendor>
+    <id>io.github.ckdgus08.intellij-claude-terminal</id>
+    <name>Claude Terminal Tabs</name>
+    <vendor url="https://github.com/ckdgus08/IntellijClaudeTerminal">ckdgus08</vendor>
 
     <description><![CDATA[
     <h2>Claude Terminal Tab Persistence for Rider / IntelliJ</h2>
@@ -18,7 +17,7 @@
       exited. Driven by Claude Code hooks, so it lands within a fraction of a second. Hover the tab for the wording.</li>
       <li><b>Remote Control on by default</b> &mdash; a <code>claude remote-control</code> tab per project, so this
       machine's sessions are reachable from claude.ai/code and the Claude mobile app. Disable via
-      <code>remoteControl.enabled</code> in <code>~/.claude/rider-plugin/config.json</code>.</li>
+      <code>remoteControl.enabled</code> in <code>~/.claude/intellij-claude-terminal/config.json</code>.</li>
       <li><b>Tabs named from Claude's own summary</b> of the conversation, read out of its session file &mdash; no turn
       spent on naming. <code>/tab &lt;name&gt;</code> overrides it and is never overwritten.</li>
       <li><b>Race-condition-free</b> identification of each tab via <code>TERM_SESSION_ID</code> mapping</li>
@@ -35,8 +34,11 @@
     with the JetBrains AI Assistant chat tool window (the "AI Agents" panel: Junie / Claude Agent / Codex)
     and Anthropic's official Claude Code [Beta] plugin. <i>This plugin manages terminal-launched Claude CLI
     sessions only</i> — chat tabs in the AI Agents panel are managed by JetBrains and are not auto-restored
-    here. Set Registry key <code>rider.claude.tabs.respectAiAgents</code> to <code>false</code> to disable
+    here. Set Registry key <code>claude.terminal.tabs.respectAiAgents</code> to <code>false</code> to disable
     the coexistence notice in the log.</p>
+    <p>A fork of <a href="https://github.com/Ragnaraven/RiderClaudeTabs">RiderClaudeTabs</a> by Ragnaraven,
+    rebuilt for IntelliJ 2026.1's reworked terminal and extended with conversation-derived tab names, shaped
+    status icons and Remote Control. Licensed under MPL-2.0, as the original is.</p>
     ]]></description>
 
     <change-notes><![CDATA[
@@ -81,7 +83,7 @@
       maintains. The instruction now says the opposite: don't name the tab unless the user asks.</li>
       <li>What it still covers, because those cannot be read from anywhere: use the user's <i>exact words</i> when they
       do ask for a name, and never treat the status glyph as part of the name.</li>
-      <li>The deployed <code>CLAUDE.md</code> section is replaced between its markers on every start, so this applies
+      <li>Any <code>CLAUDE.md</code> section an older version installed is removed on start, so this applies
       without any manual edit.</li>
     </ul>
 
@@ -285,8 +287,8 @@
       is now never restored. Matching covers both the reported and the canonical id, since a resumed process reports a
       rotated one and the restore file stores the canonical.</li>
       <li><b>Remote Control can run without a tab.</b> Set <code>"mode": "background"</code> under
-      <code>remoteControl</code> in <code>~/.claude/rider-plugin/config.json</code>: the server runs detached with its
-      output going to <code>~/.claude/rider-plugin/remote-control-&lt;project&gt;.log</code>, and is stopped when the
+      <code>remoteControl</code> in <code>~/.claude/intellij-claude-terminal/config.json</code>: the server runs detached with its
+      output going to <code>~/.claude/intellij-claude-terminal/remote-control-&lt;project&gt;.log</code>, and is stopped when the
       project closes. Note this trades away what the tab is for &mdash; the connection state and the runtime
       <code>w</code> (worktree) toggle. If the server needs a TTY it will exit immediately, and the log line says so.</li>
       <li>363 unit tests.</li>
@@ -299,7 +301,7 @@
       from <a href="https://claude.ai/code">claude.ai/code</a> and the Claude mobile app without setting anything up.
       <b>This exposes control of local Claude sessions to your Claude account for as long as the IDE is open.</b> Turn
       it off with <code>"remoteControl": {"enabled": false}</code> in
-      <code>~/.claude/rider-plugin/config.json</code>.</li>
+      <code>~/.claude/intellij-claude-terminal/config.json</code>.</li>
       <li><b>Never a second server for the same directory.</b> Before starting, the plugin looks for a remote-control
       process already serving that path — including one you started by hand in another terminal — by matching argv and
       then reading the process's working directory. The <code>rc</code> alias is matched as a whole token, so a path
@@ -341,7 +343,7 @@
       and produced invalid JSON on any other &mdash; which takes Claude Code down with it. Unrelated settings, the
       user's own hooks, and their matchers are preserved verbatim; a file that can't be parsed is left strictly alone
       and the failure is logged. The pre-edit file is copied once to
-      <code>~/.claude/rider-plugin/settings.json.bak</code>. Uninstall removes our entries the same way instead of
+      <code>~/.claude/intellij-claude-terminal/settings.json.bak</code>. Uninstall removes our entries the same way instead of
       leaving dangling commas behind.</li>
       <li><b>Status runs on its own loop</b>, separate from the 5s save poll, at a 400ms cadence over a handful of small
       files, touching only the tabs whose state actually changed. It does not use a <code>WatchService</code>: the JDK
@@ -501,11 +503,11 @@
 
     <extensions defaultExtensionNs="com.intellij">
         <postStartupActivity implementation="com.claudetabs.ClaudeTabWatcherStartup"/>
-        <registryKey key="rider.claude.tabs.respectAiAgents"
+        <registryKey key="claude.terminal.tabs.respectAiAgents"
                      defaultValue="true"
                      description="Defer to JetBrains AI Assistant / Anthropic Claude Code plugin when present (informational log only as of 1.0.5). Set to false for legacy 1.0.3 behavior."
                      restartRequired="false"/>
-        <registryKey key="rider.claude.tabs.verboseLogs"
+        <registryKey key="claude.terminal.tabs.verboseLogs"
                      defaultValue="false"
                      description="Bypass rate-limiting on high-frequency log lines (AI overlay re-apply, restore-pending). When true, every event logs. When false, rate-limited to once per minute per key. Equivalent to enabling DEBUG logging for #com.claudetabs."
                      restartRequired="false"/>

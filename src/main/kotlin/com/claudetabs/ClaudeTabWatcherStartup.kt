@@ -25,7 +25,7 @@ import java.nio.file.*
  *
  *  1. **Deploys** its bash integration (`rename-tab.sh`, `session-start-hook.sh`), slash commands,
  *     a CLAUDE.md section, and permission/settings entries into `~/.claude/`.
- *  2. **Watches** `~/.claude/rider-plugin/tabs/` for `{sessionId}.json` rename files written by the
+ *  2. **Watches** `~/.claude/intellij-claude-terminal/tabs/` for `{sessionId}.json` rename files written by the
  *     bash scripts when the user runs `/tab` or any other command that names a terminal tab.
  *  3. **Polls** the terminal tool window every [POLL_INTERVAL_MS] to:
  *     - Match Claude Code processes to their terminal tab (by walking each tab's PID tree).
@@ -68,29 +68,72 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         private val SESSIONS_DIR = File(CLAUDE_HOME, "sessions")
 
         /** Where bash scripts drop `{sessionId}.json` rename directives for the plugin to pick up. */
-        private val TABS_DIR = File(CLAUDE_HOME, "rider-plugin/tabs")
+        private val TABS_DIR = File(CLAUDE_HOME, "intellij-claude-terminal/tabs")
 
         /** Where per-project restore files (`restore-<projectPath>.json`) and `history.json` live. */
-        private val STATE_DIR = File(CLAUDE_HOME, "rider-plugin")
+        private val STATE_DIR = File(CLAUDE_HOME, "intellij-claude-terminal")
 
         /** Markers wrapping the plugin's section of `~/.claude/CLAUDE.md` so it can be replaced cleanly. */
-        private const val CLAUDE_MD_MARKER = "<!-- rider-claude-tabs-plugin -->"
+        private const val CLAUDE_MD_MARKER = "<!-- intellij-claude-terminal -->"
+
+        /**
+         * Delete the section this plugin used to write into `~/.claude/CLAUDE.md`.
+         *
+         * That section told Claude how and when to rename a tab, and it stopped being true
+         * when names started coming from the conversation itself — it opened with "you do
+         * not need to name the tab" and then documented `/tab`, a slash command that no
+         * longer exists.
+         *
+         * Instructions in `CLAUDE.md` are read on every turn of every session on the
+         * machine, so a stale one is not free: it spends context and invites the model to
+         * act on a workflow that is gone. Nothing replaces it, because naming now needs no
+         * cooperation from the conversation at all.
+         *
+         * Called on start as well as on uninstall, so an install that already carries the
+         * section loses it at the next launch rather than only when the plugin is removed.
+         */
+        private fun removeClaudeMdSection() {
+            val claudeMd = File(CLAUDE_HOME, "CLAUDE.md")
+            if (!claudeMd.exists()) return
+            try {
+                val text = claudeMd.readText()
+                if (!text.contains(CLAUDE_MD_MARKER)) return
+                val pattern = Regex(
+                    "\n?${Regex.escape(CLAUDE_MD_MARKER)}.*?${Regex.escape(CLAUDE_MD_MARKER)}\n?",
+                    RegexOption.DOT_MATCHES_ALL,
+                )
+                claudeMd.writeText(text.replace(pattern, "\n").trim() + "\n")
+                LOG.info("[ClaudeTabs] Removed the plugin's CLAUDE.md section — tab naming no longer needs an instruction")
+            } catch (e: Exception) {
+                LOG.warn("[ClaudeTabs] CLAUDE.md cleanup skipped: ${e.message}")
+            }
+        }
 
         /** Permission lines inserted into `~/.claude/settings.json` so Claude can run our helper scripts
          *  without prompting. The first one is legacy (kept for backward-compatible cleanup); the rest cover
          *  the bundled Node helpers used by /tab and /tabs-backup. */
         private val PERMISSION_ENTRIES = listOf(
-            "Bash(bash ~/.claude/rider-plugin/rename-tab.sh *)",
+            "Bash(bash ~/.claude/intellij-claude-terminal/rename-tab.sh *)",
         )
 
-        /** Permissions earlier versions added for slash commands that no longer exist. Removed
-         *  from `settings.json` on start so an old install doesn't keep granting them. */
+        /**
+         * Permissions earlier versions granted, removed from `settings.json` on start so an
+         * old install stops carrying them.
+         *
+         * The paths here are deliberately the **old** `rider-plugin` ones. These entries
+         * exist only to undo what a previous version wrote, so rewriting them to the current
+         * directory — which never had a `tab.sh` — would leave the real grants in place and
+         * revoke nothing.
+         */
         private val RETIRED_PERMISSION_ENTRIES = listOf(
+            // Slash commands that no longer exist.
             "Bash(bash ~/.claude/rider-plugin/tab.sh *)",
             "Bash(node ~/.claude/rider-plugin/tab-backup.js *)",
             "Bash(node ~/.claude/rider-plugin/backup-active.js)",
             "Bash(node ~/.claude/rider-plugin/backup-active.js *)",
             "Bash(node ~/.claude/rider-plugin/current-project.js)",
+            // The rename helper, under the directory used before the plugin was renamed.
+            "Bash(bash ~/.claude/rider-plugin/rename-tab.sh *)",
         )
 
         /** Reads the hook edges + Claude's own per-session `status` field. See [ClaudeStatusStore]. */
@@ -154,17 +197,17 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             }
 
         /** Long-term session history — one JSON entry per closed/backed-up session. */
-        private val HISTORY_FILE = File(CLAUDE_HOME, "rider-plugin/history.json")
+        private val HISTORY_FILE = File(CLAUDE_HOME, "intellij-claude-terminal/history.json")
 
         /** Rotating snapshots of restore-*.json — one per successful non-empty save. */
-        private val SNAPSHOTS_DIR = File(CLAUDE_HOME, "rider-plugin/snapshots")
+        private val SNAPSHOTS_DIR = File(CLAUDE_HOME, "intellij-claude-terminal/snapshots")
 
         /**
          * User-overridable config file. Read once at startup (see [loadConfig]). Defaults
          * below are used when the file is missing or a field is malformed. Users can create
          * or edit this file to change retention policies without recompiling the plugin.
          */
-        private val CONFIG_FILE = File(CLAUDE_HOME, "rider-plugin/config.json")
+        private val CONFIG_FILE = File(CLAUDE_HOME, "intellij-claude-terminal/config.json")
 
         /** Singleton storage helper — owns all read/write of the per-project restore file,
          *  snapshots, and history.json. The orchestration in this class converts between its
@@ -237,15 +280,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
          */
         @JvmStatic
         fun uninstall() {
-            // 1. Remove CLAUDE.md section
-            val claudeMd = File(CLAUDE_HOME, "CLAUDE.md")
-            if (claudeMd.exists()) {
-                val text = claudeMd.readText()
-                if (text.contains(CLAUDE_MD_MARKER)) {
-                    val pattern = Regex("\n?${Regex.escape(CLAUDE_MD_MARKER)}.*?${Regex.escape(CLAUDE_MD_MARKER)}\n?", RegexOption.DOT_MATCHES_ALL)
-                    claudeMd.writeText(text.replace(pattern, "\n").trim() + "\n")
-                }
-            }
+            removeClaudeMdSection()
 
             // 2. Remove our hooks and permission entries from settings.json.
             //    Tree-based, like the install side: the old string-replace left dangling
@@ -261,7 +296,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             }
 
             // 3. Remove deployed scripts and data
-            File(CLAUDE_HOME, "rider-plugin").deleteRecursively()
+            File(CLAUDE_HOME, "intellij-claude-terminal").deleteRecursively()
             removeRetiredSlashCommands()
         }
 
@@ -296,7 +331,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             }
             // The Node helpers only ever existed to back those commands.
             for (n in listOf("tab.sh", "tab-backup.js", "backup-active.js", "current-project.js")) {
-                val f = File(CLAUDE_HOME, "rider-plugin/$n")
+                val f = File(CLAUDE_HOME, "intellij-claude-terminal/$n")
                 if (f.exists() && runCatching { f.delete() }.getOrDefault(false)) removed++
             }
             if (removed > 0) LOG.info("[ClaudeTabs] Removed $removed retired slash-command file(s) — tab naming is automatic now; use right-click → Rename Session to set one by hand")
@@ -480,7 +515,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
      *  no-tab). Key is an arbitrary log identifier (often `sessionId` or `pending-$sessionId`),
      *  value is the last-logged epoch ms. Without this we'd log dozens of lines per second
      *  during Claude streaming as the AI Assistant rewrites the title on every output chunk.
-     *  Set Registry key `rider.claude.tabs.verboseLogs=true` to bypass rate limiting entirely. */
+     *  Set Registry key `claude.terminal.tabs.verboseLogs=true` to bypass rate limiting entirely. */
     private val rateLimitedLogAt = mutableMapOf<String, Long>()
     private val RATE_LIMITED_LOG_INTERVAL_MS = 60_000L
 
@@ -491,13 +526,13 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
     private val lastHistoryUpsertAt = mutableMapOf<String, Long>()
     private val HISTORY_UPSERT_INTERVAL_MS = 60_000L
 
-    /** True if Registry key `rider.claude.tabs.verboseLogs` is set OR DEBUG logging is enabled
+    /** True if Registry key `claude.terminal.tabs.verboseLogs` is set OR DEBUG logging is enabled
      *  for this class. When true, rate-limited log lines fire on every event instead of being
      *  suppressed. Use this for diagnosing title-contention or restore-matching issues without
      *  having to rebuild the plugin. */
     private fun isVerboseLogging(): Boolean {
         return try {
-            com.intellij.openapi.util.registry.Registry.`is`("rider.claude.tabs.verboseLogs", false)
+            com.intellij.openapi.util.registry.Registry.`is`("claude.terminal.tabs.verboseLogs", false)
         } catch (_: Throwable) { false } || LOG.isDebugEnabled
     }
 
@@ -647,7 +682,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         } else {
             LOG.info("[ClaudeTabs] No AI Assistant host detected.")
         }
-        LOG.info("[ClaudeTabs] Verbose logs: ${if (isVerboseLogging()) "ON (bypassing rate limits)" else "OFF (rate-limited; set Registry rider.claude.tabs.verboseLogs=true to enable)"}")
+        LOG.info("[ClaudeTabs] Verbose logs: ${if (isVerboseLogging()) "ON (bypassing rate limits)" else "OFF (rate-limited; set Registry claude.terminal.tabs.verboseLogs=true to enable)"}")
         LOG.info("[ClaudeTabs] Close detection: two-signal (contentRemoveQuery + process-dead) — pending expiry=${PENDING_CLOSE_EXPIRY_MS}ms (ProjectCtx.startupAt=${ctx(project).startupAt})")
         // Self-test (1.0.17): probe the load-bearing APIs we depend on at startup. If any
         // fail, the save path is still resilient (it uses ~/.claude/sessions/*.json — not
@@ -2281,14 +2316,14 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                         // during Claude streaming. Re-applying our value is silent and cheap, so
                         // we always do it — but the log line is rate-limited to once per session
                         // per minute so idea.log doesn't drown. Set Registry key
-                        // `rider.claude.tabs.verboseLogs=true` to log every occurrence.
+                        // `claude.terminal.tabs.verboseLogs=true` to log every occurrence.
                         val verbose = isVerboseLogging()
                         val now = System.currentTimeMillis()
                         val lastLogged = rateLimitedLogAt[sessionId] ?: 0L
                         if (verbose) {
                             LOG.info("[ClaudeTabs] AI overlay overwrote title for session $sessionId (now '$current') — re-applying '$desired' [verbose]")
                         } else if (now - lastLogged > RATE_LIMITED_LOG_INTERVAL_MS) {
-                            LOG.info("[ClaudeTabs] AI overlay overwrote title for session $sessionId (now '$current') — re-applying '$desired' (further events suppressed for ${RATE_LIMITED_LOG_INTERVAL_MS / 1000}s; set Registry rider.claude.tabs.verboseLogs=true for every event)")
+                            LOG.info("[ClaudeTabs] AI overlay overwrote title for session $sessionId (now '$current') — re-applying '$desired' (further events suppressed for ${RATE_LIMITED_LOG_INTERVAL_MS / 1000}s; set Registry claude.terminal.tabs.verboseLogs=true for every event)")
                             rateLimitedLogAt[sessionId] = now
                         }
                         try {
@@ -3425,7 +3460,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
     private fun getStateFile(project: Project): File = File(STATE_DIR, "restore-${projectHash(project)}.json")
 
     /**
-     * Upsert this project into `~/.claude/rider-plugin/project-index.json` (1.0.17).
+     * Upsert this project into `~/.claude/intellij-claude-terminal/project-index.json` (1.0.17).
      *
      * The file is a single JSON object `{"projects":[{...}]}` — one entry per project hash.
      * The `/tabs-status` skill reads it instead of cold-starting Node (~500ms saved on
@@ -4002,7 +4037,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             ApplicationManager.getApplication().invokeLater {
                 try {
                     widget.sendCommandToExecute(cmd)
-                    LOG.info("[ClaudeTabs][rc] Started Remote Control for '${project.name}' at ${project.basePath} — `$cmd`. Local sessions are now controllable from claude.ai/code and the Claude mobile app; set remoteControl.enabled=false in ~/.claude/rider-plugin/config.json to stop this.")
+                    LOG.info("[ClaudeTabs][rc] Started Remote Control for '${project.name}' at ${project.basePath} — `$cmd`. Local sessions are now controllable from claude.ai/code and the Claude mobile app; set remoteControl.enabled=false in ~/.claude/intellij-claude-terminal/config.json to stop this.")
                 } catch (e: Exception) {
                     LOG.warn("[ClaudeTabs][rc] sendCommandToExecute failed: ${e.message}")
                 }
@@ -4016,7 +4051,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
      * Start Remote Control as a detached process with no terminal tab
      * (`remoteControl.mode = "background"`).
      *
-     * Output goes to `~/.claude/rider-plugin/remote-control-<projectHash>.log` — without a
+     * Output goes to `~/.claude/intellij-claude-terminal/remote-control-<projectHash>.log` — without a
      * tab there is nowhere else for the connection URL, or for whatever it says if it
      * refuses to run without a TTY, to appear. The process is killed when the project
      * closes, so a hidden server can't outlive the window that started it.
@@ -4066,7 +4101,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                 reapOrphanedRemoteControl(argv)
                 try { lock.delete() } catch (_: Exception) { }
             }
-            LOG.info("[ClaudeTabs][rc] Started background Remote Control for '${project.name}' (pid ${process.pid()}), no tab. Output: ${log.absolutePath}. Set remoteControl.enabled=false in ~/.claude/rider-plugin/config.json to stop this.")
+            LOG.info("[ClaudeTabs][rc] Started background Remote Control for '${project.name}' (pid ${process.pid()}), no tab. Output: ${log.absolutePath}. Set remoteControl.enabled=false in ~/.claude/intellij-claude-terminal/config.json to stop this.")
             // A server that dies on startup (no pty, `claude` not on PATH, already-bound
             // port) would otherwise be indistinguishable from one running fine.
             if (process.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)) {
@@ -4329,7 +4364,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
 
     /**
      * Snapshot the cumulative list of sessions restored on this Rider start to
-     * `~/.claude/rider-plugin/last-restore.json`. Read by `/tabs-status` so users can see
+     * `~/.claude/intellij-claude-terminal/last-restore.json`. Read by `/tabs-status` so users can see
      * how many sessions came back without scraping idea.log.
      */
     private fun writeLastRestoreSnapshot(project: Project) {
@@ -4667,25 +4702,6 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         return out
     }
 
-    /**
-     * Find the currently-alive Claude process PID that owns the given [sessionId],
-     * by scanning the JSON files in `~/.claude/sessions/`. Returns null if no match
-     * or the process has exited.
-     */
-    private fun findClaudePidForSession(sessionId: String): Long? {
-        for (f in SESSIONS_DIR.listFiles() ?: emptyArray()) {
-            if (!f.name.endsWith(".json")) continue
-            try {
-                if (extractJsonString(f.readText(), "sessionId") != sessionId) continue
-                val pid = f.nameWithoutExtension.toLongOrNull() ?: continue
-                if (ProcessHandle.of(pid).map { it.isAlive }.orElse(false)) return pid
-            } catch (e: Exception) {
-                LOG.debug("[ClaudeTabs] session lookup error for ${f.name}: ${e.message}")
-            }
-        }
-        return null
-    }
-
     /** @return true if [cmd] ends in a known shell executable name (any OS). */
     private fun isShellCommand(cmd: String): Boolean = ClaudeTabsHelpers.isShellCommand(cmd)
 
@@ -4758,44 +4774,13 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
      */
     private fun deployClaudeIntegration() {
         try {
-            deployResource("claude-integration/rename-tab.sh", File(CLAUDE_HOME, "rider-plugin/rename-tab.sh"))
-            deployResource("claude-integration/session-start-hook.sh", File(CLAUDE_HOME, "rider-plugin/session-start-hook.sh"))
-            deployResource("claude-integration/status-hook.sh", File(CLAUDE_HOME, "rider-plugin/status-hook.sh"))
+            deployResource("claude-integration/rename-tab.sh", File(CLAUDE_HOME, "intellij-claude-terminal/rename-tab.sh"))
+            deployResource("claude-integration/session-start-hook.sh", File(CLAUDE_HOME, "intellij-claude-terminal/session-start-hook.sh"))
+            deployResource("claude-integration/status-hook.sh", File(CLAUDE_HOME, "intellij-claude-terminal/status-hook.sh"))
             statusStore.statusDir.mkdirs()
             removeRetiredSlashCommands()
 
-            val claudeMd = File(CLAUDE_HOME, "CLAUDE.md")
-            val existing = if (claudeMd.exists()) claudeMd.readText() else ""
-            val claudeMdBlock = """
-$CLAUDE_MD_MARKER
-## Terminal Tab Naming (Rider Plugin)
-**You do not need to name the tab.** The plugin reads the session name Claude already maintains and puts it on the tab by itself. Do not run `rename-tab.sh` at the start of a conversation.
-
-Rename it only when the user actually asks — via `/tab`, or by saying "name it X", "call this X", "name this X tab":
-```bash
-bash ~/.claude/rider-plugin/rename-tab.sh "Their Exact Words"
-```
-Use their **exact words**. "name this left tab" means the name IS "left tab" — never reinterpret it as a description. A name set this way outranks everything and is not overwritten.
-
-**Tab status:** the plugin prefixes each terminal tab with a live status glyph — `●` working, `⚠` waiting for input or a permission prompt, `✓` finished, `○` idle, `✕` exited. That prefix is applied to the tab title only and is **not** part of the tab's name: never include it when you pass a name to `rename-tab.sh`, and ignore it when reading a tab name back.
-
-**Scope note:** This plugin manages **terminal-launched Claude CLI sessions only**. Sessions started in the JetBrains AI Assistant chat tool window (the "AI Agents" panel: Junie / Claude Agent / Codex) are managed by JetBrains and are not auto-restored across Rider restarts by this plugin.
-$CLAUDE_MD_MARKER
-""".trimStart()
-            if (existing.contains(CLAUDE_MD_MARKER)) {
-                // Replace existing section with latest version
-                val pattern = Regex("$CLAUDE_MD_MARKER.*?$CLAUDE_MD_MARKER", RegexOption.DOT_MATCHES_ALL)
-                val updated = existing.replace(pattern, claudeMdBlock.trim())
-                if (updated != existing) {
-                    claudeMd.writeText(updated)
-                    LOG.info("[ClaudeTabs] Updated CLAUDE.md section")
-                }
-            } else {
-                // First install — append
-                claudeMd.appendText("\n$claudeMdBlock")
-                LOG.info("[ClaudeTabs] Added CLAUDE.md section")
-            }
-
+            removeClaudeMdSection()
             patchClaudeSettings()
         } catch (e: Exception) { LOG.warn("[ClaudeTabs] Deploy failed: ${e.message}") }
     }
@@ -4829,7 +4814,7 @@ $CLAUDE_MD_MARKER
             }
             // Keep a one-shot copy of whatever was there before the first rewrite, so a bad
             // patch is recoverable by hand.
-            val backup = File(CLAUDE_HOME, "rider-plugin/settings.json.bak")
+            val backup = File(CLAUDE_HOME, "intellij-claude-terminal/settings.json.bak")
             if (before != null && !backup.exists()) {
                 try { backup.parentFile?.mkdirs(); backup.writeText(before) } catch (_: Exception) { }
             }

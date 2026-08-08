@@ -64,7 +64,7 @@ class IdleNotificationTest {
 
     @Test fun readsTheNotificationTypeOffDisk() {
         val home = tmp.root
-        val statusDir = File(home, "rider-plugin/status").apply { mkdirs() }
+        val statusDir = File(home, "intellij-claude-terminal/status").apply { mkdirs() }
         File(home, "sessions").mkdirs()
         val sid = "d0000002-0000-4000-8000-000000000002"
         File(statusDir, "$sid.json").writeText(

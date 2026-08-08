@@ -14,7 +14,7 @@ import java.io.File
  * CLAUDE.md                               # plugin injects a section between markers
  * settings.json                           # plugin adds a permission entry
  * commands/tab.md, tabs-*.md              # (deployed by plugin at runtime, not here)
- * rider-plugin/
+ * intellij-claude-terminal/
  *   rename-tab.sh, session-start-hook.sh  # shell integration scripts
  *   tabs/<sessionId>.json                 # rename directives (scripts → plugin)
  *   session-map/<TERM_SESSION_ID>         # per-tab session ID mapping
@@ -26,7 +26,7 @@ import java.io.File
  */
 internal class ClaudeTabsStorage(private val claudeHome: File) {
 
-    val stateDir = File(claudeHome, "rider-plugin")
+    val stateDir = File(claudeHome, "intellij-claude-terminal")
     val tabsDir = File(stateDir, "tabs")
     val sessionMapDir = File(stateDir, "session-map")
     val snapshotsDir = File(stateDir, "snapshots")
