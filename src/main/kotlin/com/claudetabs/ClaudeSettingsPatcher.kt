@@ -41,7 +41,11 @@ internal object ClaudeSettingsPatcher {
      * Throws nothing: on a parse failure the caller gets null and leaves the file alone —
      * a settings.json we can't understand is one we must not rewrite.
      */
-    fun patch(settingsText: String?, permissions: List<String>): String? {
+    fun patch(
+        settingsText: String?,
+        permissions: List<String>,
+        removePermissions: List<String> = emptyList(),
+    ): String? {
         val root: MutableMap<String, Any?> = when {
             settingsText.isNullOrBlank() -> LinkedHashMap()
             else -> try {
@@ -55,6 +59,9 @@ internal object ClaudeSettingsPatcher {
         var changed = false
         if (ensureHooks(root)) changed = true
         if (ensurePermissions(root, permissions)) changed = true
+        // Permissions earlier versions granted for features that no longer exist. Leaving
+        // them would keep allowing commands this plugin no longer ships.
+        if (removePermissions.isNotEmpty() && dropPermissions(root, removePermissions)) changed = true
         if (!changed) return null
 
         return MiniJson.write(root) + "\n"
@@ -139,6 +146,14 @@ internal object ClaudeSettingsPatcher {
             changed = true
         }
         return changed
+    }
+
+    /** Drop [obsolete] entries from `permissions.allow`. Returns true if anything went. */
+    private fun dropPermissions(root: MutableMap<String, Any?>, obsolete: List<String>): Boolean {
+        @Suppress("UNCHECKED_CAST")
+        val allow = (root["permissions"] as? MutableMap<String, Any?>)?.get("allow") as? MutableList<Any?>
+            ?: return false
+        return allow.removeAll { it is String && it in obsolete }
     }
 
     /**

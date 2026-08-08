@@ -7,7 +7,7 @@ plugins {
 }
 
 group = "com.claudetabs"
-version = "1.0.32"
+version = "1.0.36"
 
 repositories {
     mavenCentral()
