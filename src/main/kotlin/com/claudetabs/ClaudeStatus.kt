@@ -100,8 +100,10 @@ internal object StatusResolver {
         val event: String,
         val ts: Long,
         val source: String? = null,
-        /** `Notification` only: Claude's `notification_type`. See [IDLE_NOTIFICATION]. */
+        /** `Notification` only: Claude's `notification_type`. See [BLOCKING_NOTIFICATIONS]. */
         val notificationType: String? = null,
+        /** `SessionEnd` only: Claude's `reason`. See [fromHookEvent]. */
+        val reason: String? = null,
     )
 
     /**
@@ -112,6 +114,38 @@ internal object StatusResolver {
      * to show ✓ and then flip to ⚠ a minute later with nothing having happened.
      */
     const val IDLE_NOTIFICATION = "idle_prompt"
+
+    /**
+     * The `notification_type` values that actually mean someone is blocked.
+     *
+     * This is an allowlist because the deny-list it replaced was wrong about most of the set.
+     * Claude Code 2.1.x sends at least twelve types and only these four are a person waiting:
+     *
+     *     permission_prompt · worker_permission_prompt · elicitation_dialog · agent_needs_input
+     *
+     * Everything else is Claude *telling* you something, and reading those as ⚠ was actively
+     * destructive — the status file holds one edge per session, so each one overwrote the
+     * `Stop` or `UserPromptSubmit` underneath it. The ones that bit hardest:
+     *
+     *  - `agent_completed` — fires when a **background agent finishes**, with the message
+     *    "<label> finished". A fan-out of five agents produced five spurious ⚠ per turn, on
+     *    the tab that was least likely to be looked at.
+     *  - `elicitation_complete` / `elicitation_response` — the end of a wait, marked as the
+     *    start of one, so the tab stayed ⚠ after the question had been answered.
+     *  - `auth_success` — "Claude Code login successful", which flipped a working tab to ⚠.
+     *  - `idle_prompt` — see [IDLE_NOTIFICATION].
+     *
+     * An unrecognised type establishes nothing rather than defaulting to ⚠: a genuinely
+     * blocking one that isn't listed here is still caught by Claude's own session file, which
+     * reports `waiting` for permission dialogs, elicitation and sandbox prompts alike — so a
+     * miss self-corrects, while a false ⚠ destroys the edge it was written over.
+     */
+    val BLOCKING_NOTIFICATIONS = setOf(
+        "permission_prompt",
+        "worker_permission_prompt",
+        "elicitation_dialog",
+        "agent_needs_input",
+    )
 
     /**
      * A reading of `~/.claude/sessions/<pid>.json`. [status] is Claude's own field
@@ -137,27 +171,82 @@ internal object StatusResolver {
      * A null [source] (an older hook script, or a file written before this was recorded)
      * falls back to [ClaudeStatus.IDLE], which is the previous behaviour.
      */
-    fun fromHookEvent(event: String, source: String? = null, notificationType: String? = null): ClaudeStatus? = when (event) {
+    fun fromHookEvent(
+        event: String,
+        source: String? = null,
+        notificationType: String? = null,
+        reason: String? = null,
+    ): ClaudeStatus? = when (event) {
         "UserPromptSubmit" -> ClaudeStatus.WORKING
-        // Not every notification means someone is blocked. `idle_prompt` is Claude nudging
-        // you 60s after it went idle — nothing about the turn changed, so it establishes
-        // nothing. status-hook.sh already declines to record it (writing it would destroy
-        // the `Stop` edge underneath); this covers files written before that, and any other
-        // route the event might arrive by.
-        "Notification" -> if (notificationType == IDLE_NOTIFICATION) null else ClaudeStatus.WAITING
+
+        // Only the types that mean a person is blocked — see [BLOCKING_NOTIFICATIONS] for
+        // why this is an allowlist and what the deny-list version got wrong. status-hook.sh
+        // already declines to record the rest (writing one would destroy the edge
+        // underneath); this covers files written before it did, and any other route the
+        // event might arrive by. A blank type is an older hook script that recorded none, so
+        // it keeps the previous meaning rather than silently changing what those files say.
+        "Notification" -> when {
+            notificationType.isNullOrBlank() -> ClaudeStatus.WAITING
+            notificationType in BLOCKING_NOTIFICATIONS -> ClaudeStatus.WAITING
+            else -> null
+        }
+
         "Stop" -> ClaudeStatus.FINISHED
+
+        // A turn that ended on an API error — rate limit, overloaded, billing. `Stop` does
+        // not fire for these, so without this the session stays on its `UserPromptSubmit`
+        // edge and the tab claims to be working. The turn is over and Claude is back at the
+        // prompt, which is exactly what [ClaudeStatus.FINISHED] says; the enum has no state
+        // for "ended badly", and inventing one would say more than the tab strip can carry.
+        "StopFailure" -> ClaudeStatus.FINISHED
+
         "SessionStart" -> when (source) {
-            "resume" -> ClaudeStatus.FINISHED
+            // `fork` branches an existing conversation, so like `resume` it arrives with its
+            // history behind it and a turn already run.
+            "resume", "fork" -> ClaudeStatus.FINISHED
             "compact" -> null
             else -> ClaudeStatus.IDLE
         }
-        "SessionEnd" -> ClaudeStatus.EXITED
+
+        // Not every `SessionEnd` is an ending. `clear` and `resume` are **in-place
+        // replacements**: the process, the terminal and the tab all survive and only the
+        // session id rotates. Painting those ✕ put a live conversation under a dead marker
+        // until the pid-join in `ClaudeStatusStore.supersededSessions` caught up — and that
+        // recovery exists precisely because this signal used to be thrown away. Establishing
+        // nothing lets the hand-over happen without the tab ever lying.
+        //
+        // Everything else — `logout`, `prompt_input_exit`, `bypass_permissions_disabled`,
+        // `other`, and a missing reason from an older hook script — really is the end.
+        "SessionEnd" -> if (reason == "clear" || reason == "resume") null else ClaudeStatus.EXITED
+
         else -> null
     }
 
-    /** Claude's own `status` field → the state it establishes. */
+    /**
+     * Claude's own `status` field → the state it establishes.
+     *
+     * The four values are the whole set — `["busy","shell","idle","waiting"]` in the CLI —
+     * and they are computed as:
+     *
+     *     status = waitingForSomething ? "waiting"
+     *            : (isLoading || delegatedActive) ? "busy"
+     *            : "idle"
+     *     if (status == "idle" && aBackgroundLocalBashIsStillRunning) status = "shell"
+     *
+     * Two things follow that are not obvious from the name of either value:
+     *
+     *  - **`busy` covers delegated work**, not just the model turn. That is what keeps it set
+     *    while background agents run, and what [resolve]'s rule 4 relies on.
+     *  - **`shell` is a flavour of `idle`**, not of `busy`. It is only ever produced when the
+     *    status would otherwise be `idle`, and it means "at the prompt, with a detached
+     *    background `Bash` still running" — a dev server, a watcher. A Bash *tool call* inside
+     *    a turn reads as `busy`, because the turn is loading.
+     *
+     * `shell` is still surfaced as [ClaudeStatus.WORKING]: something the user started is
+     * running, and the tab saying so is the useful reading. But it is not a turn in progress,
+     * which is why rule 4 excludes it.
+     */
     fun fromSessionStatus(status: String?): ClaudeStatus? = when (status) {
-        // `shell` is Claude running a Bash tool call — still a turn in progress.
         "busy", "shell" -> ClaudeStatus.WORKING
         "waiting" -> ClaudeStatus.WAITING
         "idle" -> ClaudeStatus.IDLE
@@ -180,9 +269,23 @@ internal object StatusResolver {
      *     downgrade a hook-established [ClaudeStatus.FINISHED] to [ClaudeStatus.IDLE], keep
      *     [ClaudeStatus.FINISHED]; the two describe the same underlying process state and
      *     the hook's is strictly more informative.
+     *  4. **A working session is not finished, however new the `Stop`.** `Stop` fires when
+     *     the *response* ends, which is not when the session's work ends: background agents
+     *     and a subagent fan-out keep running after it. Claude's own file is the only signal
+     *     that knows about them, and it stays `busy` until they are all done. Caught live —
+     *     a session showing "waiting for 5 background agents to finish" while the tab said ✓:
+     *
+     *       hook     Stop   ts=1786258683693              ← 15:58:03, the response ended
+     *       session  busy   statusUpdatedAt=1786256718513 ← 15:25:18, and still busy at 16:00
+     *
+     *     The session reading is half an hour older and still the correct one, so this can't
+     *     be a freshness check: Claude rewrites the file on state *changes*, so "old" says
+     *     nothing about "stale". `busy` is only ever written by a live process describing
+     *     itself, which is what makes it safe to believe over an edge that has been
+     *     superseded by work the edge cannot see.
      */
     fun resolve(hook: HookSignal?, session: SessionSignal?, now: Long = 0L): ClaudeStatus? {
-        val hookState = hook?.let { fromHookEvent(it.event, it.source, it.notificationType) }
+        val hookState = hook?.let { fromHookEvent(it.event, it.source, it.notificationType, it.reason) }
         val sessionState = session?.let { fromSessionStatus(it.status) }
 
         // Rule 1 — terminal states.
@@ -197,6 +300,13 @@ internal object StatusResolver {
 
         // Rule 3 — don't let a session-file `idle` erase a hook-established `finished`.
         if (winner == ClaudeStatus.IDLE && hookState == ClaudeStatus.FINISHED) return ClaudeStatus.FINISHED
+
+        // Rule 4 — a `Stop` edge doesn't finish a session Claude still reports as busy.
+        // `busy` only, not every reading that paints as WORKING: `shell` is Claude *idle*
+        // with a detached background Bash still running (see [fromSessionStatus]), and a
+        // `Stop` is entitled to settle that one — otherwise a `npm run dev` left running in
+        // the background would pin the tab to ● for as long as the server is up.
+        if (winner == ClaudeStatus.FINISHED && session.status == "busy") return ClaudeStatus.WORKING
 
         return winner
     }

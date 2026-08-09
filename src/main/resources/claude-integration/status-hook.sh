@@ -1,92 +1,236 @@
 #!/bin/bash
 # ─────────────────────────────────────────────────────────────────────
-# status-hook.sh — Claude Code status hook
+# status-hook.sh — Claude Code status hook (tab state indicator)
 # ─────────────────────────────────────────────────────────────────────
-# Usage (from ~/.claude/settings.json):
-#   bash ~/.claude/intellij-claude-terminal/status-hook.sh <EventName>
+# Usage: bash ~/.claude/intellij-claude-terminal/status-hook.sh <EventName>
 #
-# Registered for SessionStart, UserPromptSubmit, Notification, Stop and
-# SessionEnd. Claude passes the hook payload as JSON on stdin; we only
-# need session_id out of it.
+# Registered by ClaudeSettingsPatcher for six events, with the event
+# name passed as the single argument so one script covers all of them:
 #
-# Each invocation records one edge:
-#   ~/.claude/intellij-claude-terminal/status/{session_id}.json
-#     {"event":"Stop","sessionId":"...","ts":1786179029939,"pid":12345}
+#   SessionStart · UserPromptSubmit · Notification · Stop · StopFailure
+#   · SessionEnd
 #
-# The plugin maps that session id to a terminal tab and prefixes the tab
-# title with a status glyph. Events are recorded rather than states so the
-# plugin owns the event → glyph mapping and can change it without the
-# script having to be redeployed in lockstep.
+# Claude passes the event payload as JSON on stdin. We flatten it into
+# one small record and drop it in the plugin's status directory, where
+# ClaudeStatusStore picks it up on its next poll:
 #
-# Why hooks and not just polling: Claude maintains its own status field in
-# ~/.claude/sessions/{pid}.json (busy|shell|idle|waiting), but that field
-# cannot distinguish "a turn just finished" from "sitting idle since start",
-# and it lags a clean SessionEnd. The plugin reconciles both signals — see
-# StatusResolver.
+#   ~/.claude/intellij-claude-terminal/status/{sessionId}.json
+#     The status edge itself. One file per session, always overwritten,
+#     so it holds the LAST edge — see the idle-nudge note below for why
+#     that matters. StatusResolver.fromHookEvent maps the event to the
+#     glyph on the tab (● working, ⚠ waiting, ✓ finished, ○ idle, ✕ exited).
 #
-# This script is on the hot path of every prompt submission, so it stays
-# free of subprocesses beyond the one `date` call and never blocks: a
-# failure to write must not stall Claude.
+#   ~/.claude/intellij-claude-terminal/status/{TERM_SESSION_ID}.json
+#     (written with a "termsess" name prefix) The PID-free bridge from a
+#     JetBrains terminal tab to the session running inside it. On the
+#     2026.1 terminal this is the only mapping that works, so it is
+#     refreshed by EVERY event, including ones whose status we discard.
+#
+# Record shape — flat, one line, no nesting, because the plugin reads it
+# with regexes rather than a JSON parser:
+#
+#   {"event":"Stop","source":"","notificationType":"","reason":"",
+#    "sessionId":"…","ts":1786214613166,"pid":77877}
+#
+# The hook has a 5s timeout and runs on every prompt and every turn end,
+# so everything here is shell built-ins plus at most one small fork.
 # ─────────────────────────────────────────────────────────────────────
 
 EVENT="$1"
-[ -z "$EVENT" ] && exit 0
+INPUT=$(cat 2>/dev/null)
 
-INPUT=$(cat)
-SID=$(echo "$INPUT" | sed -n 's/.*"session_id":"\([^"]*\)".*/\1/p')
+# ── JSON field extraction ──────────────────────────────────────────
+# First occurrence of a top-level string field. `grep -o` rather than a
+# greedy `sed` because `.*"key":"…"` matches the LAST occurrence, and
+# the payloads nest (a transcript excerpt can carry its own "source").
+# Tolerates whitespace around the colon: Claude has emitted both compact
+# and pretty-printed hook input across versions.
+json_str() {
+  printf '%s' "$INPUT" | tr -d '\n' \
+    | grep -o "\"$1\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" \
+    | head -1 \
+    | sed 's/^[^:]*:[[:space:]]*"//; s/"$//'
+}
 
-# SessionStart carries how the session began: startup | resume | clear | compact.
-# It is the difference between "brand new, no turns yet" and "picked an existing
-# conversation back up", which look identical from the event name alone — and
-# getting that wrong makes a finished chat come back as idle after an IDE restart.
-SOURCE=$(echo "$INPUT" | sed -n 's/.*"source":"\([^"]*\)".*/\1/p')
+SID=$(json_str session_id)
+[ -n "$SID" ] || SID=$(json_str sessionId)
 
-# Notification carries what kind it is, in the same slot SessionStart uses for
-# `source`. Claude's own hook-payload builder:
-#   case "Notification": a = n.notification_type
-#   case "SessionStart": a = n.source
-NOTIF_TYPE=$(echo "$INPUT" | sed -n 's/.*"notification_type":"\([^"]*\)".*/\1/p')
+# The argument is authoritative; the payload is the fallback for a hook
+# entry that lost its argument (hand-edited settings.json, older patcher).
+[ -n "$EVENT" ] || EVENT=$(json_str hook_event_name)
 
-STATUS_DIR="$HOME/.claude/intellij-claude-terminal/status"
-mkdir -p "$STATUS_DIR" 2>/dev/null || exit 0
+# SessionStart only: startup | resume | clear | compact. Decides whether a
+# restart means "nothing has run yet" (○) or "picked an existing chat back
+# up" (✓) — see StatusResolver.fromHookEvent.
+SOURCE=$(json_str source)
 
-# Milliseconds since epoch. `date +%s%N` is GNU-only; on macOS (BSD date)
-# it prints a literal N, so fall back to seconds * 1000. The plugin only
-# compares this against Claude's statusUpdatedAt, which is also in ms.
-NOW_NS=$(date +%s%N 2>/dev/null)
-case "$NOW_NS" in
-  *[!0-9]*|"") TS=$(( $(date +%s) * 1000 )) ;;
-  *)           TS=$(( NOW_NS / 1000000 )) ;;
-esac
+# Notification only. Claude has used both spellings across versions.
+NOTIF_TYPE=$(json_str notification_type)
+[ -n "$NOTIF_TYPE" ] || NOTIF_TYPE=$(json_str notificationType)
 
-PAYLOAD="{\"event\":\"$EVENT\",\"source\":\"$SOURCE\",\"notificationType\":\"$NOTIF_TYPE\",\"sessionId\":\"$SID\",\"ts\":$TS,\"pid\":$PPID}"
+# SessionEnd only: clear | resume | logout | prompt_input_exit |
+# bypass_permissions_disabled | other. The first two are in-place replacements
+# rather than endings — see StatusResolver.fromHookEvent.
+REASON=$(json_str reason)
 
-# `idle_prompt` is Claude nudging you 60s after it went idle — "Claude is waiting
-# for your input". It is not a permission prompt and nothing about the turn has
-# changed, so it must not overwrite the edge already on record.
+# ── Validation ─────────────────────────────────────────────────────
+# These become filenames and land inside a JSON string unquoted, so
+# anything that a path parser or the plugin's regexes treat specially is
+# dropped rather than escaped. Mirrors ClaudeTabsHelpers.isSafeSessionId.
+is_safe_id() {
+  case "$1" in
+    ''|.|..) return 1 ;;
+    *[!A-Za-z0-9._-]*) return 1 ;;
+  esac
+  [ "${#1}" -le 128 ]
+}
+
+is_safe_id "$SID" || SID=""
+# Event names are alphabetic; a value that isn't would corrupt the record.
+case "$EVENT" in ''|*[!A-Za-z]*) EVENT="" ;; esac
+case "$SOURCE" in *[!A-Za-z]*) SOURCE="" ;; esac
+case "$NOTIF_TYPE" in *[!A-Za-z_]*) NOTIF_TYPE="" ;; esac
+case "$REASON" in *[!A-Za-z_]*) REASON="" ;; esac
+
+# Nothing identifiable — no record to write, and no bridge to refresh.
+[ -n "$EVENT" ] && [ -n "$SID" ] || exit 0
+
+# ── Events that must not overwrite the edge underneath ──────────────
+# The status file holds ONE edge per session, so writing an event that
+# says nothing about the turn destroys the one that did.
 #
-# This is filtered here rather than in the plugin because the file holds one edge
-# per session: writing this event would destroy the `Stop` under it, and there
-# would be nothing left to fall back to. Recording it and ignoring it later is
-# not the same thing.
+#   Notification — only four of Claude's dozen notification types mean a
+#     person is blocked, and they are listed positively below. The rest are
+#     Claude telling you something, and every one of them used to land as ⚠
+#     on top of a live edge:
 #
-# Observed: a finished session showed ✓, then flipped to ⚠ exactly 60s later and
-# stayed there. Claude's own status said `idle` the whole time.
-SKIP_STATUS_WRITE=""
-if [ "$EVENT" = "Notification" ] && [ "$NOTIF_TYPE" = "idle_prompt" ]; then
+#       agent_completed        "<label> finished" — a BACKGROUND AGENT ended.
+#                              A fan-out of five produced five false ⚠.
+#       elicitation_complete   the end of a wait, recorded as the start of one,
+#       elicitation_response   so the tab stayed ⚠ after you had answered.
+#       auth_success           "Claude Code login successful".
+#       idle_prompt            the 60s "waiting for your input" nudge, fired
+#                              after a session goes idle. Nothing changed.
+#       computer_use_enter/exit, push_notification — informational.
+#
+#     An unknown type is skipped too. A blocking one we haven't listed is
+#     still caught by Claude's own session file (which reports `waiting` for
+#     permission dialogs, elicitation and sandbox prompts), so a miss
+#     self-corrects — while a false ⚠ destroys what it was written over.
+#
+#   SessionStart / compact — fires mid-turn when the context is compacted.
+#     StatusResolver reads it as "establishes nothing, leave the current
+#     state alone", which only holds if the previous edge survives it.
+#
+# All of them are still recognised by the resolver, for files written before
+# this filter existed.
+SKIP_STATUS_WRITE=0
+if [ "$EVENT" = "Notification" ]; then
+  case "$NOTIF_TYPE" in
+    # Blank: an older Claude that sends no type. Kept, so its meaning
+    # doesn't change under a CLI that predates the field.
+    ""|permission_prompt|worker_permission_prompt|elicitation_dialog|agent_needs_input) ;;
+    *) SKIP_STATUS_WRITE=1 ;;
+  esac
+fi
+if [ "$EVENT" = "SessionStart" ] && [ "$SOURCE" = "compact" ]; then
   SKIP_STATUS_WRITE=1
 fi
 
-if [ -n "$SID" ] && [ -z "$SKIP_STATUS_WRITE" ]; then
-  echo "$PAYLOAD" > "$STATUS_DIR/$SID.json"
+# ── Timestamp ───────────────────────────────────────────────────────
+# Milliseconds, not seconds. StatusResolver rule 2 is "the newer signal
+# wins", comparing this against `statusUpdatedAt` in Claude's own session
+# file — which is in ms. Truncating to whole seconds rounds a `Stop`
+# backwards past the `idle` that Claude wrote a fraction of a second
+# earlier, and the tab shows ○ instead of ✓.
+now_ms() {
+  local ms
+  ms=$(date +%s%3N 2>/dev/null)
+  case "$ms" in
+    ''|*[!0-9]*) ;;                       # BSD date: emits a literal "N"
+    *) printf '%s' "$ms"; return ;;
+  esac
+  if command -v perl >/dev/null 2>&1; then
+    perl -MTime::HiRes=time -e 'printf("%d", time()*1000)' 2>/dev/null && return
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null && return
+  fi
+  printf '%s000' "$(date +%s)"            # last resort: second precision
+}
+TS=$(now_ms)
+case "$TS" in ''|*[!0-9]*) TS=0 ;; esac
+
+# ── The Claude PID ──────────────────────────────────────────────────
+# Joins this record to `~/.claude/sessions/{pid}.json`. It is what lets
+# ClaudeStatusStore.supersededSessions tell `/clear` (same process, new
+# session id — hand the tab over) apart from a real exit (✕): a
+# `SessionEnd` whose pid still hosts a different live session was
+# replaced, not ended. 0 means unknown, which reads as "no successor".
+CLAUDE_PID=""
+
+# 1. The messaging socket path is /tmp/cc-socks/{pid}.sock — exact, free.
+if [ -n "$CLAUDE_CODE_MESSAGING_SOCKET" ]; then
+  cand=${CLAUDE_CODE_MESSAGING_SOCKET##*/}
+  cand=${cand%.sock}
+  case "$cand" in ''|*[!0-9]*) ;; *) CLAUDE_PID="$cand" ;; esac
 fi
 
-# Secondary key: the terminal this session runs in. Written so the very
-# first SessionStart is attributable to a tab even before the plugin has
-# resolved the tab's Claude session id. Same TERM_SESSION_ID that
-# session-start-hook.sh uses for the rename mapping.
-if [ -n "$TERM_SESSION_ID" ]; then
-  echo "$PAYLOAD" > "$STATUS_DIR/termsess-$TERM_SESSION_ID.json"
+# 2. Walk up from this script. Claude spawns hooks directly, so it is
+#    almost always $PPID; the loop covers an intervening wrapper shell.
+if [ -z "$CLAUDE_PID" ]; then
+  parent="$PPID"
+  depth=0
+  while [ -n "$parent" ] && [ "$parent" -gt 1 ] 2>/dev/null && [ "$depth" -lt 6 ]; do
+    info=$(ps -o ppid=,comm= -p "$parent" 2>/dev/null) || break
+    [ -n "$info" ] || break
+    set -- $info
+    grandparent="$1"
+    shift
+    case "$*" in *claude*) CLAUDE_PID="$parent"; break ;; esac
+    parent="$grandparent"
+    depth=$((depth + 1))
+  done
+fi
+
+# 3. Last resort: the session file that names this session id.
+if [ -z "$CLAUDE_PID" ]; then
+  for sf in "$HOME/.claude/sessions/"*.json; do
+    [ -f "$sf" ] || continue
+    case "$(cat "$sf" 2>/dev/null)" in
+      *"\"sessionId\":\"$SID\""*) CLAUDE_PID=${sf##*/}; CLAUDE_PID=${CLAUDE_PID%.json}; break ;;
+    esac
+  done
+  case "$CLAUDE_PID" in *[!0-9]*) CLAUDE_PID="" ;; esac
+fi
+
+: "${CLAUDE_PID:=0}"
+
+# ── Write ───────────────────────────────────────────────────────────
+STATUS_DIR="$HOME/.claude/intellij-claude-terminal/status"
+mkdir -p "$STATUS_DIR" 2>/dev/null || exit 0
+
+RECORD="{\"event\":\"$EVENT\",\"source\":\"$SOURCE\",\"notificationType\":\"$NOTIF_TYPE\",\"reason\":\"$REASON\",\"sessionId\":\"$SID\",\"ts\":$TS,\"pid\":$CLAUDE_PID}"
+
+# Written to a temp file and renamed, so the plugin — which polls this
+# directory every 400ms — never reads a half-written record.
+write_record() {
+  tmp="$1.$$.tmp"
+  if printf '%s\n' "$RECORD" > "$tmp" 2>/dev/null; then
+    mv -f "$tmp" "$1" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+  fi
+}
+
+if [ "$SKIP_STATUS_WRITE" -eq 0 ]; then
+  write_record "$STATUS_DIR/$SID.json"
+fi
+
+# The tab bridge is a mapping, not a status. Every event refreshes it,
+# including the ones whose status was just discarded above — the terminal
+# still hosts this session either way, and a tab that loses its mapping
+# stops being tracked entirely.
+if [ -n "$TERM_SESSION_ID" ] && is_safe_id "$TERM_SESSION_ID"; then
+  write_record "$STATUS_DIR/termsess-$TERM_SESSION_ID.json"
 fi
 
 exit 0

@@ -47,16 +47,31 @@ Everything else (scripts, hooks, permissions) is set up on first start.
 Two signals, reconciled — neither is sufficient alone.
 
 1. **Claude Code hooks** are the primary signal. The plugin registers `SessionStart`, `UserPromptSubmit`,
-   `Notification`, `Stop` and `SessionEnd` in `~/.claude/settings.json`; each writes one line to
-   `~/.claude/intellij-claude-terminal/status/{sessionId}.json` at the moment the state changes. `SubagentStop` is deliberately not
-   subscribed — a subagent finishing is not the turn finishing.
+   `Notification`, `Stop`, `StopFailure` and `SessionEnd` in `~/.claude/settings.json`; each writes one line to
+   `~/.claude/intellij-claude-terminal/status/{sessionId}.json` at the moment the state changes. `StopFailure` matters
+   because a turn that ends on an API error — rate limit, overloaded, billing — fires *that* and never a `Stop`.
+   `SubagentStop` is deliberately not subscribed — a subagent finishing is not the turn finishing.
+
+   Only the notifications that mean someone is actually blocked are recorded (`permission_prompt`,
+   `worker_permission_prompt`, `elicitation_dialog`, `agent_needs_input`). The rest are Claude telling you something —
+   `agent_completed` when a background agent finishes, `auth_success` after a login — and since the file holds one edge
+   per session, recording them would overwrite the state underneath.
 2. **Claude Code's own session file** (`~/.claude/sessions/{pid}.json`) carries a `status` field
    (`busy` / `shell` / `idle` / `waiting`). It's read alongside the hooks and covers what hooks structurally can't:
    sessions that started before the hooks were installed, permission prompts that emit no `Notification`, and a Claude
    that was killed rather than exiting cleanly.
 
-The newer signal wins, with one exception: a stale `idle` from the session file can't downgrade a hook-established
-`Finished`, because Claude's own field has no way to express "a turn just completed".
+The newer signal wins, with two exceptions, one in each direction:
+
+- A stale `idle` from the session file can't downgrade a hook-established `Finished`, because Claude's own field has no
+  way to express "a turn just completed".
+- A `busy` from the session file can't be overridden by a `Stop`, because `Stop` is the end of a *response*, not of the
+  session's work: background agents and a subagent fan-out keep running past it, and Claude's field — which covers
+  delegated work, not just the model turn — is the only signal that knows. It is not a freshness question; Claude
+  rewrites that file on state *changes*, so a `busy` from half an hour ago is exactly as true as one from a second ago.
+
+A `SessionEnd` is read together with its reason: `clear` and `resume` are in-place replacements where the process, the
+terminal and the tab all survive and only the session id rotates, so they hand the tab over instead of marking it dead.
 
 Terminal ↔ session mapping reuses the `TERM_SESSION_ID` ↔ Claude `sessionId` bridge the rename feature already relies
 on, so any number of tabs stay independent.
@@ -177,7 +192,7 @@ one behind. An instruction there is read on every turn of every session on the m
 ## Running the tests
 
 ```bash
-./gradlew test        # Unit + storage + status + settings patcher (476 tests, <10s)
+./gradlew test        # Unit + storage + status + settings patcher (494 tests, <10s)
 ./gradlew verifyPlugin # IntelliJ Plugin Verifier against IntelliJ IDEA 2026.1.3
 ./gradlew uiTest      # UI tests via Remote Robot (optional, needs a sandbox IDE)
 ```

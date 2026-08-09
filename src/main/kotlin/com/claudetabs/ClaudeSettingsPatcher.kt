@@ -19,13 +19,21 @@ internal object ClaudeSettingsPatcher {
      *
      * `SubagentStop` is deliberately absent: a subagent finishing does not mean the turn
      * finished, and treating it as [ClaudeStatus.FINISHED] made tabs flicker to ✓ in the
-     * middle of a long agentic run.
+     * middle of a long agentic run. `SubagentStart` likewise adds nothing — Claude's own
+     * session file already reports `busy` for the whole delegated run (see
+     * [StatusResolver.fromSessionStatus]), which covers background agents too.
+     *
+     * `StopFailure` is the counterpart to `Stop`, and easy to miss: when a turn ends on an
+     * API error — rate limit, overloaded, billing — Claude fires **that instead**, and no
+     * `Stop` ever arrives. Without it the last edge stays `UserPromptSubmit` and the tab
+     * claims to be working until Claude's session file happens to be rewritten.
      */
     val STATUS_EVENTS = listOf(
         "SessionStart",
         "UserPromptSubmit",
         "Notification",
         "Stop",
+        "StopFailure",
         "SessionEnd",
     )
 
