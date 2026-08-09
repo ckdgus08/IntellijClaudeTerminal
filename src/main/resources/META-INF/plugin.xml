@@ -42,6 +42,59 @@
     ]]></description>
 
     <change-notes><![CDATA[
+    <h3>1.1.1</h3>
+    <ul>
+      <li><b>A session waiting on background agents was shown as finished.</b> <code>Stop</code> fires when the
+      <i>response</i> ends, not when the session's work does: a background fan-out and a subagent run both keep going
+      past it, and Claude's own status field &mdash; which covers delegated work, not just the model turn &mdash; is the
+      only signal that knows. Caught live on a session printing "waiting for 5 background agents to finish" under a
+      &#10003; tab: hook <code>Stop</code> at 15:58:03 over a session file that had read <code>busy</code> since
+      15:25:18 and still did at 16:00. That the correct reading was half an hour older is the point &mdash; Claude
+      rewrites the file on state <i>changes</i>, so "old" says nothing about "stale", and this could not have been a
+      freshness rule.</li>
+
+      <li><b>Most of Claude's notifications are not someone waiting on you.</b> The filter knew about the 60-second idle
+      nudge and treated the other eleven <code>notification_type</code> values as prompts &mdash; and because the status
+      file holds one edge per session, each one overwrote the <code>Stop</code> or <code>UserPromptSubmit</code>
+      underneath it. <code>agent_completed</code> was the worst of them: it fires when a <b>background agent
+      finishes</b>, so a fan-out of five put five spurious &#9888; on the tab least likely to be looked at.
+      <code>elicitation_complete</code> and <code>elicitation_response</code> marked the <i>end</i> of a wait as the
+      start of one; <code>auth_success</code> ("Claude Code login successful") flipped a working tab. It is now an
+      allowlist of the four that really do block &mdash; <code>permission_prompt</code>,
+      <code>worker_permission_prompt</code>, <code>elicitation_dialog</code>, <code>agent_needs_input</code> &mdash;
+      and an unrecognised type establishes nothing, because a missed block is still caught by Claude's own session file
+      while a false one destroys what it was written over.</li>
+
+      <li><b>A <code>/clear</code> is not a death.</b> <code>SessionEnd</code> now carries its <code>reason</code>, and
+      <code>clear</code> / <code>resume</code> are read as what they are: in-place replacements where the process, the
+      terminal and the tab all survive and only the session id rotates. They no longer paint &#10007; while the pid-join
+      hand-over catches up.</li>
+
+      <li><b>A turn that dies on an API error fires <code>StopFailure</code>, not <code>Stop</code>.</b> Rate limit,
+      overloaded, billing &mdash; none of them produced an edge, so the session kept its <code>UserPromptSubmit</code>
+      and the session file's <code>idle</code> then won on age, leaving a turn that ran for minutes looking like one
+      that never started. The event is now subscribed to.</li>
+
+      <li><b><code>SessionStart</code> gained a <code>fork</code> source</b>, which was falling through to "nothing has
+      run yet". A forked conversation arrives with its history behind it, like <code>resume</code>.</li>
+
+      <li><code>shell</code> is documented and handled for what it actually is. Claude only ever produces it when the
+      status would otherwise be <code>idle</code>, so it means "at the prompt, with a detached background
+      <code>Bash</code> still running" &mdash; a dev server, a watcher. A Bash <i>tool call</i> inside a turn reads as
+      <code>busy</code>. It still shows as running, but a <code>Stop</code> is allowed to settle it, or an
+      <code>npm run dev</code> left in the background would pin the tab for as long as the server is up.</li>
+
+      <li><b>The status hook script is rewritten.</b> Its timestamp is now milliseconds on every platform: BSD
+      <code>date</code> has no <code>%N</code>, so on macOS it had been falling back to whole seconds &mdash; which
+      rounds a <code>Stop</code> backwards past the <code>idle</code> Claude wrote a fraction of a second earlier, the
+      exact comparison the precedence rules turn on. Also: the Claude pid is resolved from the messaging socket or the
+      process tree rather than assuming <code>$PPID</code>, the session id is validated before it becomes a filename,
+      the payload is parsed first-match rather than last (a transcript excerpt can carry its own <code>source</code>),
+      and the record is written to a temp file and renamed so the 400ms poll can never read a half-written one.</li>
+
+      <li>494 unit tests.</li>
+    </ul>
+
     <h3>1.0.36</h3>
     <ul>
       <li><b>"Is this tab still unnamed?" was answered in English only.</b> The IDE's default terminal name is

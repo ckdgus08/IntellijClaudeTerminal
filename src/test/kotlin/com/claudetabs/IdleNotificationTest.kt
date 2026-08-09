@@ -90,6 +90,14 @@ class IdleNotificationTest {
         assertTrue("must record it for the plugin", script.contains("\\\"notificationType\\\""))
         assertTrue("must special-case the nudge", script.contains("idle_prompt"))
         assertTrue("must guard the status write", script.contains("SKIP_STATUS_WRITE"))
+        // The filter is an allowlist, so the blocking types have to be in it by name. The
+        // deny-list version that only knew about the nudge let `agent_completed` and the
+        // rest through — the same bug with a different type. See [NotificationTypeTest].
+        for (blocking in StatusResolver.BLOCKING_NOTIFICATIONS) {
+            assertTrue("must keep recording $blocking", script.contains(blocking))
+        }
+        // SessionEnd's reason is what tells a `/clear` hand-over from a real exit.
+        assertTrue("must record the SessionEnd reason", script.contains("\\\"reason\\\""))
         // The TERM_SESSION_ID bridge is a mapping, not a status, and must keep being
         // refreshed by every event including this one.
         val bridgeWrite = script.substringAfter("termsess-")

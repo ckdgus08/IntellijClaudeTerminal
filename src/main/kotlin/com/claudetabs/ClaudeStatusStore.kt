@@ -94,9 +94,11 @@ internal class ClaudeStatusStore(claudeHome: File) {
                 event = event,
                 ts = Regex(""""ts"\s*:\s*(\d+)""").find(text)?.groupValues?.get(1)?.toLongOrNull()
                     ?: f.lastModified(),
-                // Only SessionStart carries a source; only Notification a type.
+                // Only SessionStart carries a source, only Notification a type, and only
+                // SessionEnd a reason.
                 source = ClaudeTabsHelpers.extractJsonString(text, "source")?.takeIf { it.isNotBlank() },
                 notificationType = ClaudeTabsHelpers.extractJsonString(text, "notificationType")?.takeIf { it.isNotBlank() },
+                reason = ClaudeTabsHelpers.extractJsonString(text, "reason")?.takeIf { it.isNotBlank() },
             ),
             pid = Regex(""""pid"\s*:\s*(\d+)""").find(text)?.groupValues?.get(1)?.toLongOrNull(),
         )

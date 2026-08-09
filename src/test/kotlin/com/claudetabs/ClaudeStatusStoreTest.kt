@@ -132,6 +132,29 @@ class ClaudeStatusStoreTest {
         assertEquals("waiting", reading.sessionStatus)
     }
 
+    /**
+     * The qualifier fields have to survive the trip through disk, or the resolver decides on
+     * a record it can't tell apart from a plain one. Each of these was a real misreading when
+     * the field wasn't there: a `/clear` hand-over as a death, a background agent's "finished"
+     * as a prompt, a forked conversation as one that never ran.
+     */
+    @Test fun theQualifierFieldsAreReadOffDisk() {
+        setUpHome()
+        fun record(sid: String, json: String) =
+            File(home, "intellij-claude-terminal/status/$sid.json").writeText(json)
+
+        record("sid-cleared", """{"event":"SessionEnd","source":"","notificationType":"","reason":"clear","sessionId":"sid-cleared","ts":5,"pid":999}""")
+        record("sid-forked", """{"event":"SessionStart","source":"fork","notificationType":"","reason":"","sessionId":"sid-forked","ts":5,"pid":999}""")
+        record("sid-agent", """{"event":"Notification","source":"","notificationType":"agent_completed","reason":"","sessionId":"sid-agent","ts":5,"pid":999}""")
+        record("sid-gone", """{"event":"SessionEnd","source":"","notificationType":"","reason":"prompt_input_exit","sessionId":"sid-gone","ts":5,"pid":999}""")
+
+        val snapshot = store.snapshot(allAlive)
+        assertNull("a /clear hand-over is not a death", snapshot["sid-cleared"])
+        assertNull("a finished background agent is not a prompt", snapshot["sid-agent"])
+        assertEquals(ClaudeStatus.FINISHED, snapshot["sid-forked"]!!.status)
+        assertEquals(ClaudeStatus.EXITED, snapshot["sid-gone"]!!.status)
+    }
+
     @Test fun pruneKeepsLiveSessionsAndRecentFilesOnly() {
         setUpHome()
         writeHook("sid-live", "Stop", 1)
