@@ -42,6 +42,39 @@
     ]]></description>
 
     <change-notes><![CDATA[
+    <h3>1.1.2</h3>
+    <ul>
+      <li><b>Quitting Claude and starting it again in a tab went unnoticed.</b> A tab changes session two ways, and only
+      one was being caught: <code>/clear</code> keeps the process alive, so the pid links the old id to the new one, but
+      quitting and re-running starts a <i>new</i> process and there is no pid to join on. Everything keyed by session id
+      then stayed behind on the dead one. The tab kept coming back as &#10007; &mdash; the widget cache still held the
+      old id, and it is what the status attach rebuilds from, so four dead sessions sat bound to live tabs and repainted
+      their &#10007; over whatever the live session had just put there. <code>TERM_SESSION_ID</code> spans both cases:
+      the terminal outlives every session run in it, and the status hook records the mapping from the inside on every
+      event. A resumed session that merely rotates its id is not mistaken for one of these &mdash; both sides resolve to
+      the same transcript.</li>
+
+      <li><b>A tab name you typed reverted a few seconds later.</b> Measured at 19 seconds. Two caches carry a tab's
+      name and the rename paths were writing only one of them: the status loop repaints from the other every 400ms,
+      while the poll that refreshes it runs every 5s. So the first status change inside that window put the old name
+      back &mdash; and the overwrite then arrived at the title listener looking exactly like a rename someone had typed,
+      which filed it as deliberate and made it permanent. Worse when combined with the hand-over above, which had the
+      name filed under a session id nothing read any more.</li>
+
+      <li><b>A detached background shell now settles the tab the same way every time.</b> <code>shell</code> was left to
+      the newer-signal rule, so the same real state &mdash; a turn over, a background command still running, what Claude
+      Code shows as "1 shell still running" &mdash; painted &#10003; or &#9679; depending on which file happened to be
+      written last. It belongs with <code>idle</code>: Claude only ever writes it when the status would otherwise be
+      <code>idle</code>, which makes it the session file's second way of saying "back at the prompt", and that is
+      already the thing a <code>Stop</code> is not allowed to lose to. A <code>shell</code> with no finished edge still
+      shows as running.</li>
+
+      <li>A repair pass ships in the repository for names that were already stranded by a hand-over, since the fix above
+      cannot go back for them &mdash; <code>scripts/tidy-names.py</code>, read-only unless asked to write.</li>
+
+      <li>508 unit tests.</li>
+    </ul>
+
     <h3>1.1.1</h3>
     <ul>
       <li><b>A session waiting on background agents was shown as finished.</b> <code>Stop</code> fires when the
