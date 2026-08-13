@@ -493,6 +493,67 @@ internal object ClaudeTabsHelpers {
     }
 
     // ══════════════════════════════════════════════════════════════
+    // A TAB WHOSE CLAUDE WAS QUIT AND STARTED AGAIN
+    // ══════════════════════════════════════════════════════════════
+
+    /**
+     * `oldSessionId → newSessionId` for terminals that changed which session they host.
+     *
+     * The pid join in [ClaudeStatusStore.supersededSessions] covers `/clear`, where the
+     * process survives the rotation and can therefore link the two ids. It cannot cover the
+     * other way a tab changes session: the user quits Claude and runs it again in the same
+     * terminal. That is a *new* process, so the old session's pid is dead and the join finds
+     * nothing. Observed on a real run — terminal `2effd38a`:
+     *
+     *   status/b38f686a….json → {"event":"SessionEnd","reason":"prompt_input_exit","pid":24373}
+     *   pid 24373 is gone; the terminal now hosts 09776e86… under pid 25106
+     *
+     * Everything keyed by session id then stays behind on the dead one: the tab keeps being
+     * re-attached as `✕`, and a name the user types into the tab strip is filed under an id
+     * nothing reads any more — so the next status change repaints the tab with the *new*
+     * session's stale name and the rename looks like it reverted.
+     *
+     * `TERM_SESSION_ID` is what spans both cases. The terminal outlives every session run in
+     * it, and the status hook records `TERM_SESSION_ID → sessionId` from the inside on every
+     * event, so a hand-over is visible as the bridge file changing which session it names.
+     *
+     * The file only ever keeps the newest id, so this is necessarily a comparison against
+     * what the caller saw last: [previous] is its own prior reading. A terminal seen for the
+     * first time reports nothing, which is what stops a fresh IDE start from inventing
+     * hand-overs for sessions it merely restored.
+     *
+     * [canonical] is applied only to ids that actually changed — resolving one can cost a
+     * directory scan, and on a busy machine this map holds every terminal the hook has ever
+     * written for while hand-overs are rare.
+     *
+     * Scoped to [interesting] for the same reason the pid join is: a session nobody holds a
+     * tab for has nothing to hand over.
+     */
+    fun terminalHandovers(
+        previous: Map<String, String>,
+        current: Map<String, String>,
+        interesting: Set<String>,
+        canonical: (String) -> String = { it },
+    ): Map<String, String> {
+        if (previous.isEmpty() || interesting.isEmpty()) return emptyMap()
+        val out = mutableMapOf<String, String>()
+        for ((terminal, rawNew) in current) {
+            if (rawNew.isBlank()) continue
+            val rawOld = previous[terminal] ?: continue
+            if (rawOld == rawNew) continue
+            val oldSid = canonical(rawOld)
+            val newSid = canonical(rawNew)
+            // A resumed session rotates its in-memory id while staying the same
+            // conversation. That is not a hand-over — both sides canonicalise to the same
+            // transcript, and re-keying a tab to itself every tick would be pure churn.
+            if (oldSid == newSid) continue
+            if (oldSid !in interesting) continue
+            out[oldSid] = newSid
+        }
+        return out
+    }
+
+    // ══════════════════════════════════════════════════════════════
     // THE IDE'S OWN DEFAULT TERMINAL
     // ══════════════════════════════════════════════════════════════
 
