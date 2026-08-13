@@ -508,8 +508,20 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
 
     /** Per-session disposables for installed [com.intellij.terminal.TerminalTitleListener]s.
      *  Listener re-applies our [lastAppliedName] whenever the AI Assistant (or anything else)
-     *  overwrites `userDefinedTitle`. One listener per session; idempotent install. */
-    private val titleListenerDisposables = mutableMapOf<String, Disposable>()
+     *  overwrites `userDefinedTitle`. One listener per session; idempotent install.
+     *
+     *  Concurrent because [handOverTab] disposes off the EDT while [installTitleListener]
+     *  runs on it. */
+    private val titleListenerDisposables = java.util.concurrent.ConcurrentHashMap<String, Disposable>()
+
+    /**
+     * `TERM_SESSION_ID → sessionId` as of the last [rebindSupersededSessions] pass.
+     *
+     * The bridge file keeps only the newest id per terminal, so telling "this terminal now
+     * hosts a different session" from "this terminal has always hosted this session" needs a
+     * previous reading to compare against. This is it. See [ClaudeTabsHelpers.terminalHandovers].
+     */
+    private val lastTermSessionSid = java.util.concurrent.ConcurrentHashMap<String, String>()
 
     /** Rate-limit map for high-frequency log keys (e.g. AI overlay re-apply, restore-pending
      *  no-tab). Key is an arbitrary log identifier (often `sessionId` or `pending-$sessionId`),
@@ -1310,71 +1322,125 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
     }
 
     /**
-     * Hand a tab over from a session that `/clear` replaced to the one that replaced it.
+     * Hand each tab over from the session that used to be in it to the one there now.
      *
      * Without this the tab stays bound to the old id forever. The old id's last hook event
      * is `SessionEnd`, which [StatusResolver] treats as terminal by design, so the tab sits
      * at `✕` while the conversation in it is actively running — and it never picks up the
      * new conversation's name either, because the name is derived per session id.
      *
-     * Re-keying [spawnedWidgets] is the load-bearing part: it is what Strategy 0 of
-     * [attachStatusTabs] rebuilds `tabForSession` from, so leaving the old key there would
-     * re-attach the dead session on the very next pass.
+     * Two things replace a session in a tab, and they need different evidence to spot:
      *
-     * See [ClaudeStatusStore.supersededSessions] for how the two ids are linked.
+     *  - **`/clear`** keeps the process, so the pid links the two ids. See
+     *    [ClaudeStatusStore.supersededSessions].
+     *  - **Quitting Claude and running it again** starts a new process, so the pid join has
+     *    nothing to join on. The `TERM_SESSION_ID` bridge spans it. See
+     *    [ClaudeTabsHelpers.terminalHandovers].
      */
     private fun rebindSupersededSessions() {
         // Only sessions we hold a tab for can be handed over, and scoping the lookup to them
         // is what stops this costing more on a machine that has simply run Claude a lot:
         // every other SessionEnd on disk belongs to a conversation with no tab to give away.
-        val ours = tabForSession.keys + spawnedWidgets.keys
-        val superseded = try { statusStore.supersededSessions(ours) } catch (_: Exception) { return }
-        if (superseded.isEmpty()) return
+        val superseded = try {
+            statusStore.supersededSessions(tabForSession.keys + spawnedWidgets.keys)
+        } catch (_: Exception) {
+            emptyMap()
+        }
+        for ((oldSid, newSid) in superseded) handOverTab(oldSid, newSid, "replaced in place (/clear)")
 
-        for ((oldSid, newSid) in superseded) {
-            if (oldSid == newSid) continue
+        val currentTerm = try { statusStore.termSessionMap() } catch (_: Exception) { return }
+        val handovers = ClaudeTabsHelpers.terminalHandovers(
+            previous = lastTermSessionSid,
+            current = currentTerm,
+            // Recomputed rather than reused: the pass above may already have re-keyed some
+            // of these, and handing the same tab over twice would drop it.
+            interesting = tabForSession.keys + spawnedWidgets.keys,
+            canonical = ::canonicalize,
+        )
+        lastTermSessionSid.keys.retainAll(currentTerm.keys)
+        lastTermSessionSid.putAll(currentTerm)
+        for ((oldSid, newSid) in handovers) handOverTab(oldSid, newSid, "Claude restarted in the same terminal")
+    }
 
-            // Carry the permission mode across, before anything else — this is the only
-            // moment both sessions are linkable, and the successor's transcript records no
-            // mode of its own. Unconditional on whether a tab is being rebound: the value
-            // has to reach the restore file either way. See readPermissionMode.
-            if (!inheritedPermissionMode.containsKey(newSid) &&
-                transcriptPermissionMode(null, newSid) == null
-            ) {
-                transcriptPermissionMode(null, oldSid)?.let { mode ->
-                    inheritedPermissionMode[newSid] = mode
-                    LOG.info("[ClaudeTabs] ${newSid.take(8)} inherits permission mode '$mode' from ${oldSid.take(8)} — /clear writes none of its own")
-                }
+    /**
+     * Move every per-session handle and cache from [oldSid] to [newSid].
+     *
+     * Re-keying [spawnedWidgets] is the load-bearing part: it is what Strategy 0 of
+     * [attachStatusTabs] rebuilds `tabForSession` from, so leaving the old key there would
+     * re-attach the dead session on the very next pass — which is exactly how four dead
+     * sessions came to be re-attached to live tabs on every poll, each painting its `✕` over
+     * the status the live session had just put there.
+     *
+     * [reason] is for the log only.
+     */
+    private fun handOverTab(oldSid: String, newSid: String, reason: String) {
+        if (oldSid == newSid) return
+
+        // Carry the permission mode across, before anything else — this is the only
+        // moment both sessions are linkable, and the successor's transcript records no
+        // mode of its own. Unconditional on whether a tab is being rebound: the value
+        // has to reach the restore file either way. See readPermissionMode.
+        if (!inheritedPermissionMode.containsKey(newSid) &&
+            transcriptPermissionMode(null, newSid) == null
+        ) {
+            transcriptPermissionMode(null, oldSid)?.let { mode ->
+                inheritedPermissionMode[newSid] = mode
+                LOG.info("[ClaudeTabs] ${newSid.take(8)} inherits permission mode '$mode' from ${oldSid.take(8)} — a replaced session writes none of its own")
             }
+        }
 
-            val widget = spawnedWidgets.remove(oldSid)
-            val trackedTab = tabForSession.remove(oldSid)
-            if (widget == null && trackedTab == null) continue
+        val widget = spawnedWidgets.remove(oldSid)
+        val trackedTab = tabForSession.remove(oldSid)
+        if (widget == null && trackedTab == null) return
 
-            if (widget != null) spawnedWidgets.putIfAbsent(newSid, widget)
-            if (trackedTab != null) tabForSession.putIfAbsent(newSid, trackedTab)
+        if (widget != null) spawnedWidgets.putIfAbsent(newSid, widget)
+        if (trackedTab != null) tabForSession.putIfAbsent(newSid, trackedTab)
 
-            // A name the user typed belongs to the *tab*, not to the conversation that
-            // happened to be in it, so it follows the hand-over and keeps outranking
-            // everything. Without this, `/clear` would quietly overwrite it — the successor
-            // has no names.json entry of its own, so nothing would be left to protect.
-            carryUserChosenName(oldSid, newSid)
+        // A name the user typed belongs to the *tab*, not to the conversation that
+        // happened to be in it, so it follows the hand-over and keeps outranking
+        // everything. Without this, the replacement would quietly overwrite it — the
+        // successor has no names.json entry of its own, so nothing would be left to protect.
+        carryUserChosenName(oldSid, newSid)
 
-            // The plugin's own last-applied name moves too, so the title now on the tab
-            // still counts as ours. That is what lets the new conversation's name replace
-            // it; dropping the entry instead would leave the tab advertising the cleared
-            // conversation forever, since a non-generic title we no longer recognise is
-            // treated as someone's deliberate choice.
-            lastAppliedName.remove(oldSid)?.let { lastAppliedName.putIfAbsent(newSid, it) }
+        // The plugin's own last-applied name moves too, so the title now on the tab
+        // still counts as ours. That is what lets the new conversation's name replace
+        // it; dropping the entry instead would leave the tab advertising the replaced
+        // conversation forever, since a non-generic title we no longer recognise is
+        // treated as someone's deliberate choice.
+        lastAppliedName.remove(oldSid)?.let { lastAppliedName.putIfAbsent(newSid, it) }
 
-            // Everything else is per-conversation and must be re-derived.
-            appliedStatus.remove(oldSid)
-            baseNameForSession.remove(oldSid)
-            promptNameCache.remove(oldSid)
-            sessionEverRunning.remove(oldSid)
-            tabSpawnedAt.remove(oldSid)?.let { tabSpawnedAt.putIfAbsent(newSid, it) }
+        // The title listener closes over the id it was installed for, and it is what records
+        // a rename typed into the tab strip. Left on the old id it files the user's name
+        // under a session nothing reads any more — and goes on re-applying that session's
+        // last name over the new one. Dropping it lets the next rename install a listener
+        // keyed to the session the tab actually hosts.
+        disposeTitleListener(oldSid)
 
-            LOG.info("[ClaudeTabs][status] ${oldSid.take(8)} was replaced in place (/clear) — handing its tab to ${newSid.take(8)}")
+        // Everything else is per-conversation and must be re-derived.
+        appliedStatus.remove(oldSid)
+        baseNameForSession.remove(oldSid)
+        promptNameCache.remove(oldSid)
+        sessionEverRunning.remove(oldSid)
+        tabSpawnedAt.remove(oldSid)?.let { tabSpawnedAt.putIfAbsent(newSid, it) }
+
+        LOG.info("[ClaudeTabs][status] ${oldSid.take(8)} $reason — handing its tab to ${newSid.take(8)}")
+    }
+
+    /**
+     * Remove the [com.intellij.terminal.TerminalTitleListener] installed for [sessionId], if
+     * any, so a later [installTitleListener] for the same tab is not skipped as redundant.
+     *
+     * Disposal goes to the EDT: this is called from the status loop's background pass, and
+     * the listener list it unregisters from is the terminal's UI state.
+     */
+    private fun disposeTitleListener(sessionId: String) {
+        val disposable = titleListenerDisposables.remove(sessionId) ?: return
+        ApplicationManager.getApplication().invokeLater {
+            try {
+                Disposer.dispose(disposable)
+            } catch (e: Exception) {
+                LOG.debug("[ClaudeTabs] disposing title listener for ${sessionId.take(8)} failed: ${e.message}")
+            }
         }
     }
 
@@ -2295,7 +2361,8 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
      * project closes (via the [Disposer] hierarchy rooted at the project).
      */
     private fun installTitleListener(project: Project, title: com.intellij.terminal.TerminalTitle, sessionId: String) {
-        if (sessionId in titleListenerDisposables) return
+        // containsKey, explicitly: `in` on a ConcurrentHashMap resolves to containsValue.
+        if (titleListenerDisposables.containsKey(sessionId)) return
         try {
             val parentDisposable = Disposer.newDisposable("ClaudeTabs-titleListener-$sessionId")
             Disposer.register(project as Disposable, parentDisposable)
@@ -2344,7 +2411,10 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                         // persist the new name to the restore file immediately so the user's
                         // rename survives a crash before the next poll.
                         val canonical = canonicalize(sessionId)
-                        if (canonical != sessionId) lastAppliedName[canonical] = current
+                        if (canonical != sessionId) {
+                            lastAppliedName[canonical] = current
+                            baseNameForSession[canonical] = current
+                        }
                         persistRenameImmediately(project, canonical, current)
                     }
                 }
@@ -2876,6 +2946,10 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                     } else {
                         LOG.info("[ClaudeTabs] Manual rename detected: plugin set '$lastSet', now '$currentName' — respecting user choice")
                         lastAppliedName[sessionId] = currentName
+                        // Same reason as in the title listener: the status loop repaints from
+                        // baseNameForSession, so leaving the old value there hands the user's
+                        // name back to the one it replaced at the next status change.
+                        baseNameForSession[sessionId] = currentName
                         File(TABS_DIR, "$sessionId.json").delete()
                     }
                 }
