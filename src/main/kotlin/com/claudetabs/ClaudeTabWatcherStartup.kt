@@ -1459,6 +1459,11 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             val chosen = names[oldSid]?.takeIf { it.setBy == "user" }?.name ?: return
             storage.upsertName(newSid, chosen, "user")
             lastAppliedName[newSid] = chosen
+            // The status loop repaints from baseNameForSession — see [refreshStatuses]. The
+            // successor has no entry yet, so without this the first status change after the
+            // hand-over would fall back to whatever the tab is called and re-derive from
+            // there, undoing the carry we just made.
+            baseNameForSession[newSid] = chosen
             LOG.info("[ClaudeTabs] Carried the user's tab name '$chosen' across to ${newSid.take(8)}")
         } catch (e: Exception) {
             LOG.debug("[ClaudeTabs] carrying user name failed: ${e.message}")
@@ -2406,6 +2411,14 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                     } else if (current != null) {
                         LOG.info("[ClaudeTabs] User-driven title for session $sessionId: '$current' — accepting")
                         lastAppliedName[sessionId] = current
+                        // The status loop repaints from baseNameForSession, not from
+                        // lastAppliedName (see [refreshStatuses]), and it runs every 400ms
+                        // while the poll that refreshes base names runs every 5s. A rename
+                        // recorded only in lastAppliedName is therefore overwritten by the
+                        // stale base name at the next status change — measured at 19 seconds
+                        // after a rename, and the overwrite then came back through this same
+                        // listener as if the user had typed it.
+                        baseNameForSession[sessionId] = current
                         // Right-click → Rename Session (and any other in-app rename surface)
                         // funnels through the title listener. Treat it as a writing action:
                         // persist the new name to the restore file immediately so the user's
