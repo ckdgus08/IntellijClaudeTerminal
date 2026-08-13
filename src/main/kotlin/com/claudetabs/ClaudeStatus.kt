@@ -264,11 +264,24 @@ internal object StatusResolver {
      *     the same id.
      *  2. **The newer signal wins.** Both carry timestamps, so a hook edge that fired after
      *     Claude last rewrote its session file supersedes it, and vice versa.
-     *  3. **[FINISHED] survives a stale `idle`.** Claude's session file has no way to say
-     *     "a turn just completed" — it only knows `idle`. So when the session file would
-     *     downgrade a hook-established [ClaudeStatus.FINISHED] to [ClaudeStatus.IDLE], keep
-     *     [ClaudeStatus.FINISHED]; the two describe the same underlying process state and
-     *     the hook's is strictly more informative.
+     *  3. **[FINISHED] survives a session file that says "back at the prompt".** Claude's
+     *     session file has no way to say "a turn just completed" — it only knows `idle`, and
+     *     `shell` for `idle` with a detached background `Bash` still up. So when either would
+     *     downgrade a hook-established [ClaudeStatus.FINISHED], keep [ClaudeStatus.FINISHED];
+     *     they describe the same underlying process state and the hook's is strictly more
+     *     informative.
+     *
+     *     `shell` belongs here rather than under rule 4, and leaving it to rule 2 made the
+     *     same real state paint two different ways depending on which file was written last:
+     *
+     *       Stop at t=2000, session `shell` at t=1000  → ✓, the response is over
+     *       Stop at t=1000, session `shell` at t=2000  → ●, the response is equally over
+     *
+     *     Nothing about the tab differs between those — a turn has ended and a background
+     *     command the user started is still running — so the indicator must not differ
+     *     either. `shell` now settles to ✓ both ways, which is also what rule 4 already
+     *     wanted: it excludes `shell` from its own protection precisely so a long-lived
+     *     `npm run dev` can't pin a tab to ● for as long as the server is up.
      *  4. **A working session is not finished, however new the `Stop`.** `Stop` fires when
      *     the *response* ends, which is not when the session's work ends: background agents
      *     and a subagent fan-out keep running after it. Claude's own file is the only signal
@@ -298,8 +311,16 @@ internal object StatusResolver {
         // Rule 2 — newer wins.
         val winner = if (hook.ts >= session.statusUpdatedAt) hookState else sessionState
 
-        // Rule 3 — don't let a session-file `idle` erase a hook-established `finished`.
-        if (winner == ClaudeStatus.IDLE && hookState == ClaudeStatus.FINISHED) return ClaudeStatus.FINISHED
+        // Rule 3 — a session file saying "back at the prompt" doesn't erase a hook-established
+        // `finished`. Both of its ways of saying that are covered: `idle`, and `shell` — which
+        // Claude only ever writes when the status would otherwise be `idle` (see
+        // [fromSessionStatus]). `shell` has to be named explicitly because it *paints* as
+        // WORKING, so it never arrives here as `winner == IDLE`.
+        if (hookState == ClaudeStatus.FINISHED &&
+            (winner == ClaudeStatus.IDLE || session.status == "shell")
+        ) {
+            return ClaudeStatus.FINISHED
+        }
 
         // Rule 4 — a `Stop` edge doesn't finish a session Claude still reports as busy.
         // `busy` only, not every reading that paints as WORKING: `shell` is Claude *idle*

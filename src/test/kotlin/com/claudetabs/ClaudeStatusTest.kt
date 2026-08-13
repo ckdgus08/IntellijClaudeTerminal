@@ -352,15 +352,58 @@ class TurnEndSignalsTest {
     }
 
     /**
-     * `shell` is deliberately not covered, and its name is why it looks like it should be.
-     * Claude computes it only when the status would otherwise be `idle` — "at the prompt,
-     * with a detached background Bash still running". Covering it would pin the tab to ● for
-     * as long as someone's `npm run dev` stays up.
+     * `shell` is deliberately not covered by rule 4, and its name is why it looks like it
+     * should be. Claude computes it only when the status would otherwise be `idle` — "at the
+     * prompt, with a detached background Bash still running". Covering it would pin the tab
+     * to ● for as long as someone's `npm run dev` stays up.
+     *
+     * Which makes the ordering irrelevant, and it used not to be: whichever of the two files
+     * was written last decided the icon, so "response done, background shell alive" showed ✓
+     * or ● depending on a race. Rule 3 covers `shell` now, so it settles either way.
      */
     @Test fun aDetachedBackgroundShellDoesNotOutrankTheStop() {
         assertEquals(ClaudeStatus.FINISHED, StatusResolver.resolve(stop(2_000), session("shell", 1_000)))
-        // It still paints as running while it is the newest thing anyone knows.
-        assertEquals(ClaudeStatus.WORKING, StatusResolver.resolve(stop(1_000), session("shell", 2_000)))
+        assertEquals(ClaudeStatus.FINISHED, StatusResolver.resolve(stop(1_000), session("shell", 2_000)))
+    }
+
+    /** The user-visible statement of the same thing: one state, one icon, whatever the order. */
+    @Test fun theIconDoesNotDependOnWhichFileWasWrittenLast() {
+        for (sessionTs in listOf(1L, 999L, 1_000L, 1_001L, 5_000L, 400_000L)) {
+            assertEquals(
+                "Stop at 1000, shell at $sessionTs",
+                ClaudeStatus.FINISHED,
+                StatusResolver.resolve(stop(1_000), session("shell", sessionTs)),
+            )
+        }
+    }
+
+    /**
+     * Only a `Stop` settles it. A background `Bash` running inside a turn reads as `busy`,
+     * not `shell`, so this is the case where the user really did start something and walk
+     * away — and until the turn ends the tab is still working.
+     */
+    @Test fun aShellWithNoFinishedEdgeStillPaintsAsRunning() {
+        assertEquals(
+            ClaudeStatus.WORKING,
+            StatusResolver.resolve(StatusResolver.HookSignal("UserPromptSubmit", 1_000), session("shell", 2_000)),
+        )
+        assertEquals(ClaudeStatus.WORKING, StatusResolver.resolve(null, session("shell", 2_000)))
+    }
+
+    /** `StopFailure` ends a response the same way, so it settles a `shell` too. */
+    @Test fun aFailedTurnAlsoSettlesADetachedShell() {
+        assertEquals(
+            ClaudeStatus.FINISHED,
+            StatusResolver.resolve(StatusResolver.HookSignal("StopFailure", 1_000), session("shell", 2_000)),
+        )
+    }
+
+    /** A dead process outranks all of it — rule 1 runs first. */
+    @Test fun aShellOnADeadProcessIsStillDead() {
+        assertEquals(
+            ClaudeStatus.EXITED,
+            StatusResolver.resolve(stop(1_000), session("shell", 2_000, alive = false)),
+        )
     }
 
     @Test fun aDeadProcessIsStillDead() {
