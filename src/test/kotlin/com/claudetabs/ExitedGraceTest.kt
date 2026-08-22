@@ -9,11 +9,10 @@ import org.junit.Test
  *
  * On every IDE start the restore spawns the tabs first and `claude --resume` starts inside
  * them a few seconds later. In that window the only session file on disk for the id is the
- * dead one from before the restart, so the status resolves to EXITED — measured on a real
- * start as a 4-second `✕` across the whole tab strip:
+ * dead one from before the restart, so the status resolves to EXITED for a few seconds:
  *
- *   21:21:12  70000002 - → EXITED ('plugin')
- *   21:21:16  70000002 EXITED → FINISHED ('plugin')
+ *   t=0s  10000001 - → EXITED ('plugin')
+ *   t=4s  10000001 EXITED → FINISHED ('plugin')
  *
  * The suppression is deliberately narrow. A session that genuinely died must still reach
  * `✕`, so the hold only applies while all three conditions hold at once.

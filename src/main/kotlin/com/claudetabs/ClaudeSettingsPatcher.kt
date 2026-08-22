@@ -17,11 +17,11 @@ internal object ClaudeSettingsPatcher {
      * `status-hook.sh`. The event name doubles as the argument so the script needs no
      * mapping table of its own.
      *
-     * `SubagentStop` is deliberately absent: a subagent finishing does not mean the turn
-     * finished, and treating it as [ClaudeStatus.FINISHED] made tabs flicker to ✓ in the
-     * middle of a long agentic run. `SubagentStart` likewise adds nothing — Claude's own
-     * session file already reports `busy` for the whole delegated run (see
-     * [StatusResolver.fromSessionStatus]), which covers background agents too.
+     * `SubagentStop` is subscribed only to refresh the separate background-task count. It
+     * still establishes no [ClaudeStatus] of its own, so a subagent finishing cannot make
+     * the main turn flicker to ✓. `SubagentStart` adds nothing visible while the main turn is
+     * already working; the authoritative in-flight list arrives with `Stop` and subsequent
+     * `SubagentStop` payloads.
      *
      * `StopFailure` is the counterpart to `Stop`, and easy to miss: when a turn ends on an
      * API error — rate limit, overloaded, billing — Claude fires **that instead**, and no
@@ -33,6 +33,7 @@ internal object ClaudeSettingsPatcher {
         "UserPromptSubmit",
         "Notification",
         "Stop",
+        "SubagentStop",
         "StopFailure",
         "SessionEnd",
     )

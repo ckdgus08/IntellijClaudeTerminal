@@ -28,7 +28,7 @@ class SessionIdSafetyTest {
     @get:Rule val tmp = TemporaryFolder()
 
     @Test fun acceptsTheIdsClaudeActuallyWrites() {
-        assertTrue(ClaudeTabsHelpers.isSafeSessionId("70000002-0000-4000-8000-000000000002"))
+        assertTrue(ClaudeTabsHelpers.isSafeSessionId("60000001-0000-4000-8000-000000000001"))
         // Not pinned to UUID: the property that matters is "nothing a shell or a path
         // parser treats specially", and pinning would break when the format changes.
         assertTrue(ClaudeTabsHelpers.isSafeSessionId("sid-abc"))
@@ -75,7 +75,7 @@ class SessionIdSafetyTest {
         assertNull(ClaudeTabsHelpers.findTranscript(projects, "../outside", null))
         assertFalse(ClaudeTabsHelpers.hasTranscriptAnywhere(projects, "../outside", null))
 
-        // A real id in the same tree still resolves, so the guard isn't just refusing work.
+        // A valid fixture id in the same tree still resolves, so the guard isn't just refusing work.
         File(File(projects, "-x-proj"), "good-sid.jsonl").writeText("{}")
         assertTrue(ClaudeTabsHelpers.hasTranscriptAnywhere(projects, "good-sid", null))
     }
@@ -86,7 +86,7 @@ class SessionIdSafetyTest {
      * before it gets here.
      */
     @Test fun theResumeCommandIsOnlyEverIdAndFlag() {
-        val sid = "70000002-0000-4000-8000-000000000002"
+        val sid = "60000001-0000-4000-8000-000000000001"
         assertTrue(ClaudeTabsHelpers.isSafeSessionId(sid))
         val cmd = "claude --resume $sid"
         assertFalse("no shell metacharacter can survive validation", cmd.any { it in ";|&`$()<>\n" })

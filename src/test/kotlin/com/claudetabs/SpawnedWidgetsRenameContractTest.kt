@@ -125,8 +125,8 @@ class SpawnedWidgetsRenameContractTest {
         // documents the contract for future readers and catches any rename-keying
         // mistakes early.
         val widget = FakeTarget("w")
-        val canonical = "d0000001-0000-4000-8000-000000000001"
-        val rotatedRaw = "11111111-1111-1111-1111-111111111111"
+        val canonical = "20000001-0000-4000-8000-000000000001"
+        val rotatedRaw = "20000002-0000-4000-8000-000000000002"
         val cache = mapOf(canonical to widget)
 
         // Canonical lookup → APPLIED

@@ -64,6 +64,9 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         /** Root of Claude Code's user data (scripts, sessions, commands live under this). */
         private val CLAUDE_HOME = File(System.getProperty("user.home"), ".claude")
 
+        /** Root of Codex CLI's user data and hooks configuration. */
+        private val CODEX_HOME = File(System.getProperty("user.home"), ".codex")
+
         /** Where Claude Code writes `{PID}.json` session files. Read-only for the plugin. */
         private val SESSIONS_DIR = File(CLAUDE_HOME, "sessions")
 
@@ -139,6 +142,9 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         /** Reads the hook edges + Claude's own per-session `status` field. See [ClaudeStatusStore]. */
         private val statusStore = ClaudeStatusStore(CLAUDE_HOME)
 
+        /** Reads Codex hook edges and the metadata used for save/restore. */
+        private val codexStatusStore = CodexStatusStore(CODEX_HOME)
+
         /** How often the status indicator re-reads the (tiny) status files.
          *
          *  The tab glyph has to feel immediate, and the 5s save poll is far too coarse for
@@ -190,11 +196,14 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             synchronized(statusSnapshotLock) {
                 val now = System.currentTimeMillis()
                 if (now - statusSnapshotAt >= STATUS_SNAPSHOT_TTL_MS) {
-                    statusSnapshot = statusStore.snapshot()
+                    statusSnapshot = statusStore.snapshot() + codexStatusStore.snapshot()
                     statusSnapshotAt = now
                 }
                 statusSnapshot
             }
+
+        private fun sharedTermSessionMap(): Map<String, String> =
+            statusStore.termSessionMap() + codexStatusStore.termSessionMap()
 
         /** Long-term session history — one JSON entry per closed/backed-up session. */
         private val HISTORY_FILE = File(CLAUDE_HOME, "intellij-claude-terminal/history.json")
@@ -295,8 +304,19 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                 }
             }
 
+
+            val codexHooks = File(CODEX_HOME, "hooks.json")
+            if (codexHooks.exists()) {
+                try {
+                    CodexHooksPatcher.unpatch(codexHooks.readText())?.let { codexHooks.writeText(it) }
+                } catch (e: Exception) {
+                    LOG.warn("[ClaudeTabs] Codex hooks.json cleanup skipped: ${e.message}")
+                }
+            }
+
             // 3. Remove deployed scripts and data
             File(CLAUDE_HOME, "intellij-claude-terminal").deleteRecursively()
+            File(CODEX_HOME, "rider-agent-tabs").deleteRecursively()
             removeRetiredSlashCommands()
         }
 
@@ -391,14 +411,19 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
      */
     private val sessionAliases = java.util.concurrent.ConcurrentHashMap<String, String>()
 
+    private data class AppliedStatus(
+        val status: ClaudeStatus,
+        val backgroundTaskCount: Int,
+    )
+
     /**
-     * Current status glyph state per canonical sessionId, as last **applied to a tab**.
+     * Current main status and background count per canonical sessionId, as last applied.
      *
      * Distinct from what [statusStore] reads off disk: this records what the tab strip is
      * actually showing, so the fast status loop can skip the (reflective, main-thread) title
      * write when nothing changed. Without it, every 400ms tick would repaint every tab.
      */
-    private val appliedStatus = java.util.concurrent.ConcurrentHashMap<String, ClaudeStatus>()
+    private val appliedStatus = java.util.concurrent.ConcurrentHashMap<String, AppliedStatus>()
 
     /**
      * When the plugin spawned a tab for a session, so a restored tab that hasn't started its
@@ -728,6 +753,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         maybeWriteConfigTemplate()
         loadConfig()
         deployClaudeIntegration()
+        deployCodexIntegration()
         pruneStaleHistoryEntries()
         pruneStaleRestoreEntries(project)
         // Hook files outlive their sessions (SessionEnd writes one last edge and then
@@ -735,6 +761,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         // still tracked in names.json are kept regardless of age.
         try {
             statusStore.prune(liveSessionIds = storage.loadNames().keys)
+            codexStatusStore.prune(liveSessionIds = storage.loadNames().keys)
         } catch (e: Exception) {
             LOG.debug("[ClaudeTabs] status file prune failed: ${e.message}")
         }
@@ -1012,7 +1039,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             // measured at ~1.9ms together — and they used to run inside the EDT block below,
             // which is a UI stall every 1.5s for work that touches no UI at all.
             rebindSupersededSessions()
-            val termMap = try { statusStore.termSessionMap() } catch (_: Exception) { emptyMap() }
+            val termMap = try { sharedTermSessionMap() } catch (_: Exception) { emptyMap() }
             withContext(Dispatchers.Main) {
                 try {
                     attachStatusTabs(project, tabForSession.keys.toSet(), termMap)
@@ -1027,9 +1054,9 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         val readings = sharedStatusSnapshot()
         if (readings.isEmpty()) return
 
-        // sid → (tab, newStatus) for the tabs that actually need repainting. Scoped to this
+        // sid → (tab, presentation) for the tabs that actually need repainting. Scoped to this
         // window so two open projects don't both paint (and both log) the same tab.
-        val pending = mutableListOf<Triple<String, TabInfo, ClaudeStatus>>()
+        val pending = mutableListOf<Triple<String, TabInfo, AppliedStatus>>()
         for ((sid, tracked) in tabForSession) {
             if (tracked.projectHash != thisProjectHash) continue
             // A resumed session's hook files are keyed by the rotated id Claude reported at
@@ -1042,21 +1069,26 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                 // dead process from before the restart, not this one.
                 continue
             }
-            if (appliedStatus[sid] == reading.status) continue
-            pending.add(Triple(sid, tracked.tab, reading.status))
+            val presentation = AppliedStatus(reading.status, reading.backgroundTaskCount)
+            if (appliedStatus[sid] == presentation) continue
+            pending.add(Triple(sid, tracked.tab, presentation))
         }
         if (pending.isEmpty()) return
 
         withContext(Dispatchers.Main) {
-            for ((sid, tab, status) in pending) {
+            for ((sid, tab, presentation) in pending) {
                 val previous = appliedStatus[sid]
-                appliedStatus[sid] = status
+                appliedStatus[sid] = presentation
                 val base = baseNameForSession[sid]
                     ?: lastAppliedName[sid]
                     ?: storage.nameFor(sid)
                     ?: tab.tabName
-                if (applyStatusToTab(tab, base, status, project)) {
-                    LOG.info("[ClaudeTabs][status] ${sid.take(8)} ${previous?.name ?: "-"} → ${status.name} ('$base')")
+                if (applyStatusToTab(tab, base, presentation, project)) {
+                    val previousText = previous?.let { "${it.status.name}/bg${it.backgroundTaskCount}" } ?: "-"
+                    LOG.info(
+                        "[ClaudeTabs][status] ${sid.take(8)} $previousText → " +
+                            "${presentation.status.name}/bg${presentation.backgroundTaskCount} ('$base')"
+                    )
                 } else {
                     // The tab is gone or its title surface is unreachable. Drop the cached
                     // state so we don't keep retrying every tick; the next poll re-adds it
@@ -1069,8 +1101,8 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
     }
 
     /**
-     * The title to write for a tab in [status]: the bare name when the tab carries the
-     * status icon, glyph-prefixed when it doesn't.
+     * The title to write for a tab in [presentation]: the bare name when the tab carries the
+     * status icon and background badge, glyph-prefixed when it doesn't.
      *
      * Both used to go on at once, and that turned out to be more than redundant. Writing
      * `userDefinedTitle` does not stay on the frontend: the platform's own title listeners
@@ -1083,21 +1115,30 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
      * whose `Content` the platform won't hand over, which can show no icon and would
      * otherwise show no state at all.
      */
-    private fun titleFor(baseName: String, status: ClaudeStatus?, content: Content?): String =
-        if (content != null) baseName else StatusDecoration.decorate(baseName, status)
+    private fun titleFor(baseName: String, presentation: AppliedStatus?, content: Content?): String =
+        if (content != null) baseName else StatusDecoration.decorate(
+            baseName,
+            presentation?.status,
+            presentation?.backgroundTaskCount ?: 0,
+        )
 
     /**
-     * Put [status] on [tab]: the icon when the tab can carry one, the glyph in the title
-     * when it can't, and the tooltip either way. Returns false if no surface could be
+     * Put [presentation] on [tab]: the icon when the tab can carry one, the glyph/background
+     * prefix in the title when it can't, and the tooltip either way. Returns false if no surface could be
      * reached, which the caller treats as "this tab is gone".
      *
      * Only the frontend surfaces are touched. The backend tab name (the one that persists
      * into `workspace.xml`) keeps the bare name written by [renameTab] — a glyph there would
      * outlive the session it describes and reappear, stale, on the next IDE start.
      */
-    private fun applyStatusToTab(tab: TabInfo, baseName: String, status: ClaudeStatus, project: Project? = null): Boolean {
+    private fun applyStatusToTab(
+        tab: TabInfo,
+        baseName: String,
+        presentation: AppliedStatus,
+        project: Project? = null,
+    ): Boolean {
         val content = tab.content ?: project?.let { contentForWidget(it, tab.widget) }
-        val display = titleFor(baseName, status, content)
+        val display = titleFor(baseName, presentation, content)
         var applied = false
         if (content != null) {
             try {
@@ -1110,7 +1151,10 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                 // plugin doesn't depend on; the icon is a nice-to-have and must not be able
                 // to take the status path down with it.
                 enableContentIcon(content)
-                content.icon = ClaudeStatusIcons.forStatus(status)
+                content.icon = ClaudeStatusIcons.forStatus(
+                    presentation.status,
+                    presentation.backgroundTaskCount,
+                )
                 applied = true
             } catch (e: Exception) {
                 LOG.debug("[ClaudeTabs][status] setIcon failed: ${e.message}")
@@ -1130,7 +1174,11 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         try {
             content?.let {
                 it.displayName = display
-                it.description = StatusDecoration.tooltip(baseName, status)
+                it.description = StatusDecoration.tooltip(
+                    baseName,
+                    presentation.status,
+                    presentation.backgroundTaskCount,
+                )
                 applied = true
             }
         } catch (e: Exception) {
@@ -1249,12 +1297,14 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             // already paid for a snapshot within the last 300ms.
             val readings = try { sharedStatusSnapshot() } catch (_: Exception) { emptyMap() }
             val shown = mine.keys.joinToString(", ") { sid ->
-                val st = appliedStatus[sid]?.name ?: "-"
+                val applied = appliedStatus[sid]
+                val st = applied?.status?.name ?: "-"
+                val background = applied?.backgroundTaskCount ?: 0
                 val hook = readings[sid]?.hookEvent ?: readings[rawIdFor(sid)]?.hookEvent ?: "-"
                 val claude = readings[sid]?.sessionStatus ?: readings[rawIdFor(sid)]?.sessionStatus ?: "-"
-                "${sid.take(8)}:$st(hook=$hook,claude=$claude)"
+                "${sid.take(8)}:$st/bg$background(hook=$hook,claude=$claude)"
             }.ifBlank { "none" }
-            val termMap = try { statusStore.termSessionMap().size } catch (_: Exception) { -1 }
+            val termMap = try { sharedTermSessionMap().size } catch (_: Exception) { -1 }
             // How many tracked tabs expose a `Content` for the icon to be written to. This
             // is reachability only — it says the write lands somewhere real, NOT that the
             // tab strip draws it. Named for what it measures: reading the old `icons=2/2` as
@@ -1314,7 +1364,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                 }
                 "'$name'(${cls.simpleName}: ${values.joinToString(" ; ").ifBlank { "nothing-identity-like" }})"
             }
-            val candidates = try { statusStore.termSessionMap().keys.joinToString(",") { it.take(8) } } catch (_: Exception) { "?" }
+            val candidates = try { sharedTermSessionMap().keys.joinToString(",") { it.take(8) } } catch (_: Exception) { "?" }
             LOG.info("[ClaudeTabs][status] identity probe — ${contents.size} content(s), looking for TERM_SESSION_IDs [$candidates]: $report")
         } catch (e: Exception) {
             LOG.debug("[ClaudeTabs][status] identity probe failed: ${e.message}")
@@ -1348,7 +1398,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         }
         for ((oldSid, newSid) in superseded) handOverTab(oldSid, newSid, "replaced in place (/clear)")
 
-        val currentTerm = try { statusStore.termSessionMap() } catch (_: Exception) { return }
+        val currentTerm = try { sharedTermSessionMap() } catch (_: Exception) { return }
         val handovers = ClaudeTabsHelpers.terminalHandovers(
             previous = lastTermSessionSid,
             current = currentTerm,
@@ -1504,7 +1554,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         if (termSessionMap == null) rebindSupersededSessions()
 
         val termMap = termSessionMap
-            ?: try { statusStore.termSessionMap() } catch (_: Exception) { emptyMap() }
+            ?: try { sharedTermSessionMap() } catch (_: Exception) { emptyMap() }
 
         val attached = mutableSetOf<String>()
         val thisProjectHash = projectHash(project)
@@ -1536,7 +1586,8 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             tabForSession[canonical] = TrackedTab(handle, thisProjectHash)
             baseNameForSession.putIfAbsent(
                 canonical,
-                storage.nameFor(canonical) ?: name.takeIf { it.isNotBlank() && !isGenericTabName(it) } ?: "Claude",
+                storage.nameFor(canonical) ?: name.takeIf { it.isNotBlank() && !isGenericTabName(it) }
+                    ?: if (AgentKind.fromInternalSessionId(canonical) == AgentKind.CODEX) "Codex" else "Claude",
             )
             attached.add(canonical)
         }
@@ -1602,7 +1653,8 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                     tabForSession[canonical] = TrackedTab(handle, thisProjectHash)
                     baseNameForSession.putIfAbsent(
                         canonical,
-                        storage.nameFor(canonical) ?: handle.tabName.takeIf { it.isNotBlank() && !isGenericTabName(it) } ?: "Claude",
+                        storage.nameFor(canonical) ?: handle.tabName.takeIf { it.isNotBlank() && !isGenericTabName(it) }
+                            ?: if (AgentKind.fromInternalSessionId(canonical) == AgentKind.CODEX) "Codex" else "Claude",
                     )
                     attached.add(canonical)
                 } catch (e: Exception) {
@@ -2241,8 +2293,8 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         // persistence path; `display` is what the tab strip shows. Remembering the bare name
         // here is what lets the status loop repaint later without re-deriving it.
         if (sessionId != null) baseNameForSession[sessionId] = name
-        val status = sessionId?.let { appliedStatus[it] }
-        val display = titleFor(name, status, tab.content ?: contentForWidget(project, tab.widget))
+        val presentation = sessionId?.let { appliedStatus[it] }
+        val display = titleFor(name, presentation, tab.content ?: contentForWidget(project, tab.widget))
 
         // Redundancy short-circuit: skip the rename APIs only if both the backend name AND the
         // TerminalTitle's userDefinedTitle already match. The backend can be correct (restored
@@ -2277,7 +2329,11 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         // chain propagates correctly this is redundant, but if not it makes the rename visible
         // until the listener settles.
         tab.content?.displayName = display
-        tab.content?.description = StatusDecoration.tooltip(name, status)
+        tab.content?.description = StatusDecoration.tooltip(
+            name,
+            presentation?.status,
+            presentation?.backgroundTaskCount ?: 0,
+        )
 
         // Backend persistence: ensures the rename survives IDE restart.
         if (tab.reworkedTabId != null) {
@@ -2843,6 +2899,11 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                     if (rawSid in pendingSids) alive.add(rawSid)
                     if (canonical in pendingSids) alive.add(canonical)
                 }
+                for ((sid, metadata) in codexStatusStore.liveSessions()) {
+                    if (sid !in pendingSids) continue
+                    val cwd = metadata.cwd ?: continue
+                    if (ClaudeTabsHelpers.isCwdUnderProject(cwd, project.basePath)) alive.add(sid)
+                }
             } catch (e: Exception) {
                 LOG.debug("[ClaudeTabs][close] pendingClose alive-check failed: ${e.message}")
             }
@@ -3124,6 +3185,78 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             }
         }
 
+        // Codex has no Claude-style `sessions/<pid>.json`; its supported hooks are the
+        // authoritative session-id/cwd source. The hook also records the interactive
+        // ancestor pid, so a stale record from an unclean kill is not persisted forever.
+        val codexSessions = mutableListOf<String>()
+        try {
+            for ((sid, metadata) in codexStatusStore.sessions()) {
+                if (metadata.event == "SessionEnd") continue
+                val pid = metadata.pid
+                val processRecognised = if (pid != null && pid > 0) {
+                    val process = ProcessHandle.of(pid).orElse(null)
+                    process?.takeIf { it.isAlive }?.let {
+                        CodexProcessRecognition.isInteractive(
+                            CodexProcessRecognition.ProcessInfo(
+                                command = it.info().command().orElse(""),
+                                commandLine = it.info().commandLine().orElse(""),
+                            )
+                        )
+                    } == true
+                } else {
+                    false
+                }
+                // Some Windows policies hide the parent process query from the hook. A
+                // fresh TERM_SESSION_ID attachment is still direct proof that this Rider
+                // tab currently hosts the session; use it only when no pid was available.
+                val attachedWithoutPid = (pid == null || pid <= 0) && sid in termAttached
+                if (!processRecognised && !attachedWithoutPid) continue
+                val cwd = metadata.cwd ?: continue
+                val tracked = tabForSession[sid]?.takeIf { it.projectHash == thisProjectHash }?.tab
+                val hostedHere = tracked != null
+                val cwdOwnedHere = ClaudeTabsHelpers.isCwdUnderProject(cwd, project.basePath)
+                if (!hostedHere && !cwdOwnedHere) continue
+                if (!hostedHere && claimedByTabWalk[sid]?.let { it != thisProjectHash } == true) continue
+
+                val liveTitle = tracked?.tabName?.let(StatusDecoration::strip)
+                val promptName = ClaudeTabsHelpers.promptName(metadata.prompt)
+                val storedName = storage.nameFor(sid)
+                val title = storedName
+                    ?: promptName
+                    ?: liveTitle?.takeUnless { it.equals("Codex", true) || isGenericTabName(it) }
+                    ?: c.previousActive[sid]?.tabName
+                    ?: "Codex"
+
+                // A raw prompt is buffered only so this poll can derive a compact, secret-
+                // checked label. Persist the label, then delete the raw buffer immediately.
+                if (metadata.prompt != null) {
+                    if (storedName == null && promptName != null) {
+                        runCatching { storage.upsertName(sid, promptName, "auto") }
+                    }
+                    codexStatusStore.discardPrompt(sid)
+                }
+
+                if (tracked != null) {
+                    tracked.content?.let { c.contentToSid[it] = sid }
+                    tabWalkSeenSids.add(sid)
+                    tabWalkOwnedSids.add(sid)
+                    claimedByTabWalk[sid] = thisProjectHash
+                    val current = StatusDecoration.strip(tracked.tabName)
+                    if (promptName != null && title == promptName &&
+                        (current.isBlank() || current.equals("Codex", true) || isGenericTabName(current))
+                    ) {
+                        renameTab(project, tracked, promptName, sessionId = sid)
+                        lastAppliedName[sid] = promptName
+                    }
+                }
+                baseNameForSession[sid] = title
+                activeSessions.add(SavedSession(sid, cwd, title, false, AgentKind.CODEX))
+                codexSessions.add("'$title'→session:${AgentKind.CODEX.toExternalSessionId(sid).take(8)}")
+            }
+        } catch (e: Exception) {
+            LOG.debug("[ClaudeTabs] Codex session scan failed: ${e.message}")
+        }
+
         // Drop status bookkeeping for tabs this window no longer has, so the fast loop
         // doesn't keep poking disposed widgets and the maps don't grow without bound.
         //
@@ -3176,7 +3309,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         // belongs to this project, regardless of cwd. No platform API needed.
         //
         // This is the real fix for the worktree case: a session whose cwd is
-        // `D:\Dev\ProjectAlpha-couch-mode` but whose shell was spawned by ProjectAlpha's Rider window
+        // `D:\Dev\ProjectAlpha-worktree` but whose shell was spawned by ProjectAlpha's Rider window
         // gets discovered here. Goes into `tabWalkOwnedSids` so `saveState` bypasses the
         // cross-project cwd filter (see `ClaudeTabsHelpers.ownedByProjectSave`).
         val ownJvmPid = ProcessHandle.current().pid()
@@ -3300,6 +3433,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
 
         if (c.pollCount % 12 == 0) {
             if (claudeSessions.isNotEmpty()) LOG.info("[ClaudeTabs] STEP 6: Claude sessions found: $claudeSessions")
+            if (codexSessions.isNotEmpty()) LOG.info("[ClaudeTabs] STEP 6: Codex sessions found: $codexSessions")
             LOG.info("[ClaudeTabs] STEP 7: Saving ${activeSessions.size} active session(s)")
         }
 
@@ -3352,8 +3486,14 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
     // SESSION SAVE / RESTORE
     // ══════════════════════════════════════════════════════════════
 
-    /** A Claude Code session that has been (or currently is) associated with a named terminal tab. */
-    data class SavedSession(val sessionId: String, val cwd: String, val tabName: String, val bypassPermissions: Boolean)
+    /** An interactive agent session associated with a terminal tab. */
+    internal data class SavedSession(
+        val sessionId: String,
+        val cwd: String,
+        val tabName: String,
+        val bypassPermissions: Boolean,
+        val provider: AgentKind = AgentKind.CLAUDE,
+    )
 
     /** Lock object guarding all reads/writes to [HISTORY_FILE]. */
     private val historyLock = Any()
@@ -3376,10 +3516,15 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             }
             val entries = existing.toMutableList()
 
-            // Don't duplicate — replace any existing entry for the same sessionId.
-            entries.removeAll { extractJsonString(it, "sessionId") == session.sessionId }
+            // Don't duplicate — provider participates so identical external ids cannot
+            // collide across Claude and Codex.
+            val externalSid = session.provider.toExternalSessionId(session.sessionId)
+            entries.removeAll { raw ->
+                AgentKind.fromWire(extractJsonString(raw, "provider")) == session.provider &&
+                    extractJsonString(raw, "sessionId") == externalSid
+            }
 
-            val entry = "{\"sessionId\":\"${esc(session.sessionId)}\",\"cwd\":\"${esc(session.cwd)}\",\"tabName\":\"${esc(session.tabName)}\",\"bypassPermissions\":${session.bypassPermissions},\"closedAt\":$now}"
+            val entry = "{\"provider\":\"${session.provider.wireName}\",\"sessionId\":\"${esc(externalSid)}\",\"cwd\":\"${esc(session.cwd)}\",\"tabName\":\"${esc(session.tabName)}\",\"bypassPermissions\":${session.bypassPermissions},\"closedAt\":$now}"
             entries.add(entry)
 
             // Prune entries older than configured retention window.
@@ -3465,7 +3610,8 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                     return
                 }
                 val (kept, pruned) = entries.partition { raw ->
-                    val sid = extractJsonString(raw, "sessionId") ?: return@partition true
+                    val provider = AgentKind.fromWire(extractJsonString(raw, "provider"))
+                    val sid = provider.toInternalSessionId(extractJsonString(raw, "sessionId") ?: return@partition true)
                     val cwd = extractJsonString(raw, "cwd") ?: return@partition true
                     hasTranscript(cwd, sid)
                 }
@@ -3507,7 +3653,8 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             val droppedNoTranscript = mutableListOf<String>()
             val droppedCrossProject = mutableListOf<String>()
             val kept = entries.filter { raw ->
-                val sid = extractJsonString(raw, "sessionId") ?: return@filter true
+                val provider = AgentKind.fromWire(extractJsonString(raw, "provider"))
+                val sid = provider.toInternalSessionId(extractJsonString(raw, "sessionId") ?: return@filter true)
                 val cwd = extractJsonString(raw, "cwd") ?: return@filter true
                 val name = extractJsonString(raw, "tabName") ?: "?"
                 if (!ClaudeTabsHelpers.isCwdUnderProject(cwd, basePath)) {
@@ -3682,7 +3829,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             val userClosed = synchronized(c.userClosedSessions) { c.userClosedSessions.toSet() }
 
             val newForStorage = kept.map {
-                ClaudeTabsStorage.SavedSession(it.sessionId, it.cwd, it.tabName, it.bypassPermissions)
+                ClaudeTabsStorage.SavedSession(it.sessionId, it.cwd, it.tabName, it.bypassPermissions, it.provider)
             }
 
             // Two-poll-grace: compute which sids are missing from `new` this poll. Entries
@@ -3748,11 +3895,13 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                 val rawParsed = mutableListOf<SavedSession>()
                 for (m in Regex("""\{[^}]+\}""").findAll(json)) {
                     val o = m.value
+                    val provider = AgentKind.fromWire(extractJsonString(o, "provider"))
                     rawParsed.add(SavedSession(
-                        extractJsonString(o, "sessionId") ?: continue,
+                        provider.toInternalSessionId(extractJsonString(o, "sessionId") ?: continue),
                         extractJsonString(o, "cwd") ?: continue,
                         extractJsonString(o, "tabName") ?: continue,
-                        o.contains("\"bypassPermissions\":true")
+                        o.contains("\"bypassPermissions\":true"),
+                        provider,
                     ))
                 }
                 if (rawParsed.isEmpty()) continue
@@ -3786,7 +3935,9 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                 // directory and its session ids are typed into a live terminal by
                 // buildResumeCmd. Anything that isn't a plain id is dropped here rather than
                 // being allowed to become a command. See ClaudeTabsHelpers.isSafeSessionId.
-                val (safe, unsafe) = parsed.partition { ClaudeTabsHelpers.isSafeSessionId(it.sessionId) }
+                val (safe, unsafe) = parsed.partition {
+                    ClaudeTabsHelpers.isSafeSessionId(it.provider.toExternalSessionId(it.sessionId))
+                }
                 if (unsafe.isNotEmpty()) {
                     LOG.warn("[ClaudeTabs] Refusing to restore ${unsafe.size} session(s) whose id is not a plain identifier — the id is typed into a terminal, so this is not restorable: ${unsafe.joinToString { "'" + it.sessionId.take(40) + "'" }}")
                 }
@@ -3898,7 +4049,7 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                 // Keep only tabs that actually have a Claude child. Everything else (no
                 // widget, no PID, or PID with no Claude inside) is a stale ghost and gets
                 // closed.
-                if (pid != null && findClaudeChild(pid) != null) continue
+                if (pid != null && findInteractiveAgentChild(pid) != null) continue
                 try {
                     mgr.closeTab(content)
                     closed++
@@ -4422,17 +4573,17 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
                 val childCount = children?.size ?: 1
                 val childNames = children?.joinToString(",") { it.info().command().orElse("?").substringAfterLast('/') } ?: "unreadable"
                 val generic = isGenericTabName(name)
-                val hasClaude = findClaudeChild(pid) != null
+                val hasAgent = findInteractiveAgentChild(pid) != null
                 val spawned = tab.widget != null && tab.widget in ourWidgets
 
                 val disposable = ClaudeTabsHelpers.isDisposableDefaultTerminal(
                     restoredAny = true,
                     isGenericName = generic,
-                    hasClaude = hasClaude,
+                    hasClaude = hasAgent,
                     childProcessCount = childCount,
                     isPluginSpawned = spawned,
                 )
-                verdicts.add("'$name'(pid=$pid generic=$generic claude=$hasClaude children=$childCount[$childNames] ours=$spawned → ${if (disposable) "CLOSE" else "keep"})")
+                verdicts.add("'$name'(pid=$pid generic=$generic agent=$hasAgent children=$childCount[$childNames] ours=$spawned → ${if (disposable) "CLOSE" else "keep"})")
                 if (!disposable) continue
 
                 try {
@@ -4461,8 +4612,8 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             out.parentFile?.mkdirs()
             val sessions = restoredThisRun.joinToString(",") { s ->
                 val n = s.tabName.replace("\\", "\\\\").replace("\"", "\\\"")
-                val sid = s.sessionId.replace("\\", "\\\\").replace("\"", "\\\"")
-                """{"tabName":"$n","sessionId":"$sid"}"""
+                val sid = s.provider.toExternalSessionId(s.sessionId).replace("\\", "\\\\").replace("\"", "\\\"")
+                """{"provider":"${s.provider.wireName}","tabName":"$n","sessionId":"$sid"}"""
             }
             val projectName = project.name.replace("\\", "\\\\").replace("\"", "\\\"")
             val json = """{"restoredAt":${System.currentTimeMillis()},"projectName":"$projectName","count":${restoredThisRun.size},"sessions":[$sessions]}"""
@@ -4495,14 +4646,12 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
      * reintroduce the hole.
      */
     private fun buildResumeCmd(s: SavedSession): String? {
-        if (!ClaudeTabsHelpers.isSafeSessionId(s.sessionId)) {
-            LOG.warn("[ClaudeTabs] Refusing to build a resume command for session id '${s.sessionId.take(40)}' — not a plain identifier")
-            return null
+        val externalSessionId = s.provider.toExternalSessionId(s.sessionId)
+        val command = AgentResumeCommand.build(s.provider, s.sessionId, s.bypassPermissions)
+        if (command == null) {
+            LOG.warn("[ClaudeTabs] Refusing to build a resume command for session id '${externalSessionId.take(40)}' — not a plain identifier")
         }
-        return buildString {
-            append("claude --resume ${s.sessionId}")
-            if (s.bypassPermissions) append(" --dangerously-skip-permissions")
-        }
+        return command
     }
 
     /**
@@ -4512,7 +4661,8 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
      * about `CLAUDE_HOME`.
      */
     private fun hasTranscript(cwd: String, sessionId: String): Boolean =
-        ClaudeTabsHelpers.hasTranscriptAnywhere(File(CLAUDE_HOME, "projects"), sessionId, cwd)
+        if (AgentKind.fromInternalSessionId(sessionId) == AgentKind.CODEX) true
+        else ClaudeTabsHelpers.hasTranscriptAnywhere(File(CLAUDE_HOME, "projects"), sessionId, cwd)
 
     /**
      * Given a sessionId we read from `sessions/<pid>.json`, return the **canonical**
@@ -4786,6 +4936,26 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
         } catch (e: Exception) {
             LOG.debug("[ClaudeTabs] liveSessionsNow failed: ${e.message}")
         }
+        try {
+            for ((sid, metadata) in codexStatusStore.liveSessions()) {
+                val pid = metadata.pid ?: continue
+                val process = ProcessHandle.of(pid).orElse(null) ?: continue
+                val info = CodexProcessRecognition.ProcessInfo(
+                    process.info().command().orElse(""),
+                    process.info().commandLine().orElse(""),
+                )
+                if (CodexProcessRecognition.isInteractive(info)) {
+                    out.add(ClaudeTabsHelpers.LiveSession(sid, sid))
+                }
+            }
+            for (sid in codexStatusStore.termSessionMap().values) {
+                if (out.none { it.rawSessionId == sid || it.canonicalSessionId == sid }) {
+                    out.add(ClaudeTabsHelpers.LiveSession(sid, sid))
+                }
+            }
+        } catch (e: Exception) {
+            LOG.debug("[ClaudeTabs] Codex live-session scan failed: ${e.message}")
+        }
         return out
     }
 
@@ -4815,6 +4985,27 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
     private fun findClaudeChild(pid: Long): ProcessHandle? {
         val h = ProcessHandle.of(pid).orElse(null) ?: return null
         return findClaudeRec(h)
+    }
+
+    private fun findInteractiveAgentChild(pid: Long): ProcessHandle? =
+        findClaudeChild(pid) ?: findCodexChild(pid)
+
+    /** Breadth-first match for the interactive Codex process hosted by a terminal shell. */
+    private fun findCodexChild(pid: Long): ProcessHandle? {
+        val root = ProcessHandle.of(pid).orElse(null) ?: return null
+        val queue = ArrayDeque(root.children().toList())
+        var visited = 0
+        while (queue.isNotEmpty() && visited < 512) {
+            val child = queue.removeFirst()
+            visited++
+            val info = CodexProcessRecognition.ProcessInfo(
+                child.info().command().orElse(""),
+                child.info().commandLine().orElse(""),
+            )
+            if (CodexProcessRecognition.isInteractive(info)) return child
+            queue.addAll(child.children().toList())
+        }
+        return null
     }
 
     /**
@@ -4870,6 +5061,35 @@ class ClaudeTabWatcherStartup : StartupActivity.DumbAware {
             removeClaudeMdSection()
             patchClaudeSettings()
         } catch (e: Exception) { LOG.warn("[ClaudeTabs] Deploy failed: ${e.message}") }
+    }
+
+    /** Install the Codex hook scripts and register them in `~/.codex/hooks.json`. */
+    private fun deployCodexIntegration() {
+        // Avoid creating Codex configuration for users who have never installed or run it.
+        if (!CODEX_HOME.exists()) return
+        try {
+            deployResource("codex-integration/status-hook.sh", File(codexStatusStore.integrationDir, "status-hook.sh"))
+            deployResource("codex-integration/status-hook.ps1", File(codexStatusStore.integrationDir, "status-hook.ps1"))
+            codexStatusStore.statusDir.mkdirs()
+
+            val hooksFile = File(CODEX_HOME, "hooks.json")
+            val before = if (hooksFile.exists()) hooksFile.readText() else null
+            val after = CodexHooksPatcher.patch(before)
+            if (after == null) {
+                if (!before.isNullOrBlank()) {
+                    try { MiniJson.parse(before) } catch (_: MiniJson.ParseException) {
+                        LOG.warn("[ClaudeTabs] Codex hooks.json is not valid JSON — leaving it untouched")
+                    }
+                }
+                return
+            }
+            val backup = File(codexStatusStore.integrationDir, "hooks.json.bak")
+            if (before != null && !backup.exists()) runCatching { backup.writeText(before) }
+            writeAtomic(hooksFile, after)
+            LOG.info("[ClaudeTabs] Codex hooks installed (${CodexHooksPatcher.STATUS_EVENTS.joinToString(", ")})")
+        } catch (e: Exception) {
+            LOG.warn("[ClaudeTabs] Codex integration deploy failed: ${e.message}")
+        }
     }
 
     /**

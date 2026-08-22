@@ -72,10 +72,15 @@ internal class ClaudeTabsStorage(private val claudeHome: File) {
                 return@synchronized false
             }
             val existing = (read as HistoryRead.Ok).entries.toMutableList()
-            existing.removeAll { ClaudeTabsHelpers.extractJsonString(it, "sessionId") == session.sessionId }
+            existing.removeAll { raw ->
+                val provider = AgentKind.fromWire(ClaudeTabsHelpers.extractJsonString(raw, "provider"))
+                val sid = ClaudeTabsHelpers.extractJsonString(raw, "sessionId")
+                provider == session.provider && sid == session.provider.toExternalSessionId(session.sessionId)
+            }
 
             val entry = buildString {
-                append("{\"sessionId\":\"${ClaudeTabsHelpers.esc(session.sessionId)}\"")
+                append("{\"provider\":\"${session.provider.wireName}\"")
+                append(",\"sessionId\":\"${ClaudeTabsHelpers.esc(session.provider.toExternalSessionId(session.sessionId))}\"")
                 append(",\"cwd\":\"${ClaudeTabsHelpers.esc(session.cwd)}\"")
                 append(",\"tabName\":\"${ClaudeTabsHelpers.esc(session.tabName)}\"")
                 append(",\"bypassPermissions\":${session.bypassPermissions}")
@@ -151,13 +156,20 @@ internal class ClaudeTabsStorage(private val claudeHome: File) {
     // RESTORE FILE + SNAPSHOTS
     // ══════════════════════════════════════════════════════════════
 
-    data class SavedSession(val sessionId: String, val cwd: String, val tabName: String, val bypassPermissions: Boolean)
+    data class SavedSession(
+        val sessionId: String,
+        val cwd: String,
+        val tabName: String,
+        val bypassPermissions: Boolean,
+        val provider: AgentKind = AgentKind.CLAUDE,
+    )
 
     /** Serialise [sessions] to a JSON array string (matches what saveState writes). */
     fun serialiseSessions(sessions: List<SavedSession>): String {
         if (sessions.isEmpty()) return "[]"
         return sessions.joinToString(prefix = "[\n", postfix = "\n]", separator = ",\n") { s ->
-            "  {\"sessionId\":\"${ClaudeTabsHelpers.esc(s.sessionId)}\"," +
+            "  {\"provider\":\"${s.provider.wireName}\"," +
+                "\"sessionId\":\"${ClaudeTabsHelpers.esc(s.provider.toExternalSessionId(s.sessionId))}\"," +
                 "\"cwd\":\"${ClaudeTabsHelpers.esc(s.cwd)}\"," +
                 "\"tabName\":\"${ClaudeTabsHelpers.esc(s.tabName)}\"," +
                 "\"bypassPermissions\":${s.bypassPermissions}}"
@@ -170,10 +182,17 @@ internal class ClaudeTabsStorage(private val claudeHome: File) {
         if (text.isEmpty() || text == "[]") return emptyList()
         return Regex("""\{[^}]+\}""").findAll(text).mapNotNull { m ->
             val o = m.value
-            val sid = ClaudeTabsHelpers.extractJsonString(o, "sessionId") ?: return@mapNotNull null
+            val rawSid = ClaudeTabsHelpers.extractJsonString(o, "sessionId") ?: return@mapNotNull null
             val cwd = ClaudeTabsHelpers.extractJsonString(o, "cwd") ?: return@mapNotNull null
             val name = ClaudeTabsHelpers.extractJsonString(o, "tabName") ?: return@mapNotNull null
-            SavedSession(sid, cwd, name, o.contains("\"bypassPermissions\":true"))
+            val provider = AgentKind.fromWire(ClaudeTabsHelpers.extractJsonString(o, "provider"))
+            SavedSession(
+                provider.toInternalSessionId(rawSid),
+                cwd,
+                name,
+                o.contains("\"bypassPermissions\":true"),
+                provider,
+            )
         }.toList()
     }
 

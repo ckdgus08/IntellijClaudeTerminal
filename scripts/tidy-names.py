@@ -8,11 +8,11 @@ in a tab without the plugin noticing:
   RECOVER  A name you typed is filed under a session that has since ended. The tab
            is still open and still yours, but everything that reads a name for it
            keys off the *new* session id — which has no entry — so the tab reverted
-           to an auto-derived name. Observed for real:
+           to an auto-derived name. Representative example:
 
              names.json   b0000002… -> "Example tab"   (setBy=user)
              status/      b0000002… -> SessionEnd at t=0s, pid 4001 gone
-             queue        b0000003… started t=2s, same project directory
+             queue        b0000003… started at t=2s, same project directory
              restore      b0000003… is the session in that tab now, and unnamed
 
            The fix in the plugin stops this happening again; it cannot go back and
@@ -47,8 +47,8 @@ STATE_DIR = os.path.join(CLAUDE_HOME, "intellij-claude-terminal")
 NAMES_FILE = os.path.join(STATE_DIR, "names.json")
 
 # How long after one session ends another may start and still count as having taken
-# over the same terminal. The real gap is the time it takes to type `claude` again —
-# two seconds in the case above. Generous by default; nothing else within the window
+# over the same terminal. The gap is the time it takes to type `claude` again — two
+# seconds in the example above. Generous by default; nothing else within the window
 # may match, or the link is reported as ambiguous instead of guessed.
 DEFAULT_WINDOW_S = 120
 

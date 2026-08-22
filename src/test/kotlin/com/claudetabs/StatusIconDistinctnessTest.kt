@@ -63,6 +63,13 @@ class StatusIconDistinctnessTest {
         }
     }
 
+    @Test fun backgroundCountAddsAVisibleBadgeWithoutReplacingTheMainIcon() {
+        val plain = ClaudeStatusIcons.forStatus(ClaudeStatus.FINISHED)
+        val withBackground = ClaudeStatusIcons.forStatus(ClaudeStatus.FINISHED, 3)
+        assertTrue(withBackground.iconWidth > plain.iconWidth)
+        assertTrue(withBackground.iconHeight >= plain.iconHeight)
+    }
+
     /** Hollow really is hollow — the centre is what separates it from the solid disc. */
     @Test fun idleIsHollowAndWorkingIsSolid() {
         val centre = (size / 2) * size + (size / 2)

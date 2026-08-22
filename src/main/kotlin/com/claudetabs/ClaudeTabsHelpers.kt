@@ -382,6 +382,12 @@ internal object ClaudeTabsHelpers {
         return null
     }
 
+    /** A safe tab label from an already-extracted prompt (for example, a Codex hook). */
+    fun promptName(prompt: String?, maxChars: Int = PROMPT_NAME_MAX_CHARS): String? {
+        if (prompt.isNullOrBlank()) return null
+        return cleanPromptText(prompt)?.let { condense(it, maxChars) }
+    }
+
     /** The plain-string content of one transcript line, if it is a user turn a person typed. */
     private fun userTurnText(line: String): String? {
         // Cheap reject before parsing: a transcript is mostly assistant turns and tool
@@ -503,8 +509,8 @@ internal object ClaudeTabsHelpers {
      * process survives the rotation and can therefore link the two ids. It cannot cover the
      * other way a tab changes session: the user quits Claude and runs it again in the same
      * terminal. That is a *new* process, so the old session's pid is dead and the join finds
-     * nothing. Observed on a real run — terminal `b0000001`:
-     *
+     * nothing. A representative transition is:
+ *
      *   status/b0000002….json → {"event":"SessionEnd","reason":"prompt_input_exit","pid":4001}
      *   pid 4001 is gone; the terminal now hosts b0000003… under pid 4002
      *

@@ -7,7 +7,9 @@ import java.io.File
  *
  *  - **Hook edges** live in `~/.claude/intellij-claude-terminal/status/<sessionId>.json`, written by
  *    `status-hook.sh` on every `SessionStart` / `UserPromptSubmit` / `Notification` / `Stop`
- *    / `SessionEnd`.
+ *    / `SubagentStop` / `SessionEnd`.
+ *  - **Background-task counts** live beside them as `background-<sessionId>.json`. They are
+ *    separate so a subagent completion can update the badge without replacing the main edge.
  *  - **Claude's own reading** lives in `~/.claude/sessions/<pid>.json` as a `status` field.
  *
  * Both directories hold one small flat-JSON file per live session (single digits in
@@ -82,6 +84,9 @@ internal class ClaudeStatusStore(claudeHome: File) {
     /** The fields of `sessions/<pid>.json` this class reads. */
     private data class SessionFile(val sessionId: String, val status: String?, val updatedAt: Long)
 
+    /** Count-only background state. Task ids, descriptions and commands never reach disk. */
+    private data class BackgroundRecord(val sessionId: String, val count: Int, val updatedAt: Long)
+
     // Both caches are shared by more than one caller, so the parse has to be shared too:
     // keyed by path, whichever parser ran first wins, and two that disagreed about which
     // fields to fill would hand the other caller a half-populated record.
@@ -120,6 +125,7 @@ internal class ClaudeStatusStore(claudeHome: File) {
         val status: ClaudeStatus,
         val hookEvent: String?,
         val sessionStatus: String?,
+        val backgroundTaskCount: Int = 0,
     )
 
     /**
@@ -134,6 +140,7 @@ internal class ClaudeStatusStore(claudeHome: File) {
      */
     fun snapshot(isAlive: (Long) -> Boolean = { pid -> ProcessHandle.of(pid).map { it.isAlive }.orElse(false) }): Map<String, Reading> {
         val hooks = readHookSignals()
+        val backgrounds = readBackgroundRecords()
         val sessions = readSessionSignals(isAlive)
 
         val result = mutableMapOf<String, Reading>()
@@ -141,9 +148,57 @@ internal class ClaudeStatusStore(claudeHome: File) {
             val hook = hooks[sid]
             val session = sessions[sid]
             val resolved = StatusResolver.resolve(hook, session?.signal) ?: continue
-            result[sid] = Reading(resolved, hook?.event, session?.signal?.status)
+            // `idle` describes the main turn, not delegated work: it is the expected state
+            // after Stop even while `background_tasks` is non-empty. The count therefore
+            // survives main-turn transitions and is cleared only by its own hook lifecycle
+            // (or hidden once the whole session exits).
+            val backgroundTaskCount = when {
+                resolved == ClaudeStatus.EXITED -> 0
+                hook?.event == "SessionEnd" -> 0
+                else -> backgrounds[sid]?.count ?: 0
+            }
+            // Before the dedicated badge existed, rule 4 deliberately folded a stopped
+            // main turn plus delegated `busy` work into WORKING. With an authoritative
+            // positive count we can finally preserve both facts: main ✓, background bgN.
+            // If an older CLI supplies no count, keep the conservative WORKING result.
+            val mainStatus = if (
+                resolved == ClaudeStatus.WORKING &&
+                backgroundTaskCount > 0 &&
+                (hook?.event == "Stop" || hook?.event == "StopFailure")
+            ) ClaudeStatus.FINISHED else resolved
+            result[sid] = Reading(mainStatus, hook?.event, session?.signal?.status, backgroundTaskCount)
         }
         return result
+    }
+
+    /** Latest count-only background record per session. */
+    private fun readBackgroundRecords(): Map<String, BackgroundRecord> {
+        val files = statusDir.listFiles { f ->
+            f.name.startsWith("background-") && f.name.endsWith(".json")
+        } ?: return emptyMap()
+
+        val out = mutableMapOf<String, BackgroundRecord>()
+        for (f in files) {
+            // Do not use the mtime+size parse cache here. `bg2 → bg1` is a same-size
+            // atomic rewrite and filesystems with coarse timestamp resolution can report
+            // an unchanged cache key. These records are tiny and there is only one per
+            // session, so reading them directly is both cheap and exact.
+            val text = runCatching { f.readText() }.getOrNull() ?: continue
+            val sid = ClaudeTabsHelpers.extractJsonString(text, "sessionId")
+                ?.takeIf(ClaudeTabsHelpers::isSafeSessionId)
+                ?: continue
+            val count = Regex(""""count"\s*:\s*(\d+)""").find(text)
+                ?.groupValues?.get(1)?.toIntOrNull()?.coerceIn(0, 999)
+                ?: continue
+            val ts = Regex(""""ts"\s*:\s*(\d+)""").find(text)
+                ?.groupValues?.get(1)?.toLongOrNull() ?: f.lastModified()
+            val record = BackgroundRecord(sid, count, ts)
+            val previous = out[record.sessionId]
+            if (previous == null || record.updatedAt >= previous.updatedAt) {
+                out[record.sessionId] = record
+            }
+        }
+        return out
     }
 
     /**
@@ -194,9 +249,9 @@ internal class ClaudeStatusStore(claudeHome: File) {
      * all survive, and only Claude's session id rotates. The old id gets a `SessionEnd` hook
      * and vanishes from `sessions/<pid>.json`, so anything still bound to it resolves to
      * [ClaudeStatus.EXITED] and stays there — a live conversation sitting under a `✕`.
-     * Observed exactly that way:
+     * A representative transition is:
      *
-     *   70000004  SessionEnd  pid=12001          ← the hook record
+     *   10000001  SessionEnd  pid=12001          ← the hook record
      *   sessions/12001.json → 10000002, busy     ← same process, new session
      *
      * The pid is the join. A process outlives the session ids it runs, so a `SessionEnd`
@@ -240,7 +295,9 @@ internal class ClaudeStatusStore(claudeHome: File) {
         // terminal but not yet the Claude session id. The tab indicator is keyed by session
         // id, so those are filtered out by name — before any read — and reaped by `prune`.
         val files = statusDir.listFiles { f ->
-            f.name.endsWith(".json") && !f.name.startsWith("termsess-")
+            f.name.endsWith(".json") &&
+                !f.name.startsWith("termsess-") &&
+                !f.name.startsWith("background-")
         } ?: return emptyMap()
         hookCache.retainOnly(files.mapTo(HashSet()) { it.path })
 
@@ -298,7 +355,9 @@ internal class ClaudeStatusStore(claudeHome: File) {
     fun prune(liveSessionIds: Set<String>, maxAgeMs: Long = 24L * 60 * 60 * 1000, now: Long = System.currentTimeMillis()) {
         val files = statusDir.listFiles { f -> f.isFile && f.name.endsWith(".json") } ?: return
         for (f in files) {
-            val sid = f.nameWithoutExtension.removePrefix("termsess-")
+            val sid = f.nameWithoutExtension
+                .removePrefix("termsess-")
+                .removePrefix("background-")
             if (sid in liveSessionIds) continue
             if (now - f.lastModified() < maxAgeMs) continue
             try { f.delete() } catch (_: Exception) { /* best effort */ }

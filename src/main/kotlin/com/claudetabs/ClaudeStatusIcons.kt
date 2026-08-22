@@ -4,6 +4,7 @@ import com.intellij.ui.JBColor
 import com.intellij.util.ui.JBUI
 import java.awt.BasicStroke
 import java.awt.Component
+import java.awt.Font
 import java.awt.Graphics
 import java.awt.Graphics2D
 import java.awt.RenderingHints
@@ -36,25 +37,62 @@ internal object ClaudeStatusIcons {
     private val FINISHED = JBColor(0x369650, 0x57965C)  // green  — done
     private val IDLE = JBColor(0x9AA7B0, 0x6F737A)      // grey   — nothing yet
     private val EXITED = JBColor(0xC94F4F, 0xD65C5C)    // red    — gone
+    private val BACKGROUND = JBColor(0x6B7280, 0x8C8C8C)
+    private val BACKGROUND_TEXT = JBColor.WHITE
 
     /** What to draw. One per state, and no two share a silhouette. */
     private enum class Shape { DISC, RING, TRIANGLE, TICK, CROSS }
 
     private val cache = java.util.EnumMap<ClaudeStatus, Icon>(ClaudeStatus::class.java)
+    private val backgroundCache = mutableMapOf<Pair<ClaudeStatus, String>, Icon>()
 
     /** The icon for [status]. Cached — the status loop asks for these repeatedly. */
     @Synchronized
-    fun forStatus(status: ClaudeStatus): Icon = cache.getOrPut(status) {
-        when (status) {
-            // Solid: something is happening right now.
-            ClaudeStatus.WORKING -> StatusIcon(WORKING, Shape.DISC)
-            // The universal "look at me" outline, and the only shape here with a flat base.
-            ClaudeStatus.WAITING -> StatusIcon(WAITING, Shape.TRIANGLE)
-            ClaudeStatus.FINISHED -> StatusIcon(FINISHED, Shape.TICK)
-            // Hollow, so "nothing has happened here" reads as absence rather than as another
-            // state competing for attention.
-            ClaudeStatus.IDLE -> StatusIcon(IDLE, Shape.RING)
-            ClaudeStatus.EXITED -> StatusIcon(EXITED, Shape.CROSS)
+    fun forStatus(status: ClaudeStatus, backgroundTaskCount: Int = 0): Icon {
+        val base = cache.getOrPut(status) {
+            when (status) {
+                // Solid: something is happening right now.
+                ClaudeStatus.WORKING -> StatusIcon(WORKING, Shape.DISC)
+                // The universal "look at me" outline, and the only shape here with a flat base.
+                ClaudeStatus.WAITING -> StatusIcon(WAITING, Shape.TRIANGLE)
+                ClaudeStatus.FINISHED -> StatusIcon(FINISHED, Shape.TICK)
+                // Hollow, so "nothing has happened here" reads as absence rather than as another
+                // state competing for attention.
+                ClaudeStatus.IDLE -> StatusIcon(IDLE, Shape.RING)
+                ClaudeStatus.EXITED -> StatusIcon(EXITED, Shape.CROSS)
+            }
+        }
+        val label = StatusDecoration.backgroundLabel(backgroundTaskCount) ?: return base
+        return backgroundCache.getOrPut(status to label) { BackgroundBadgeIcon(base, label) }
+    }
+
+    /** Main-state shape plus a small `bgN` pill; the tab name itself stays persistence-safe. */
+    private class BackgroundBadgeIcon(private val base: Icon, private val label: String) : Icon {
+        private val badgeWidth = JBUI.scale(if (label.length <= 3) 18 else 24)
+        private val gap = JBUI.scale(2)
+
+        override fun getIconWidth() = base.iconWidth + gap + badgeWidth
+        override fun getIconHeight() = maxOf(base.iconHeight, JBUI.scale(12))
+
+        override fun paintIcon(c: Component?, g: Graphics?, x: Int, y: Int) {
+            base.paintIcon(c, g, x, y)
+            val g2 = (g as? Graphics2D)?.create() as? Graphics2D ?: return
+            try {
+                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
+                val left = x + base.iconWidth + gap
+                val top = y + JBUI.scale(2)
+                val height = JBUI.scale(8)
+                g2.color = BACKGROUND
+                g2.fillRoundRect(left, top, badgeWidth, height, height, height)
+                g2.color = BACKGROUND_TEXT
+                g2.font = g2.font.deriveFont(Font.BOLD, JBUI.scale(7).toFloat())
+                val metrics = g2.fontMetrics
+                val textX = left + (badgeWidth - metrics.stringWidth(label)) / 2
+                val textY = top + (height - metrics.height) / 2 + metrics.ascent
+                g2.drawString(label, textX, textY)
+            } finally {
+                g2.dispose()
+            }
         }
     }
 

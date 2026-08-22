@@ -39,6 +39,24 @@ class ClaudeStatusTest {
         assertEquals("✓ backend", StatusDecoration.decorate("● backend", ClaudeStatus.FINISHED))
     }
 
+    @Test fun decorate_showsMainAndBackgroundStateWithoutPollutingTheBaseName() {
+        val decorated = StatusDecoration.decorate("backend", ClaudeStatus.FINISHED, 3)
+        assertEquals("✓ · bg3 backend", decorated)
+        assertEquals("backend", StatusDecoration.strip(decorated))
+        assertEquals(
+            "backend — Finished · 3 background tasks running",
+            StatusDecoration.tooltip(decorated, ClaudeStatus.FINISHED, 3),
+        )
+    }
+
+    @Test fun backgroundBadgeIsBoundedAndSingularInTheTooltip() {
+        assertEquals("✓ · bg99+ backend", StatusDecoration.decorate("backend", ClaudeStatus.FINISHED, 500))
+        assertEquals(
+            "backend — Finished · 1 background task running",
+            StatusDecoration.tooltip("backend", ClaudeStatus.FINISHED, 1),
+        )
+    }
+
     @Test fun strip_removesGlyphAndIsIdempotent() {
         assertEquals("backend", StatusDecoration.strip("● backend"))
         assertEquals("backend", StatusDecoration.strip("backend"))
@@ -92,10 +110,10 @@ class ClaudeStatusTest {
         assertEquals(ClaudeStatus.EXITED, StatusResolver.fromHookEvent("SessionEnd"))
     }
 
-    @Test fun subagentStop_isNotAFinishedTurn() {
-        // A subagent finishing mid-run must not flip the tab to ✓.
+    @Test fun subagentStop_updatesOnlyTheBackgroundCount_notTheMainTurn() {
+        // The hook is installed for its separate count record, but establishes no main state.
         assertNull(StatusResolver.fromHookEvent("SubagentStop"))
-        assertFalse("SubagentStop" in ClaudeSettingsPatcher.STATUS_EVENTS)
+        assertTrue("SubagentStop" in ClaudeSettingsPatcher.STATUS_EVENTS)
     }
 
     @Test fun claudeSessionStatuses_mapToStates() {

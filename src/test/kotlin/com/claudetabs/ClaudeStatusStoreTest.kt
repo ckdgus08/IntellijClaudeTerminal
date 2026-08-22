@@ -41,6 +41,12 @@ class ClaudeStatusStoreTest {
         )
     }
 
+    private fun writeBackground(sid: String, count: Int, ts: Long = 1000) {
+        File(home, "intellij-claude-terminal/status/background-$sid.json").writeText(
+            """{"sessionId":"$sid","count":$count,"ts":$ts}"""
+        )
+    }
+
     private val allAlive: (Long) -> Boolean = { true }
     private val noneAlive: (Long) -> Boolean = { false }
 
@@ -132,6 +138,49 @@ class ClaudeStatusStoreTest {
         assertEquals("waiting", reading.sessionStatus)
     }
 
+    @Test fun backgroundCountIsIndependentOfTheMainStopEdge() {
+        setUpHome()
+        writeSession(100, "sid-a", "busy", 1000)
+        writeHook("sid-a", "Stop", 2000)
+        writeBackground("sid-a", 2, 2000)
+
+        val reading = store.snapshot(allAlive)["sid-a"]!!
+        assertEquals(ClaudeStatus.FINISHED, reading.status)
+        assertEquals("Stop", reading.hookEvent)
+        assertEquals(2, reading.backgroundTaskCount)
+
+        // A SubagentStop changes only the independent count file; the main edge survives.
+        writeBackground("sid-a", 1, 3000)
+        val updated = store.snapshot(allAlive)["sid-a"]!!
+        assertEquals(ClaudeStatus.FINISHED, updated.status)
+        assertEquals("Stop", updated.hookEvent)
+        assertEquals(1, updated.backgroundTaskCount)
+    }
+
+    @Test fun busyWithoutAnAuthoritativeBackgroundCountKeepsTheConservativeWorkingState() {
+        setUpHome()
+        writeSession(100, "sid-a", "busy", 1000)
+        writeHook("sid-a", "Stop", 2000)
+
+        val reading = store.snapshot(allAlive)["sid-a"]!!
+        assertEquals(ClaudeStatus.WORKING, reading.status)
+        assertEquals(0, reading.backgroundTaskCount)
+    }
+
+    @Test fun idleMainTurnKeepsBackgroundWorkButExitedSessionDoesNot() {
+        setUpHome()
+        writeBackground("sid-idle", 3)
+        writeSession(100, "sid-idle", "idle", 2000)
+        writeHook("sid-idle", "Stop", 3000)
+        val finishedMain = store.snapshot(allAlive)["sid-idle"]!!
+        assertEquals(ClaudeStatus.FINISHED, finishedMain.status)
+        assertEquals(3, finishedMain.backgroundTaskCount)
+
+        writeBackground("sid-dead", 4)
+        writeSession(101, "sid-dead", "shell", 2000)
+        assertEquals(0, store.snapshot(noneAlive)["sid-dead"]?.backgroundTaskCount)
+    }
+
     /**
      * The qualifier fields have to survive the trip through disk, or the resolver decides on
      * a record it can't tell apart from a plain one. Each of these was a real misreading when
@@ -172,5 +221,20 @@ class ClaudeStatusStoreTest {
         assertTrue(File(home, "intellij-claude-terminal/status/sid-live.json").exists())
         assertTrue(File(home, "intellij-claude-terminal/status/sid-recent.json").exists())
         assertFalse(File(home, "intellij-claude-terminal/status/sid-old.json").exists())
+    }
+
+    @Test fun pruneTreatsBackgroundFilePrefixAsMetadataNotPartOfTheSessionId() {
+        setUpHome()
+        writeBackground("sid-live", 1)
+        writeBackground("sid-old", 1)
+        val dayMs = 24L * 60 * 60 * 1000
+        val now = 10 * dayMs
+        File(home, "intellij-claude-terminal/status/background-sid-live.json").setLastModified(now - 5 * dayMs)
+        File(home, "intellij-claude-terminal/status/background-sid-old.json").setLastModified(now - 5 * dayMs)
+
+        store.prune(liveSessionIds = setOf("sid-live"), maxAgeMs = dayMs, now = now)
+
+        assertTrue(File(home, "intellij-claude-terminal/status/background-sid-live.json").exists())
+        assertFalse(File(home, "intellij-claude-terminal/status/background-sid-old.json").exists())
     }
 }

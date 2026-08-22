@@ -54,6 +54,31 @@ class ClaudeTabsStorageTest {
         assertEquals(sessions, parsed)
     }
 
+    @Test fun serialise_roundTripsCodexWithoutLeakingInternalPrefix() {
+        val session = ClaudeTabsStorage.SavedSession(
+            AgentKind.CODEX.toInternalSessionId("0198cafe-1234"),
+            "/work/repo",
+            "Fix flaky tests",
+            false,
+            AgentKind.CODEX,
+        )
+
+        val json = storage.serialiseSessions(listOf(session))
+        assertTrue(json.contains("\"provider\":\"codex\""))
+        assertTrue(json.contains("\"sessionId\":\"0198cafe-1234\""))
+        assertFalse(json.contains("codex--0198cafe-1234"))
+        assertEquals(listOf(session), storage.parseSessions(json))
+    }
+
+    @Test fun parse_legacyEntryWithoutProviderDefaultsToClaude() {
+        val parsed = storage.parseSessions(
+            """[{"sessionId":"legacy","cwd":"/p","tabName":"Old","bypassPermissions":false}]"""
+        )
+
+        assertEquals(AgentKind.CLAUDE, parsed.single().provider)
+        assertEquals("legacy", parsed.single().sessionId)
+    }
+
     @Test fun parse_emptyArrayOrBlankReturnsEmpty() {
         assertTrue(storage.parseSessions("").isEmpty())
         assertTrue(storage.parseSessions("   ").isEmpty())

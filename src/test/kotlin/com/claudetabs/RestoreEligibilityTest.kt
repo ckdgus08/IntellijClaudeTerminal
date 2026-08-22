@@ -5,14 +5,11 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * Regression pin for the duplicate-tab bug seen on 1.0.20's first install.
+ * Regression pin for a duplicate-tab bug during plugin reload.
  *
- * What happened, from idea.log: installing the plugin reloaded the project without killing
- * anything (t=0s "Project closing", t=4s project restarts). The restore file that
- * the previous window's poll had written five seconds earlier still listed both live
- * sessions, so at t=13s the plugin spawned a tab for each — including
- * `claude --resume 70000002-…`, a duplicate of the conversation already open in the tab
- * beside it. The original tabs never closed, so the user ended up with both.
+ * Installing the plugin can reload the project without killing active sessions. A restore
+ * file written just before the reload still lists those sessions; restoring them blindly
+ * would create a duplicate beside each original tab.
  */
 class RestoreEligibilityTest {
 
@@ -39,11 +36,12 @@ class RestoreEligibilityTest {
     }
 
     @Test fun theObservedInstallScenarioSpawnsNothing() {
-        // Both entries from the real restore file, both still alive at restore time.
-        val restoreFile = listOf("70000002-0000-4000-8000-000000000002", "70000004-0000-4000-8000-000000000004")
+        val first = "80000001-0000-4000-8000-000000000001"
+        val second = "80000002-0000-4000-8000-000000000002"
+        val restoreFile = listOf(first, second)
         val running = live(
-            "70000002-0000-4000-8000-000000000002" to "70000002-0000-4000-8000-000000000002",
-            "70000004-0000-4000-8000-000000000004" to "70000004-0000-4000-8000-000000000004",
+            first to first,
+            second to second,
         )
         assertTrue(
             "a project reload must not duplicate tabs that never closed",

@@ -11,9 +11,8 @@ import java.io.File
  * The `TERM_SESSION_ID → sessionId` bridge, which is what actually attaches the status
  * indicator to a tab on IntelliJ 2026.1's reworked terminal.
  *
- * Why it is needed, from a real install: `getAllTabs` reported three tabs whose shell PIDs
- * (94329, 95752) were childless `/bin/zsh --login -i` and one (95258) already dead, while
- * six live Claude sessions hung off shells the enumeration never mentioned (5001, 5002).
+ * Why it is needed: `getAllTabs` can report tabs whose shell PIDs are childless or already
+ * dead while live Claude sessions hang off shells the enumeration never mentioned.
  * Walking `shell pid → child claude` finds nothing when the shell pid belongs to a different
  * tab. TERM_SESSION_ID is inherited by everything the tab spawns, so the hook can record the
  * mapping from inside the session and no PID is involved anywhere.
@@ -41,14 +40,17 @@ class TermSessionBridgeTest {
 
     @Test fun mapsTerminalToSession() {
         setUp()
-        // The real values observed on the dev machine.
-        writeTermHook("70000001-0000-4000-8000-000000000001", "70000002-0000-4000-8000-000000000002")
-        writeTermHook("70000003-0000-4000-8000-000000000003", "70000004-0000-4000-8000-000000000004")
+        val terminalA = "70000001-0000-4000-8000-000000000001"
+        val sessionA = "70000002-0000-4000-8000-000000000002"
+        val terminalB = "70000003-0000-4000-8000-000000000003"
+        val sessionB = "70000004-0000-4000-8000-000000000004"
+        writeTermHook(terminalA, sessionA)
+        writeTermHook(terminalB, sessionB)
 
         val map = store.termSessionMap()
         assertEquals(2, map.size)
-        assertEquals("70000002-0000-4000-8000-000000000002", map["70000001-0000-4000-8000-000000000001"])
-        assertEquals("70000004-0000-4000-8000-000000000004", map["70000003-0000-4000-8000-000000000003"])
+        assertEquals(sessionA, map[terminalA])
+        assertEquals(sessionB, map[terminalB])
     }
 
     @Test fun aReusedTerminalReportsItsCurrentSession() {

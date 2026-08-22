@@ -12,10 +12,10 @@ import org.junit.Test
  * "not recorded at all" must stay distinguishable — collapsing both to false is what made a
  * bypass session come back without bypass after `/clear`.
  *
- * Surveyed across 14 real transcripts: every one carries the record, with exactly one
- * exception — the transcript `/clear` creates:
+ * The ordinary transcript carries the record, with one important exception — the transcript
+ * `/clear` creates:
  *
- *   70000004  {"type":"mode",…} / {"type":"permission-mode","permissionMode":"bypass…"}
+ *   10000001  {"type":"mode",…} / {"type":"permission-mode","permissionMode":"bypass…"}
  *   10000002  {"type":"mode",…} / {"type":"file-history-snapshot",…}     ← after /clear
  */
 class PermissionModeTest {

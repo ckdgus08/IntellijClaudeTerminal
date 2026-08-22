@@ -11,11 +11,11 @@ import org.junit.rules.TemporaryFolder
 /**
  * Claude's 60-second idle nudge is not someone waiting on you.
  *
- * Reproduced with timestamps from a live session that had finished its turn:
+ * Representative timeline for a session that has finished its turn:
  *
- *   t=0s  sessions/3001.json  status=idle          ← the turn ended
- *   t=60s  status/d0000002.json Notification         ← exactly 60s later
- *   t=244s  d0000002:WAITING(hook=Notification,claude=idle)
+ *   t=0s    sessions/3001.json  status=idle             ← the turn ended
+ *   t=60s   status/30000001….json Notification          ← exactly 60s later
+ *   t=240s  30000001:WAITING(hook=Notification,claude=idle)
  *
  * The tab showed ✓, flipped to ⚠ a minute later, and stayed there. Nothing had
  * happened — Claude fires `notification_type: "idle_prompt"` with the message
@@ -66,7 +66,7 @@ class IdleNotificationTest {
         val home = tmp.root
         val statusDir = File(home, "intellij-claude-terminal/status").apply { mkdirs() }
         File(home, "sessions").mkdirs()
-        val sid = "d0000002-0000-4000-8000-000000000002"
+        val sid = "30000001-0000-4000-8000-000000000001"
         File(statusDir, "$sid.json").writeText(
             """{"event":"Notification","source":"","notificationType":"idle_prompt","sessionId":"$sid","ts":1700000000000,"pid":3001}"""
         )

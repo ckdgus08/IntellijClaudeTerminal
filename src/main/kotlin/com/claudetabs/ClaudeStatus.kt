@@ -49,14 +49,27 @@ internal enum class ClaudeStatus(val glyph: Char, val label: String) {
  */
 internal object StatusDecoration {
 
-    /** A leading status glyph plus its separating space. */
-    private val PREFIX = Regex("^[${Regex.escape(ClaudeStatus.GLYPHS)}]\\s+")
+    /** A leading status glyph, optional background badge, and separating space. */
+    private val PREFIX = Regex(
+        "^[${Regex.escape(ClaudeStatus.GLYPHS)}](?:\\s+·\\s+bg[0-9+]+)?\\s+"
+    )
 
-    /** `("backend", WORKING)` → `"● backend"`. A blank [base] yields just the glyph. */
-    fun decorate(base: String?, status: ClaudeStatus?): String {
+    /** Compact count shown beside the main state; bounded so a bad payload cannot grow a tab. */
+    fun backgroundLabel(backgroundTaskCount: Int): String? = when {
+        backgroundTaskCount <= 0 -> null
+        backgroundTaskCount > 99 -> "bg99+"
+        else -> "bg$backgroundTaskCount"
+    }
+
+    /** `("backend", FINISHED, 1)` → `"✓ · bg1 backend"`. */
+    fun decorate(base: String?, status: ClaudeStatus?, backgroundTaskCount: Int = 0): String {
         val bare = strip(base)
         if (status == null) return bare
-        return if (bare.isBlank()) status.glyph.toString() else "${status.glyph} $bare"
+        val prefix = buildString {
+            append(status.glyph)
+            backgroundLabel(backgroundTaskCount)?.let { append(" · ").append(it) }
+        }
+        return if (bare.isBlank()) prefix else "$prefix $bare"
     }
 
     /**
@@ -73,11 +86,19 @@ internal object StatusDecoration {
     fun isDecorated(title: String?): Boolean =
         !title.isNullOrEmpty() && PREFIX.containsMatchIn(title)
 
-    /** Tooltip text for a tab: `"backend — Working"`. */
-    fun tooltip(base: String?, status: ClaudeStatus?): String {
+    /** Tooltip text for a tab, including background work without exposing task details. */
+    fun tooltip(base: String?, status: ClaudeStatus?, backgroundTaskCount: Int = 0): String {
         val bare = strip(base)
         if (status == null) return bare
-        return if (bare.isBlank()) status.label else "$bare — ${status.label}"
+        val state = buildString {
+            append(status.label)
+            if (backgroundTaskCount > 0) {
+                append(" · ").append(backgroundTaskCount).append(" background task")
+                if (backgroundTaskCount != 1) append('s')
+                append(" running")
+            }
+        }
+        return if (bare.isBlank()) state else "$bare — $state"
     }
 }
 
@@ -177,7 +198,10 @@ internal object StatusResolver {
         notificationType: String? = null,
         reason: String? = null,
     ): ClaudeStatus? = when (event) {
-        "UserPromptSubmit" -> ClaudeStatus.WORKING
+        "UserPromptSubmit", "PreToolUse", "PostToolUse" -> ClaudeStatus.WORKING
+
+        // Codex emits a dedicated edge before showing an approval dialog.
+        "PermissionRequest" -> ClaudeStatus.WAITING
 
         // Only the types that mean a person is blocked — see [BLOCKING_NOTIFICATIONS] for
         // why this is an allowlist and what the deny-list version got wrong. status-hook.sh
@@ -285,17 +309,18 @@ internal object StatusResolver {
      *  4. **A working session is not finished, however new the `Stop`.** `Stop` fires when
      *     the *response* ends, which is not when the session's work ends: background agents
      *     and a subagent fan-out keep running after it. Claude's own file is the only signal
-     *     that knows about them, and it stays `busy` until they are all done. Caught live —
-     *     a session showing "waiting for 5 background agents to finish" while the tab said ✓:
+     *     that knows about them, and it stays `busy` until they are all done. For example:
      *
-     *       hook     Stop   ts=1786258683693              ← 15:58:03, the response ended
-     *       session  busy   statusUpdatedAt=1786256718513 ← 15:25:18, and still busy at 16:00
+     *       hook     Stop   ts=2_000              ← the response ended
+     *       session  busy   statusUpdatedAt=1_000 ← delegated work is still active
      *
      *     The session reading is half an hour older and still the correct one, so this can't
      *     be a freshness check: Claude rewrites the file on state *changes*, so "old" says
      *     nothing about "stale". `busy` is only ever written by a live process describing
      *     itself, which is what makes it safe to believe over an edge that has been
-     *     superseded by work the edge cannot see.
+     *     superseded by work the edge cannot see. [ClaudeStatusStore] later splits this
+     *     conservative result back into main FINISHED + `bgN` when a current Claude CLI
+     *     supplies an authoritative positive `background_tasks` count.
      */
     fun resolve(hook: HookSignal?, session: SessionSignal?, now: Long = 0L): ClaudeStatus? {
         val hookState = hook?.let { fromHookEvent(it.event, it.source, it.notificationType, it.reason) }

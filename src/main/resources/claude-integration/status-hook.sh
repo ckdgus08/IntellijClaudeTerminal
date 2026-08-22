@@ -4,11 +4,11 @@
 # ─────────────────────────────────────────────────────────────────────
 # Usage: bash ~/.claude/intellij-claude-terminal/status-hook.sh <EventName>
 #
-# Registered by ClaudeSettingsPatcher for six events, with the event
+# Registered by ClaudeSettingsPatcher for seven events, with the event
 # name passed as the single argument so one script covers all of them:
 #
-#   SessionStart · UserPromptSubmit · Notification · Stop · StopFailure
-#   · SessionEnd
+#   SessionStart · UserPromptSubmit · Notification · Stop · SubagentStop
+#   · StopFailure · SessionEnd
 #
 # Claude passes the event payload as JSON on stdin. We flatten it into
 # one small record and drop it in the plugin's status directory, where
@@ -25,6 +25,11 @@
 #     JetBrains terminal tab to the session running inside it. On the
 #     2026.1 terminal this is the only mapping that works, so it is
 #     refreshed by EVERY event, including ones whose status we discard.
+#
+#   ~/.claude/intellij-claude-terminal/status/background-{sessionId}.json
+#     Count only — never task ids, descriptions, prompts, or shell commands. `Stop`
+#     and `SubagentStop` expose Claude's authoritative `background_tasks` array;
+#     keeping it separate prevents a subagent event from overwriting the main edge.
 #
 # Record shape — flat, one line, no nesting, because the plugin reads it
 # with regexes rather than a JSON parser:
@@ -50,6 +55,67 @@ json_str() {
     | grep -o "\"$1\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" \
     | head -1 \
     | sed 's/^[^:]*:[[:space:]]*"//; s/"$//'
+}
+
+# Count top-level objects in the top-level `background_tasks` array without
+# persisting its contents. The scanner honours JSON strings and escapes, so a
+# command or assistant message containing braces cannot inflate the count.
+# Prints -1 when the field is absent (older Claude Code versions).
+json_background_count() {
+  printf '%s' "$INPUT" | awk '
+    { data = data $0 "\n" }
+    END {
+      key = "background_tasks"
+      in_string = 0; escaped = 0; object_depth = 0; array_start = 0
+      token = ""; token_depth = 0
+
+      for (i = 1; i <= length(data); i++) {
+        ch = substr(data, i, 1)
+        if (in_string) {
+          if (escaped) { escaped = 0; token = token ch; continue }
+          if (ch == "\\") { escaped = 1; continue }
+          if (ch == "\"") {
+            in_string = 0
+            if (token == key && token_depth == 1) {
+              j = i + 1
+              while (j <= length(data) && substr(data, j, 1) ~ /[ \t\r\n]/) j++
+              if (substr(data, j, 1) != ":") continue
+              j++
+              while (j <= length(data) && substr(data, j, 1) ~ /[ \t\r\n]/) j++
+              if (substr(data, j, 1) == "[") { array_start = j; break }
+            }
+            continue
+          }
+          token = token ch
+          continue
+        }
+        if (ch == "\"") { in_string = 1; token = ""; token_depth = object_depth; continue }
+        if (ch == "{") object_depth++
+        else if (ch == "}") object_depth--
+      }
+
+      if (array_start == 0) { print -1; exit }
+      in_string = 0; escaped = 0; depth = 0; count = 0
+      for (i = array_start; i <= length(data); i++) {
+        ch = substr(data, i, 1)
+        if (in_string) {
+          if (escaped) escaped = 0
+          else if (ch == "\\") escaped = 1
+          else if (ch == "\"") in_string = 0
+          continue
+        }
+        if (ch == "\"") { in_string = 1; continue }
+        if (ch == "[") { depth++; continue }
+        if (ch == "]") {
+          depth--
+          if (depth == 0) { print count; exit }
+          continue
+        }
+        if (ch == "{" && depth == 1) count++
+      }
+      print -1
+    }
+  '
 }
 
 SID=$(json_str session_id)
@@ -136,6 +202,11 @@ fi
 if [ "$EVENT" = "SessionStart" ] && [ "$SOURCE" = "compact" ]; then
   SKIP_STATUS_WRITE=1
 fi
+# A subagent finishing updates only the background count. It must never replace
+# the main turn edge with an event that StatusResolver deliberately ignores.
+if [ "$EVENT" = "SubagentStop" ]; then
+  SKIP_STATUS_WRITE=1
+fi
 
 # ── Timestamp ───────────────────────────────────────────────────────
 # Milliseconds, not seconds. StatusResolver rule 2 is "the newer signal
@@ -184,6 +255,8 @@ if [ -z "$CLAUDE_PID" ]; then
   while [ -n "$parent" ] && [ "$parent" -gt 1 ] 2>/dev/null && [ "$depth" -lt 6 ]; do
     info=$(ps -o ppid=,comm= -p "$parent" 2>/dev/null) || break
     [ -n "$info" ] || break
+    # Intentional split: ps prints "<ppid> <command>" and the first field is the join key.
+    # shellcheck disable=SC2086
     set -- $info
     grandparent="$1"
     shift
@@ -212,14 +285,44 @@ mkdir -p "$STATUS_DIR" 2>/dev/null || exit 0
 
 RECORD="{\"event\":\"$EVENT\",\"source\":\"$SOURCE\",\"notificationType\":\"$NOTIF_TYPE\",\"reason\":\"$REASON\",\"sessionId\":\"$SID\",\"ts\":$TS,\"pid\":$CLAUDE_PID}"
 
+# Background state is deliberately count-only. `Stop` supplies the complete
+# in-flight array. `SubagentStop` supplies the updated parent-session array on
+# current CLIs; on older versions, decrement the prior count as a safe fallback.
+BACKGROUND_COUNT=-1
+case "$EVENT" in
+  Stop)
+    BACKGROUND_COUNT=$(json_background_count)
+    [ "$BACKGROUND_COUNT" -ge 0 ] 2>/dev/null || BACKGROUND_COUNT=0
+    ;;
+  SubagentStop)
+    BACKGROUND_COUNT=$(json_background_count)
+    if ! [ "$BACKGROUND_COUNT" -ge 0 ] 2>/dev/null; then
+      PREVIOUS_COUNT=$(grep -o '"count"[[:space:]]*:[[:space:]]*[0-9]*' "$STATUS_DIR/background-$SID.json" 2>/dev/null \
+        | head -1 | sed 's/.*://; s/[[:space:]]//g')
+      case "$PREVIOUS_COUNT" in ''|*[!0-9]*) PREVIOUS_COUNT=0 ;; esac
+      if [ "$PREVIOUS_COUNT" -gt 0 ]; then BACKGROUND_COUNT=$((PREVIOUS_COUNT - 1)); else BACKGROUND_COUNT=0; fi
+    fi
+    ;;
+  SessionStart|SessionEnd)
+    BACKGROUND_COUNT=0
+    ;;
+esac
+if [ "$BACKGROUND_COUNT" -gt 999 ] 2>/dev/null; then BACKGROUND_COUNT=999; fi
+
 # Written to a temp file and renamed, so the plugin — which polls this
 # directory every 400ms — never reads a half-written record.
 write_record() {
   tmp="$1.$$.tmp"
-  if printf '%s\n' "$RECORD" > "$tmp" 2>/dev/null; then
+  payload="${2:-$RECORD}"
+  if printf '%s\n' "$payload" > "$tmp" 2>/dev/null; then
     mv -f "$tmp" "$1" 2>/dev/null || rm -f "$tmp" 2>/dev/null
   fi
 }
+
+if [ "$BACKGROUND_COUNT" -ge 0 ] 2>/dev/null; then
+  BACKGROUND_RECORD="{\"sessionId\":\"$SID\",\"count\":$BACKGROUND_COUNT,\"ts\":$TS}"
+  write_record "$STATUS_DIR/background-$SID.json" "$BACKGROUND_RECORD"
+fi
 
 if [ "$SKIP_STATUS_WRITE" -eq 0 ]; then
   write_record "$STATUS_DIR/$SID.json"

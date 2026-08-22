@@ -12,15 +12,18 @@ import org.junit.Test
  * This is the source that actually fires. Claude Code 2.1.226 gates its auto-naming on
  * `sessionKind === "bg"`, so an interactive terminal session keeps a directory-derived name
  * (`sample-project`) for its whole life and [ClaudeTabsHelpers.meaningfulSessionName]
- * returns null every time — verified against two live sessions and against the CLI binary.
+ * returns null every time.
  *
  * The transcript's first real user turn is the same text Claude's own `--resume` picker
  * shows, so it reads like a summary without anything having to summarise it.
  *
  * The hard part is that a transcript does not open with what the person typed. Every case
- * below is a line shape taken from a real transcript under `~/.claude/projects`.
+ * below is a representative transcript line shape.
  */
 class FirstPromptNameTest {
+
+    /** Build credential-shaped fixtures without publishing scanner-triggering literals. */
+    private fun secretFixture(prefix: String, suffix: String) = prefix + suffix
 
     private fun userLine(content: String, extra: String = "") =
         """{"parentUuid":null,"isSidechain":false,"type":"user","message":{"role":"user","content":${quote(content)}}$extra}"""
@@ -129,12 +132,11 @@ class FirstPromptNameTest {
 
     /**
      * A tab name is not a private place — it goes on the tab strip, into names.json, and
-     * into the restore file. One of the real transcripts this was checked against opens
-     * with a GitHub token, which would have ended up in all three.
+     * into the restore file. A pasted credential must not end up in any of those places.
      */
     @Test fun neverNamesATabAfterAPastedCredential() {
         val lines = sequenceOf(
-            userLine("ghp_" + "EXAMPLEONLYnotarealtoken0123456789"),
+            userLine(secretFixture("ghp_", "EXAMPLEONLYnotarealtoken0123456789")),
             userLine("create a repo"),
         )
         assertEquals("create a repo", ClaudeTabsHelpers.firstPromptName(lines))
@@ -142,14 +144,14 @@ class FirstPromptNameTest {
 
     @Test fun recognisesTheCommonTokenShapes() {
         for (secret in listOf(
-            "ghp_abcdefghijklmnop",
-            "github_pat_11ABCDE",
-            "glpat-xxxxxxxxxxxx",
-            "sk-ant-api03-abcdef",
-            "xoxb-" + "123-456-abcdef",
-            "AKIA" + "IOSFODNN7EXAMPLE",
-            "-----BEGIN OPENSSH " + "PRIVATE KEY-----",
-            "dBv3nQ8xKm2Lp9Rt4Wy7Zc1Fh6Jd0Sg5Ub8Ne3Ai",
+            secretFixture("ghp_", "abcdefghijklmnop"),
+            secretFixture("github_pat_", "11ABCDE"),
+            secretFixture("glpat-", "xxxxxxxxxxxx"),
+            secretFixture("sk-ant-", "api03-abcdef"),
+            secretFixture("xoxb-", "123-456-abcdef"),
+            secretFixture("AKIA", "IOSFODNN7EXAMPLE"),
+            secretFixture("-----BEGIN OPENSSH ", "PRIVATE KEY-----"),
+            secretFixture("dBv3nQ8xKm2Lp9Rt4Wy7", "Zc1Fh6Jd0Sg5Ub8Ne3Ai"),
         )) {
             assertTrue("should be caught: $secret", ClaudeTabsHelpers.looksLikeSecret(secret))
         }

@@ -582,11 +582,11 @@ class ClaudeTabsHelpersTest {
     }
 
     @Test fun isProcessHostedByJvm_riderWindowScenario_correctAttribution() {
-        // Realistic Rider 2026.1 multi-window scenario:
+        // Representative Rider 2026.1 multi-window scenario:
         //   PID 500 = ProjectAlpha Rider window JVM
         //   PID 600 = ProjectBeta Rider window JVM
-        //   PID 100 = Claude in ProjectAlpha  (parent chain: 100 → 110 pwsh → 500 ProjectAlpha jvm)
-        //   PID 200 = Claude in mobile   (parent chain: 200 → 210 pwsh → 600 mobile jvm)
+        //   PID 100 = Claude in ProjectAlpha (parent chain: 100 → 110 pwsh → 500 JVM)
+        //   PID 200 = Claude in ProjectBeta  (parent chain: 200 → 210 pwsh → 600 JVM)
         //   PID 300 = Claude orphaned    (parent chain: 300 → 310 pwsh → 1 init)
         val parents = mapOf(
             100L to 110L, 110L to 500L,

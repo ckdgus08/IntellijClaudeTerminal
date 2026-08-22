@@ -61,7 +61,7 @@ class IdentifierSearchTest {
         return null
     }
 
-    private val uuid = "70000001-0000-4000-8000-000000000001"
+    private val uuid = "50000001-0000-4000-8000-000000000001"
 
     @Test fun findsTheIdNestedUnderGetSession() {
         val found = search(WidgetBridge(Session(SessionId(uuid))), setOf(uuid))
@@ -81,7 +81,7 @@ class IdentifierSearchTest {
     }
 
     @Test fun picksTheCandidateThatIsActuallyPresent() {
-        val other = "70000003-0000-4000-8000-000000000003"
+        val other = "50000002-0000-4000-8000-000000000002"
         assertEquals(uuid, search(WidgetBridge(Session(SessionId(uuid))), setOf(other, uuid)))
     }
 

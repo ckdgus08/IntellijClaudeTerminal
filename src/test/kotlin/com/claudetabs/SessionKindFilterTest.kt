@@ -11,7 +11,7 @@ import java.io.File
 /**
  * Only sessions someone is typing into belong in a terminal tab.
  *
- * The shapes here are taken from a real Claude Code 2.1.226 install where an interactive
+ * The shapes here represent a Claude Code 2.1.226 install where an interactive
  * session had spawned a background job: the job's process tree was
  * `bg claude -> supervisor -> claude -> interactive claude -> zsh -> idea`, so it descended
  * from the IDE's JVM, was alive, looked like Claude, and shared the project cwd. Every
@@ -62,10 +62,9 @@ class SessionKindFilterTest {
 
     @Test fun scannerKeepsInteractiveAndDropsBackgroundJobs() {
         val dir = tmp.newFolder("sessions")
-        // Exactly the situation observed on the dev machine: the IDE project is the
-        // workspace root, so every session under it matches on cwd.
+        // The IDE project is the workspace root, so every session under it matches on cwd.
         sessionFile(dir, 3001, "sid-interactive-1", "interactive", "/Users/example/projects")
-        sessionFile(dir, 3002, "sid-interactive-2", "interactive", "/Users/example/projects/RiderClaudeTabs")
+        sessionFile(dir, 3002, "sid-interactive-2", "interactive", "/Users/example/projects/sample-plugin")
         sessionFile(dir, 3003, "sid-background", "bg", "/Users/example/projects")
 
         val result = scan(dir, "/Users/example/projects")
@@ -121,7 +120,7 @@ class ClaudeProcessRecognitionTest {
         SessionsDirScanner.ProcessInfo(command, commandLine)
 
     @Test fun recognisesTheVersionedBinaryTheDaemonLaunches() {
-        // Observed verbatim for a live background agent (pid 3003).
+        // Representative command line for a live background agent.
         assertTrue(
             SessionsDirScanner.looksLikeClaude(
                 info(

@@ -7,14 +7,13 @@ import org.junit.Test
 /**
  * Quitting Claude and starting it again in the same tab replaces the session without
  * `/clear` being involved — and without the pid that [ClaudeStatusStore.supersededSessions]
- * needs to link the two ids. Reproduced from a real run, terminal `b0000001`:
+ * needs to link the two ids. A representative transition is:
  *
  *   status/b0000002….json → {"event":"SessionEnd","reason":"prompt_input_exit","pid":4001}
  *   pid 4001 gone; the terminal now hosts b0000003… under pid 4002
  *
- * The tab then stayed bound to `b0000002`: it was re-attached as `✕` on every poll, and the
- * name the user typed into the tab strip was filed under `b0000002` while everything that
- * repaints the tab keyed off `b0000003` — so the rename came back 19 seconds later.
+ * The tab can then stay bound to the old id: it is re-attached as `✕` on every poll, while
+ * the new process and status updates are keyed by the replacement id.
  *
  * `TERM_SESSION_ID` is the only thing on disk that spans the two, which is what
  * [ClaudeTabsHelpers.terminalHandovers] reads.
@@ -62,7 +61,7 @@ class TerminalHandoverTest {
      * ids canonicalise to the same transcript, so it is a rotation, not a hand-over.
      */
     @Test fun aRotatedIdForTheSameConversationIsNotAHandover() {
-        val rotated = "ffffffff-0000-0000-0000-000000000000"
+        val rotated = "b0000004-0000-4000-8000-000000000004"
         assertTrue(
             handovers(
                 previous = mapOf(term to old),
@@ -85,7 +84,7 @@ class TerminalHandoverTest {
      * whatever the hook happened to record.
      */
     @Test fun scopingIsCheckedAfterCanonicalisation() {
-        val rotatedOld = "11111111-0000-0000-0000-000000000000"
+        val rotatedOld = "b0000005-0000-4000-8000-000000000005"
         assertEquals(
             mapOf(old to new),
             handovers(
@@ -105,8 +104,8 @@ class TerminalHandoverTest {
     /** Several tabs can be restarted between two passes; each is its own hand-over. */
     @Test fun handlesMoreThanOneTerminalAtOnce() {
         val term2 = "b0000006-0000-4000-8000-000000000006"
-        val old2 = "d0000003-0000-4000-8000-000000000003"
-        val new2 = "d0000004-0000-4000-8000-000000000004"
+        val old2 = "b0000007-0000-4000-8000-000000000007"
+        val new2 = "b0000008-0000-4000-8000-000000000008"
         assertEquals(
             mapOf(old to new, old2 to new2),
             handovers(

@@ -9,9 +9,9 @@ import org.junit.rules.TemporaryFolder
 /**
  * The parse cache must never cost freshness.
  *
- * These files are read on a 400ms cadence and almost never change — 107 of them backed two
- * live sessions on a real install — so unchanged files are parsed once and remembered. That
- * is only safe if a *changed* file is still picked up on the very next read: the whole point
+ * These files are read on a 400ms cadence and almost never change, so unchanged files are
+ * parsed once and remembered. That is only safe if a *changed* file is still picked up on
+ * the very next read: the whole point
  * of the indicator is that it moves the moment a hook fires.
  *
  * The risk is specific. Hook files are rewritten in place, often within the same millisecond
@@ -22,7 +22,7 @@ class StatusCacheFreshnessTest {
 
     @get:Rule val tmp = TemporaryFolder()
 
-    private val sid = "aaaaaaaa-1111-2222-3333-444444444444"
+    private val sid = "c0000001-0000-4000-8000-000000000001"
 
     private fun statusDir() = File(tmp.root, "intellij-claude-terminal/status").apply { mkdirs() }
     private fun sessionsDir() = File(tmp.root, "sessions").apply { mkdirs() }
@@ -93,7 +93,7 @@ class StatusCacheFreshnessTest {
         f.setLastModified(10_000)
         assertEquals(sid, store.termSessionMap()[term])
 
-        val other = "bbbbbbbb-1111-2222-3333-444444444444"
+        val other = "c0000002-0000-4000-8000-000000000002"
         f.writeText("""{"event":"SessionStart","sessionId":"$other","ts":2000,"pid":1}""")
         f.setLastModified(20_000)
         assertEquals("a terminal reused by a new session must remap", other, store.termSessionMap()[term])

@@ -1,39 +1,37 @@
 <idea-plugin>
     <id>io.github.ckdgus08.intellij-claude-terminal</id>
-    <name>Claude Terminal Tabs</name>
+    <name>Claude &amp; Codex Terminal Tabs</name>
     <vendor url="https://github.com/ckdgus08/IntellijClaudeTerminal">ckdgus08</vendor>
 
     <description><![CDATA[
-    <h2>Claude Terminal Tab Persistence for Rider / IntelliJ</h2>
+    <h2>Claude &amp; Codex Terminal Tab Persistence for Rider / IntelliJ</h2>
 
-    <p>Persists your <a href="https://claude.com/claude-code">Claude Code</a> terminal sessions across IDE
-    restarts — saved tabs come back with their names and auto-resume their conversations, so you can juggle
-    multiple Claude sessions without losing them when you close Rider.</p>
+    <p>Persists terminal sessions from <a href="https://claude.com/claude-code">Claude Code</a> and OpenAI Codex
+    across IDE restarts &mdash; saved tabs come back with their names and resume through the correct CLI.</p>
 
     <h3>Features</h3>
     <ul>
       <li><b>Live status glyph on every tab</b> &mdash; <code>&#x25CF;</code> working, <code>&#x26A0;</code> waiting for
       input or a permission prompt, <code>&#x2713;</code> finished, <code>&#x25CB;</code> idle, <code>&#x2715;</code>
-      exited. Driven by Claude Code hooks, so it lands within a fraction of a second. Hover the tab for the wording.</li>
+      exited. A separate <code>bgN</code> badge keeps background Claude tasks visible after the main response ends.
+      Driven by Claude or Codex hooks, so it lands within a fraction of a second. Hover the tab for the wording.</li>
       <li><b>Remote Control on by default</b> &mdash; a <code>claude remote-control</code> tab per project, so this
       machine's sessions are reachable from claude.ai/code and the Claude mobile app. Disable via
       <code>remoteControl.enabled</code> in <code>~/.claude/intellij-claude-terminal/config.json</code>.</li>
-      <li><b>Tabs named from Claude's own summary</b> of the conversation, read out of its session file &mdash; no turn
-      spent on naming. <code>/tab &lt;name&gt;</code> overrides it and is never overwritten.</li>
+      <li><b>Conversation-derived tab names</b> from Claude's transcript or Codex's prompt hook. A manual terminal-tab
+      rename overrides either and is never overwritten.</li>
       <li><b>Race-condition-free</b> identification of each tab via <code>TERM_SESSION_ID</code> mapping</li>
       <li><b>Session save/restore</b> across IDE restarts — your named tabs come back</li>
       <li><b>Respects manual renames</b> — if you rename a tab yourself, the plugin backs off</li>
     </ul>
 
-    <p><b>Requirements:</b> Rider / IntelliJ 2026.1+ with the bundled Terminal plugin, and
-    <a href="https://docs.claude.com/s/claude-code">Claude Code CLI</a> installed. Session detection is
-    cross-platform (<code>ProcessHandle</code>); the bundled shell scripts branch on <code>tasklist</code> for
-    Windows and <code>ps</code> elsewhere. Windows and macOS are exercised; Linux should work but is less tested.</p>
+    <p><b>Requirements:</b> Rider / IntelliJ 2026.1+ with the bundled Terminal plugin, and Claude Code CLI and/or
+    OpenAI Codex CLI installed. Codex users approve the installed user hooks once through <code>/hooks</code>.</p>
 
     <p><b>Compatibility:</b> Rider / IntelliJ 2026.1 and newer. On Rider 2026.1 the plugin coexists
     with the JetBrains AI Assistant chat tool window (the "AI Agents" panel: Junie / Claude Agent / Codex)
     and Anthropic's official Claude Code [Beta] plugin. <i>This plugin manages terminal-launched Claude CLI
-    sessions only</i> — chat tabs in the AI Agents panel are managed by JetBrains and are not auto-restored
+    and Codex CLI sessions only</i> — chat tabs in the AI Agents panel are managed by JetBrains and are not auto-restored
     here. Set Registry key <code>claude.terminal.tabs.respectAiAgents</code> to <code>false</code> to disable
     the coexistence notice in the log.</p>
     <p>A fork of <a href="https://github.com/Ragnaraven/RiderClaudeTabs">RiderClaudeTabs</a> by Ragnaraven,
@@ -42,6 +40,18 @@
     ]]></description>
 
     <change-notes><![CDATA[
+    <h3>1.2.0</h3>
+    <ul>
+      <li><b>Codex CLI support.</b> Terminal-launched Codex sessions now get status icons, prompt-derived names,
+      provider-aware persistence, duplicate-safe restore, and <code>codex resume &lt;session-id&gt;</code>.</li>
+      <li>Installs idempotent cross-platform Codex hooks without touching unrelated entries in
+      <code>~/.codex/hooks.json</code>; existing provider-less save files continue to load as Claude.</li>
+      <li><b>Claude background work is shown separately from the main turn.</b> A completed response with one or more
+      tasks still running displays the Finished icon plus a compact <code>bgN</code> badge. Only the count is stored;
+      task ids, descriptions and commands never leave the hook payload.</li>
+      <li>537 unit and filesystem contract tests.</li>
+    </ul>
+
     <h3>1.1.2</h3>
     <ul>
       <li><b>Quitting Claude and starting it again in a tab went unnoticed.</b> A tab changes session two ways, and only

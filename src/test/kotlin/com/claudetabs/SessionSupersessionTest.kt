@@ -13,9 +13,9 @@ import org.junit.rules.TemporaryFolder
  * The terminal, the process and the tab all survive; only Claude's session id rotates. The
  * old id gets a `SessionEnd` hook and drops out of `sessions/<pid>.json`, so a tab still
  * bound to it resolves to EXITED and stays there — a live conversation under a `✕`.
- * Reproduced from a real run:
+ * Represented here with synthetic identifiers:
  *
- *   status/70000004….json  → {"event":"SessionEnd","pid":12001}
+ *   status/10000001….json  → {"event":"SessionEnd","pid":12001}
  *   sessions/12001.json    → {"sessionId":"10000002…","status":"busy"}
  *
  * The pid is the only link on disk. The new session gets its own transcript and its own
@@ -26,7 +26,7 @@ class SessionSupersessionTest {
 
     @get:Rule val tmp = TemporaryFolder()
 
-    private val old = "70000004-0000-4000-8000-000000000004"
+    private val old = "10000001-0000-4000-8000-000000000001"
     private val new = "10000002-0000-4000-8000-000000000002"
 
     private fun home(): File = tmp.root
